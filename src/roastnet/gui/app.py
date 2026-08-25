@@ -15,6 +15,7 @@ above its output.
 from __future__ import annotations
 
 import json
+import queue
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 from roastnet.gui import config as gui_config
+from roastnet.gui import single_instance
 from roastnet.gui.runner import Task, describe, roastnet_argv, stream_into
 from roastnet.gui.widgets import (
     BG,
@@ -55,11 +57,15 @@ def _run_opener(cmd: list[str]) -> str | None:
         return f"could not run {cmd[0]}: {exc}"
     try:
         # Most openers (xdg-open, a real Artisan launch) either hand off
-        # to a long-running app (still running after this) or return
-        # quickly with a nonzero code when nothing could open the target --
-        # a short wait is enough to tell "launched" from "failed
-        # immediately" without blocking the GUI on a real app's lifetime.
-        proc.wait(timeout=0.5)
+        # to a long-running app (still running after this) or return with
+        # a nonzero code when nothing could open the target -- but some
+        # desktop environments route xdg-open through a D-Bus portal
+        # (org.freedesktop.portal.OpenURI) that can take a couple of
+        # seconds to resolve, so this waits a bit longer than the launched
+        # app's own startup time would suggest, to avoid mistaking "still
+        # working on it" for "launched successfully" and reporting no
+        # error when the portal call is actually about to fail.
+        proc.wait(timeout=2.0)
     except subprocess.TimeoutExpired:
         return None
     if proc.returncode != 0:
@@ -98,6 +104,14 @@ def _open_alog_file(path: str) -> str | None:
     if sys.platform == "darwin" and Path("/Applications/Artisan.app").exists():
         return _run_opener(["open", "-a", "Artisan", path])
     return _open_with_default_app(path)
+
+
+def _copy_to_clipboard(widget: tk.Widget, text: str) -> None:
+    """A manual fallback that always works, regardless of whether this
+    desktop has anything registered to auto-open a file or folder with --
+    paste the path into a file manager or terminal yourself."""
+    widget.clipboard_clear()
+    widget.clipboard_append(text)
 
 
 class Tab(ttk.Frame):
@@ -256,13 +270,17 @@ class RoastDetailWindow(tk.Toplevel):
         if raw_path:
             ttk.Button(btn_row, text="Open original file",
                        command=lambda: self._on_open_file(raw_path)).pack(side="left")
-            tk.Label(btn_row, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG).pack(
-                side="left", padx=(8, 0))
+            ttk.Button(btn_row, text="Copy path",
+                       command=lambda: _copy_to_clipboard(self, raw_path)).pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
+
+        if raw_path:
+            tk.Label(self, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
+                     wraplength=840, justify="left").pack(fill="x", padx=14, pady=(4, 0))
 
         self.open_status_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.open_status_var, font=("TkDefaultFont", 9), fg=MUTED,
-                 bg=BG, anchor="w", wraplength=840, justify="left").pack(fill="x", padx=14, pady=(0, 12))
+                 bg=BG, anchor="w", wraplength=840, justify="left").pack(fill="x", padx=14, pady=(2, 12))
 
     def _on_open_file(self, path: str) -> None:
         error = _open_alog_file(path)
@@ -301,6 +319,9 @@ class PublishTab(Tab):
             side="left")
         ttk.Button(folder_row, text="Open folder", command=self._open_watch_folder).pack(
             side="left", padx=(8, 0))
+        ttk.Button(folder_row, text="Copy path",
+                   command=lambda: _copy_to_clipboard(self, self.app.watch_dir.get())).pack(
+            side="left", padx=(6, 0))
         self.folder_status_var = tk.StringVar(value="")
         tk.Label(folder_section, textvariable=self.folder_status_var, font=("TkDefaultFont", 9),
                  fg=MUTED, bg=BG, anchor="w", wraplength=840, justify="left").pack(
@@ -603,8 +624,33 @@ class RoastnetApp(tk.Tk):
         self.destroy()
 
 
-def main() -> None:
-    RoastnetApp().mainloop()
+def main(*, single_instance_port: int = single_instance.PORT) -> None:
+    if single_instance.another_instance_is_running(port=single_instance_port):
+        return  # asked it to focus itself instead -- nothing else to do here
+
+    app = RoastnetApp()
+    focus_requests: queue.Queue = queue.Queue()
+    # start_focus_listener's callback runs on a background thread -- Tk
+    # widgets may only be touched from the thread that created them, so
+    # it just drops a marker in the queue and _poll_focus_requests (on
+    # the Tk main thread, via app.after, same pattern gui/runner.py's
+    # stream_into uses for task output) is what actually raises the
+    # window.
+    single_instance.start_focus_listener(lambda: focus_requests.put(None), port=single_instance_port)
+
+    def _poll_focus_requests() -> None:
+        try:
+            while True:
+                focus_requests.get_nowait()
+                app.deiconify()
+                app.lift()
+                app.focus_force()
+        except queue.Empty:
+            pass
+        app.after(300, _poll_focus_requests)
+
+    _poll_focus_requests()
+    app.mainloop()
 
 
 if __name__ == "__main__":

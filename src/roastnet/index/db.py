@@ -19,6 +19,15 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL: readers (e.g. a search) don't block on a concurrent writer (e.g.
+    # node serve ingesting a synced peer's feed) the way the default
+    # rollback-journal mode can -- relevant now that the GUI's Network tab
+    # runs its own background `node serve` writing to this same file while
+    # other tabs read it. busy_timeout is the remaining belt-and-braces:
+    # a genuine same-instant write/write collision waits and retries for up
+    # to 5s instead of failing immediately with "database is locked".
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     migrate(conn)
     return conn
 

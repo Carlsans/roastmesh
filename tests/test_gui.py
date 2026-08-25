@@ -157,6 +157,24 @@ print("OK")
     assert entries[0].content_sha256
 
 
+def test_copy_to_clipboard_puts_the_text_on_the_real_clipboard() -> None:
+    # A manual fallback that must keep working regardless of whether the
+    # desktop has anything registered to auto-open a file/folder with.
+    r = _run_headless("""
+import tkinter as tk
+from roastnet.gui.app import _copy_to_clipboard
+root = tk.Tk()
+root.withdraw()
+_copy_to_clipboard(root, '/tmp/some/path/roast.alog')
+root.update()
+print('CLIPBOARD', repr(root.clipboard_get()))
+root.destroy()
+print('OK')
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "CLIPBOARD '/tmp/some/path/roast.alog'" in r.stdout, r.stdout
+
+
 def test_cancel_stops_a_running_task_quickly() -> None:
     task = Task(argv=[sys.executable, "-c", "import time; time.sleep(30)"])
     task.start()
@@ -296,3 +314,46 @@ print("OK")
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def _gui_launch_argv(port: int) -> list[str]:
+    body = (
+        "from roastnet.gui.app import main\n"
+        f"main(single_instance_port={port})\n"
+    )
+    cmd = [sys.executable, "-c", body]
+    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
+        cmd = ["xvfb-run", "-a", *cmd]
+    return cmd
+
+
+def test_second_launch_focuses_the_first_instead_of_opening_a_second_window(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home)}
+    port = 41998  # dedicated test port, distinct from the real single_instance.PORT
+
+    first = subprocess.Popen(_gui_launch_argv(port), env=env)
+    try:
+        # wait for the first instance to actually bind its focus listener,
+        # not just for the process to start (Tk/Xvfb startup isn't instant)
+        from roastnet.gui import single_instance
+        bound = False
+        for _ in range(100):
+            if single_instance.another_instance_is_running(port=port, timeout=0.2):
+                bound = True
+                break
+            time.sleep(0.2)
+        assert bound, "first instance never started listening for focus requests"
+        assert first.poll() is None, "first instance exited unexpectedly"
+
+        second = subprocess.run(_gui_launch_argv(port), env=env, timeout=20)
+        assert second.returncode == 0
+        # the first instance is still the one and only instance running
+        assert first.poll() is None
+    finally:
+        first.terminate()
+        try:
+            first.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            first.kill()
