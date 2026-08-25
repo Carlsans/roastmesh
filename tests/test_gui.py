@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -357,3 +358,59 @@ def test_second_launch_focuses_the_first_instead_of_opening_a_second_window(tmp_
             first.wait(timeout=5)
         except subprocess.TimeoutExpired:
             first.kill()
+
+
+def test_sigterm_cleans_up_the_background_node_serve_process(tmp_path: Path) -> None:
+    """A plain SIGTERM (e.g. `kill`, a session manager logging the user
+    out -- anything that isn't the window's own close button) must still
+    clean up the background `node serve` process the Network tab
+    auto-starts. Otherwise it's a permanent orphan: still serving,
+    discovering, and auto-publishing with no visible app left. This was a
+    real bug found during development -- repeated manual test runs (a
+    plain subprocess.Popen(...).terminate(), same as this test does) left
+    real orphaned node serve processes running indefinitely on a real
+    machine, because WM_DELETE_WINDOW (and the os.killpg cleanup wired to
+    it) never fires for a signal that isn't a window-manager close event.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home)}
+    port = 41995
+    marker = f"node serve --publish-watch-dir {home}"
+
+    def _node_serve_running() -> bool:
+        check = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+        return bool(check.stdout.strip())
+
+    proc = subprocess.Popen(_gui_launch_argv(port), env=env)
+    try:
+        from roastnet.gui import single_instance
+        bound = False
+        for _ in range(100):
+            if single_instance.another_instance_is_running(port=port, timeout=0.2):
+                bound = True
+                break
+            time.sleep(0.2)
+        assert bound, "instance never started listening for focus requests"
+
+        running = False
+        for _ in range(50):
+            if _node_serve_running():
+                running = True
+                break
+            time.sleep(0.2)
+        assert running, "node serve never started under the GUI instance"
+
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+
+        time.sleep(1)  # give a leaked orphan, if any, a moment to still be visible
+        assert not _node_serve_running(), "node serve leaked as an orphan after SIGTERM"
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        subprocess.run(["pkill", "-f", marker])  # belt and braces if the assertion above failed

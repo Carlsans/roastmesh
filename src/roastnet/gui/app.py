@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import tkinter as tk
@@ -89,6 +90,107 @@ def _open_with_default_app(path: str) -> str | None:
     return _run_opener(["xdg-open", path])
 
 
+ARTISAN_FLATPAK_ID = "org.artisan_scope.artisan"
+
+
+def _stage_for_artisan(path: str) -> str:
+    """Copy `path` somewhere a sandboxed Artisan install can actually see.
+
+    `flatpak info --show-permissions org.artisan_scope.artisan` shows its
+    sandbox's filesystem access is just `xdg-documents` (plus a read-only
+    KDE config file) -- not the rest of $HOME. Handing a sandboxed install
+    a raw roastnet path (under ~/.local/share/roastnet or the watch
+    folder) launches Artisan fine but fails to actually read the file
+    (IOError, confirmed on a real machine) because that path is invisible
+    from inside its sandbox. Routing through the desktop's file-open
+    portal instead would be the "proper", packaging-agnostic fix, but
+    needs a D-Bus round trip and only works if the desktop's portal
+    backend supports it; copying into ~/Documents -- the one location
+    every packaging of Artisan that sandboxes at all can be expected to
+    grant (it's the standard XDG "documents" portal directory) -- is
+    simpler, needs no extra dependency, and works everywhere Artisan
+    itself already works. A single fixed staging filename (not one per
+    file) means nothing accumulates there across opens.
+
+    Only called for launch methods _find_artisan_launcher has flagged as
+    sandboxed (see `needs_staging` there) -- a plain, unsandboxed install
+    skips this, since copying would silently disconnect "save" inside
+    Artisan from the real file roastnet (or the user) actually manages."""
+    staging_dir = Path.home() / "Documents" / ".roastnet-open"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged_path = staging_dir / f"roast{Path(path).suffix}"
+    shutil.copy(path, staged_path)
+    return str(staged_path)
+
+
+def _is_snap_wrapper(binary_path: str) -> bool:
+    """True if a `shutil.which`-resolved binary is Snap's exported
+    wrapper rather than a plain native install. Unlike Flatpak (which
+    exports under the app's full reverse-DNS id, so it's caught by name
+    before this is ever consulted), Snap exports its wrapper under the
+    app's own plain command name -- e.g. still literally `artisan` -- so
+    a Snap-confined install is indistinguishable from a native one by
+    name alone; the resolved path (always under /snap/) is what actually
+    tells them apart. Not confirmed against a real Snap-packaged Artisan
+    (unlike the Flatpak case, which was) -- this is a defensive guess at
+    the same class of bug applying there too, since strict Snap
+    confinement can restrict filesystem visibility the same way Flatpak's
+    did."""
+    return binary_path.startswith("/snap/") or binary_path.startswith("/var/lib/snapd/")
+
+
+def _find_artisan_launcher(path: str) -> tuple[list[str], bool] | None:
+    """Locate a real Artisan install across the ways it commonly ends up
+    on a machine. Returns (argv_prefix, needs_staging) -- the caller
+    appends the actual file path (staged first via _stage_for_artisan if
+    `needs_staging`) to get the full command -- or None if no install is
+    found at all.
+
+    A plain PATH binary (the AUR package `artisan-roaster-scope` installs
+    one literally named `artisan`) is tried first. Flatpak -- the Flathub
+    package `org.artisan_scope.artisan` -- needs its own handling:
+    Flatpak exports a PATH wrapper under the app's full reverse-DNS id,
+    not under `artisan`, so `shutil.which("artisan")` never finds it even
+    though it's right there on PATH. Confirmed on a real machine during
+    development: this exact gap was why "open original file" silently
+    fell back to a text editor instead of the Artisan the user actually
+    had installed, and once found, why it then failed with an IOError
+    until its sandbox's restricted filesystem view was worked around too
+    (see _stage_for_artisan). Snap is handled defensively on the same
+    reasoning (see _is_snap_wrapper) even though it hasn't been confirmed
+    against a real Snap-packaged Artisan the way Flatpak was."""
+    for name in ("artisan", "Artisan"):
+        found = shutil.which(name)
+        if found:
+            return [found], _is_snap_wrapper(found)
+
+    flatpak_wrapper = shutil.which(ARTISAN_FLATPAK_ID)
+    if flatpak_wrapper:
+        return [flatpak_wrapper], True
+
+    if shutil.which("flatpak"):
+        # Covers a Flatpak install whose exports/bin wrapper isn't on
+        # PATH in this process specifically (e.g. launched from a
+        # desktop entry with a trimmed PATH) but the flatpak command
+        # itself is -- `flatpak run` finds the app by id regardless.
+        try:
+            check = subprocess.run(["flatpak", "info", ARTISAN_FLATPAK_ID],
+                                    capture_output=True, timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            check = None
+        if check is not None and check.returncode == 0:
+            return ["flatpak", "run", ARTISAN_FLATPAK_ID], True
+
+    if sys.platform == "darwin" and Path("/Applications/Artisan.app").exists():
+        # Direct-download macOS distribution isn't sandboxed; if that
+        # ever changes (e.g. a Mac App Store build with App Sandbox
+        # entitlements), this would need the same needs_staging=True
+        # treatment as Flatpak/Snap above.
+        return ["open", "-a", "Artisan"], False
+
+    return None
+
+
 def _open_alog_file(path: str) -> str | None:
     """Same contract as _open_with_default_app, but for a .alog file
     specifically: tries a real Artisan install first, since a .alog file
@@ -98,12 +200,12 @@ def _open_alog_file(path: str) -> str | None:
     actually for (confirmed during development: xdg-open opened one in
     Kate, not Artisan, on a machine with no Artisan install). Not used for
     opening a folder -- Artisan isn't a file manager."""
-    artisan = shutil.which("artisan") or shutil.which("Artisan")
-    if artisan:
-        return _run_opener([artisan, path])
-    if sys.platform == "darwin" and Path("/Applications/Artisan.app").exists():
-        return _run_opener(["open", "-a", "Artisan", path])
-    return _open_with_default_app(path)
+    found = _find_artisan_launcher(path)
+    if found is None:
+        return _open_with_default_app(path)
+    launcher, needs_staging = found
+    target_path = _stage_for_artisan(path) if needs_staging else path
+    return _run_opener([*launcher, target_path])
 
 
 def _copy_to_clipboard(widget: tk.Widget, text: str) -> None:
@@ -629,6 +731,22 @@ def main(*, single_instance_port: int = single_instance.PORT) -> None:
         return  # asked it to focus itself instead -- nothing else to do here
 
     app = RoastnetApp()
+
+    # A plain SIGTERM (killed via `kill`/`pkill`, a session manager logging
+    # the user out, systemd stopping the unit -- anything that isn't the
+    # window's own close button) never reaches WM_DELETE_WINDOW, so without
+    # this, app._on_close() -- and with it, Task.cancel()'s os.killpg on
+    # the detached `node serve` child (gui/runner.py deliberately puts it
+    # in its own process group so Cancel can kill it and its children) --
+    # never runs. The result: node serve outlives the window that started
+    # it, as a permanent orphan still serving/discovering/auto-publishing
+    # with no visible app left. Confirmed during development: exactly this
+    # leaked real orphaned node serve processes on a real machine.
+    def _handle_terminate(signum, frame) -> None:
+        app._on_close()
+
+    signal.signal(signal.SIGTERM, _handle_terminate)
+
     focus_requests: queue.Queue = queue.Queue()
     # start_focus_listener's callback runs on a background thread -- Tk
     # widgets may only be touched from the thread that created them, so
