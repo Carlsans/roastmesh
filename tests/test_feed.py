@@ -1,0 +1,209 @@
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from roastnet.feed import (
+    FeedEntry,
+    append_entry,
+    blob_path_for,
+    feed_pubkey,
+    read_entries,
+    verify_feed,
+    write_received_entry,
+)
+from roastnet.identity import generate_identity
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:3]
+
+
+@pytest.fixture
+def identity():
+    return generate_identity()
+
+
+def _publish_all(feed_dir: Path, identity) -> None:
+    for i, path in enumerate(FIXTURES):
+        append_entry(feed_dir, identity, path, timestamp=f"2026-01-0{i + 1}T00:00:00Z")
+
+
+def test_append_then_read_entries_in_order(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    entries = read_entries(feed_dir)
+    assert [e.seq for e in entries] == list(range(len(FIXTURES)))
+    assert feed_pubkey(feed_dir) == identity.public_key_hex
+
+
+def test_verify_feed_succeeds_end_to_end(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    result = verify_feed(feed_dir)
+    assert result.ok
+
+
+def test_append_entry_records_actual_file_size(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    entries = read_entries(feed_dir)
+    for entry, path in zip(entries, FIXTURES):
+        assert entry.size_bytes == path.stat().st_size
+
+
+def test_verify_catches_size_bytes_that_does_not_match_the_real_blob(tmp_path: Path, identity) -> None:
+    # size_bytes is part of what's signed, so tampering it post-hoc (like
+    # the other tamper tests) just trips the *signature* check -- to
+    # isolate this specific check, construct an entry that a buggy client
+    # legitimately signed with the wrong size_bytes in the first place.
+    feed_dir = tmp_path / "feed"
+    append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+    entry0 = read_entries(feed_dir)[0]
+    prev_hash = hashlib.sha256(entry0.canonical_stored_bytes()).hexdigest()
+
+    raw_bytes = FIXTURES[1].read_bytes()
+    content_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    wrong_size = len(raw_bytes) + 999
+
+    unsigned = FeedEntry(seq=1, content_sha256=content_sha256, timestamp="2026-01-02T00:00:00Z",
+                          prev_hash=prev_hash, size_bytes=wrong_size, signature="")
+    signature = identity.sign(unsigned.canonical_signed_bytes()).hex()
+    bad_entry = FeedEntry(seq=1, content_sha256=content_sha256, timestamp="2026-01-02T00:00:00Z",
+                           prev_hash=prev_hash, size_bytes=wrong_size, signature=signature)
+    write_received_entry(feed_dir, identity.public_key_hex, bad_entry, raw_bytes)
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    assert result.valid_count == 1  # entry 0 is genuinely fine
+    assert "size_bytes" in result.error
+
+
+def test_verify_fails_with_wrong_expected_pubkey(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    other = generate_identity()
+    result = verify_feed(feed_dir, expected_pubkey_hex=other.public_key_hex)
+    assert not result.ok
+    assert result.valid_count == 0
+
+
+def test_verify_catches_tampered_entry_content_hash(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    entry_path = feed_dir / "entries" / "00000001.json"
+    data = json.loads(entry_path.read_text())
+    data["content_sha256"] = "0" * 64
+    entry_path.write_text(json.dumps(data))
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    assert result.valid_count == 1  # entry 0 still verifies; entry 1 is where it breaks
+    assert "entry 1" in result.error
+
+
+def test_verify_catches_corrupted_blob_bytes(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    entries = read_entries(feed_dir)
+    blob_path = blob_path_for(feed_dir, entries[0])
+    blob_path.write_bytes(b"corrupted, not the original bytes")
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    assert result.valid_count == 0
+    assert "entry 0" in result.error
+
+
+def test_verify_catches_deleted_middle_entry(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    (feed_dir / "entries" / "00000001.json").unlink()
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    # entry 0 verifies, then entry originally-2 (now read as seq 1 on disk
+    # but its stored seq field is still 2) breaks the sequence check
+    assert result.valid_count == 1
+
+
+def test_verify_catches_reordered_entries(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    entries_dir = feed_dir / "entries"
+    e0 = json.loads((entries_dir / "00000000.json").read_text())
+    e1 = json.loads((entries_dir / "00000001.json").read_text())
+    (entries_dir / "00000000.json").write_text(json.dumps(e1))
+    (entries_dir / "00000001.json").write_text(json.dumps(e0))
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    assert result.valid_count == 0
+
+
+def test_second_publisher_cannot_write_into_first_publishers_feed_dir(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+
+    forger = generate_identity()
+    with pytest.raises(ValueError):
+        append_entry(feed_dir, forger, FIXTURES[0], timestamp="2026-06-01T00:00:00Z")
+
+    # the feed is untouched -- still only the original publisher's entries
+    result = verify_feed(feed_dir)
+    assert result.ok
+    assert result.valid_count == len(FIXTURES)
+
+
+def test_write_received_entry_then_verify_succeeds(tmp_path: Path, identity) -> None:
+    source_feed_dir = tmp_path / "source_feed"
+    _publish_all(source_feed_dir, identity)
+    entries = read_entries(source_feed_dir)
+
+    mirror_dir = tmp_path / "mirror_feed"
+    for entry in entries:
+        blob_bytes = blob_path_for(source_feed_dir, entry).read_bytes()
+        write_received_entry(mirror_dir, identity.public_key_hex, entry, blob_bytes)
+
+    result = verify_feed(mirror_dir)
+    assert result.ok
+    assert result.valid_count == len(FIXTURES)
+
+
+def test_write_received_entry_with_bogus_signature_fails_verification(tmp_path: Path, identity) -> None:
+    source_feed_dir = tmp_path / "source_feed"
+    _publish_all(source_feed_dir, identity)
+    entry = read_entries(source_feed_dir)[0]
+    blob_bytes = blob_path_for(source_feed_dir, entry).read_bytes()
+
+    forged = FeedEntry(seq=entry.seq, content_sha256=entry.content_sha256,
+                        timestamp=entry.timestamp, prev_hash=entry.prev_hash,
+                        size_bytes=entry.size_bytes, signature="00" * 64)
+
+    mirror_dir = tmp_path / "mirror_feed"
+    write_received_entry(mirror_dir, identity.public_key_hex, forged, blob_bytes)
+
+    result = verify_feed(mirror_dir)
+    assert not result.ok
+
+
+def test_write_received_entry_rejects_mismatched_pubkey_directory(tmp_path: Path, identity) -> None:
+    source_feed_dir = tmp_path / "source_feed"
+    _publish_all(source_feed_dir, identity)
+    entry = read_entries(source_feed_dir)[0]
+    blob_bytes = blob_path_for(source_feed_dir, entry).read_bytes()
+
+    mirror_dir = tmp_path / "mirror_feed"
+    write_received_entry(mirror_dir, identity.public_key_hex, entry, blob_bytes)
+
+    other = generate_identity()
+    with pytest.raises(ValueError):
+        write_received_entry(mirror_dir, other.public_key_hex, entry, blob_bytes)

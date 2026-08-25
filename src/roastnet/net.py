@@ -1,0 +1,249 @@
+"""Peer connectivity over Iroh: bind a node, serve requests, sync with a peer.
+
+The Iroh endpoint's own secret key IS the roastnet feed identity (confirmed
+empirically: `iroh.EndpointOptions(secret_key=...)` accepts the same raw
+32-byte Ed25519 seed `roastnet.identity` uses, and the resulting node id
+equals the feed's public key hex exactly) -- so dialing a peer's NodeId and
+verifying their feed are the same key, matching ARCHITECTURE.md's Core
+Model literally ("the public key *is* the feed address *is* the
+namespace"). This also means `conn.remote_id()` after connecting already IS
+the authenticated feed pubkey -- no separate "who are you" request needed.
+
+Wire protocol: JSON request ops over Iroh's bidirectional QUIC streams. No
+manual length-prefixing -- `write_all()` + `finish()` on one side and
+`read_to_end(cap)` on the other already frame exactly one message.
+
+    {"op": "get_peers"}                            -> {"peers": [...]}
+    {"op": "get_feed_meta", "since_seq": N}         -> {"entries": [...]}  (no blob_base64, ever)
+    {"op": "get_feed", "since_seq": N, "limit": K}  -> {"entries": [...]}  (this node's own feed,
+                                                        seq >= N, at most K entries, "limit"
+                                                        omitted = unbounded)
+
+`get_feed_meta` exists so a client can apply ARCHITECTURE.md's Abuse
+Resistance quota checks (roastnet.quota) against cheap metadata *before*
+deciding how much content is worth fetching -- see sync_with_peer.
+
+Scope: `get_feed`/`get_feed_meta` only ever return the responding peer's
+*own* feed -- syncing with peer P replicates exactly P's data, not a relay
+of everyone P knows about ("every peer mirrors the entire corpus" is later
+work).
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+import iroh
+
+from roastnet.feed import FeedEntry, FeedVerifyResult, blob_path_for, read_entries, verify_feed, write_received_entry
+from roastnet.identity import Identity
+from roastnet.peers import Peer, load_peers, save_peers, upsert_peer
+from roastnet.quota import QuotaCheckResult, QuotaLimits, check_feed_metadata
+
+ALPN = b"roastnet/peer-sync/0"
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class SyncReport:
+    peer_pubkey_hex: str
+    new_entry_count: int
+    verify: FeedVerifyResult
+    quota: QuotaCheckResult
+    peers_known: int
+
+
+async def bind_endpoint(identity: Identity, *, alpns: list[bytes] | None = None, relay: bool = True) -> iroh.Endpoint:
+    kwargs = {
+        "preset": iroh.preset_n0(),
+        "secret_key": bytes.fromhex(identity.secret_key_hex),
+    }
+    if alpns is not None:
+        kwargs["alpns"] = alpns
+    if not relay:
+        kwargs["relay_mode"] = iroh.RelayMode.disabled()
+    return await iroh.Endpoint.bind(iroh.EndpointOptions(**kwargs))
+
+
+async def _send_message(bi, message: dict) -> None:
+    send = bi.send()
+    await send.write_all(json.dumps(message).encode())
+    await send.finish()
+
+
+async def _recv_message(bi) -> dict:
+    raw = await bi.recv().read_to_end(MAX_MESSAGE_BYTES)
+    return json.loads(raw)
+
+
+async def _request(conn, message: dict) -> dict:
+    bi = await conn.open_bi()
+    await _send_message(bi, message)
+    return await _recv_message(bi)
+
+
+def _entry_to_wire(feed_dir: Path, entry: FeedEntry) -> dict:
+    blob = blob_path_for(feed_dir, entry).read_bytes()
+    return {**asdict(entry), "blob_base64": base64.b64encode(blob).decode("ascii")}
+
+
+def _entry_from_wire(wire: dict) -> tuple[FeedEntry, bytes]:
+    wire = dict(wire)
+    blob = base64.b64decode(wire.pop("blob_base64"))
+    return FeedEntry(**wire), blob
+
+
+def _build_response(request: dict, feed_dir: Path, peers_path: Path) -> dict:
+    op = request.get("op")
+    if op == "get_peers":
+        return {"peers": [asdict(p) for p in load_peers(peers_path)]}
+    if op == "get_feed_meta":
+        since_seq = int(request.get("since_seq", 0))
+        entries = [e for e in read_entries(feed_dir) if e.seq >= since_seq]
+        return {"entries": [asdict(e) for e in entries]}
+    if op == "get_feed":
+        since_seq = int(request.get("since_seq", 0))
+        entries = [e for e in read_entries(feed_dir) if e.seq >= since_seq]
+        limit = request.get("limit")
+        if limit is not None:
+            entries = entries[:int(limit)]
+        return {"entries": [_entry_to_wire(feed_dir, e) for e in entries]}
+    return {"error": f"unknown op {op!r}"}
+
+
+async def _handle_request(bi, feed_dir: Path, peers_path: Path) -> None:
+    try:
+        request = await _recv_message(bi)
+        response = _build_response(request, feed_dir, peers_path)
+    except Exception as exc:
+        response = {"error": str(exc)}
+    try:
+        await _send_message(bi, response)
+    except Exception:
+        pass  # peer likely disconnected mid-response; nothing more to do
+
+
+async def _handle_connection(incoming, feed_dir: Path, peers_path: Path) -> None:
+    try:
+        accepting = await incoming.accept()
+        conn = await accepting.connect()
+    except Exception:
+        return
+    while True:
+        try:
+            bi = await conn.accept_bi()
+        except Exception:
+            return  # connection closed
+        asyncio.create_task(_handle_request(bi, feed_dir, peers_path))
+
+
+async def serve(
+    identity: Identity,
+    feed_dir: Path,
+    peers_path: Path,
+    *,
+    relay: bool = True,
+    ready_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Bind a node and serve get_peers/get_feed requests forever."""
+    ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
+    ticket = str(iroh.EndpointTicket.from_addr(ep.addr()))
+    if ready_callback:
+        ready_callback(ticket)
+    else:
+        # explicit flush: stdout is block-buffered (not line-buffered) once
+        # it's not a TTY -- e.g. redirected to a log file or piped, which is
+        # exactly how a long-running `node serve` is normally run. Without
+        # this the ticket an operator needs immediately can sit unflushed
+        # in the buffer for the process's entire lifetime.
+        print(f"listening as {identity.public_key_hex[:16]}...")
+        print(f"ticket: {ticket}", flush=True)
+    try:
+        while True:
+            incoming = await ep.accept_next()
+            if incoming is None:
+                break
+            asyncio.create_task(_handle_connection(incoming, feed_dir, peers_path))
+    finally:
+        await ep.close()
+
+
+async def sync_with_peer(
+    ticket_str: str,
+    identity: Identity,
+    peer_feeds_root: Path,
+    peers_path: Path,
+    *,
+    relay: bool = True,
+    added_via: str = "manual",
+    limits: QuotaLimits | None = None,
+) -> SyncReport:
+    """Dial a peer, pull any new feed entries into a local mirror directory
+    (subject to `limits` -- ARCHITECTURE.md's Abuse Resistance quotas,
+    checked against cheap metadata before any content is fetched), and merge
+    their known-peer list into ours (peer exchange gossip)."""
+    limits = limits or QuotaLimits()
+    ticket = iroh.EndpointTicket.from_string(ticket_str)
+    addr = ticket.endpoint_addr()
+    ep = await bind_endpoint(identity, relay=relay)
+    try:
+        conn = await ep.connect(addr, ALPN)
+        peer_pubkey_hex = str(conn.remote_id())
+
+        mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+        existing_entries = read_entries(mirror_dir)
+        since_seq = len(existing_entries)
+
+        meta_response = await _request(conn, {"op": "get_feed_meta", "since_seq": since_seq})
+        if "error" in meta_response:
+            raise RuntimeError(f"peer {peer_pubkey_hex} returned an error for get_feed_meta: {meta_response['error']}")
+        candidate_entries = [FeedEntry(**d) for d in meta_response.get("entries", [])]
+        quota_result = check_feed_metadata(existing_entries, candidate_entries, limits)
+
+        new_entries: list[dict] = []
+        if quota_result.allowed_count > 0:
+            feed_response = await _request(
+                conn, {"op": "get_feed", "since_seq": since_seq, "limit": quota_result.allowed_count},
+            )
+            if "error" in feed_response:
+                raise RuntimeError(f"peer {peer_pubkey_hex} returned an error for get_feed: {feed_response['error']}")
+            new_entries = feed_response.get("entries", [])
+            for wire_entry in new_entries:
+                entry, blob = _entry_from_wire(wire_entry)
+                write_received_entry(mirror_dir, peer_pubkey_hex, entry, blob)
+
+        verify_result = (
+            verify_feed(mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
+            if mirror_dir.exists()
+            else FeedVerifyResult(0, 0, None)
+        )
+
+        peers_response = await _request(conn, {"op": "get_peers"})
+        if "error" in peers_response:
+            raise RuntimeError(f"peer {peer_pubkey_hex} returned an error for get_peers: {peers_response['error']}")
+        local_peers = load_peers(peers_path)
+        for peer_dict in peers_response.get("peers", []):
+            gossiped = Peer(**{**peer_dict, "added_via": "gossip"})
+            local_peers = upsert_peer(local_peers, gossiped)
+
+        now = datetime.now(timezone.utc).isoformat()
+        local_peers = upsert_peer(local_peers, Peer(
+            ticket=ticket_str, feed_pubkey_hex=peer_pubkey_hex,
+            first_seen=now, last_seen=now, added_via=added_via,
+        ))
+        save_peers(local_peers, peers_path)
+
+        return SyncReport(
+            peer_pubkey_hex=peer_pubkey_hex,
+            new_entry_count=len(new_entries),
+            verify=verify_result,
+            quota=quota_result,
+            peers_known=len(local_peers),
+        )
+    finally:
+        await ep.close()

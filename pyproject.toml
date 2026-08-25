@@ -1,0 +1,41 @@
+[project]
+name = "roastnet"
+version = "0.1.0"
+description = "Local parser, metadata extractor, and search index for Artisan .alog roast profiles -- the standalone building block for a P2P roast-profile sharing network."
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "cryptography>=42",
+    "iroh>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+build = [
+    "pyinstaller>=6.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[project.scripts]
+roastnet = "roastnet.cli:main"
+
+[project.gui-scripts]
+# Declared under gui-scripts (not scripts) so on Windows it launches without
+# a console window attached; on Linux the two are equivalent. Same reasoning
+# roastlab's own pyproject.toml uses for roastlab-gui.
+roastnet-gui = "roastnet.gui.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"roastnet.index" = ["schema.sql"]
