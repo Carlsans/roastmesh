@@ -169,7 +169,8 @@ from roastnet.gui.app import RoastnetApp
 app = RoastnetApp()
 app.update()
 tab = app.tabs[2]
-tab._on_start_serve()
+# serving starts automatically on tab construction -- no _on_start_serve()
+# call here, just wait for the ticket that auto-start produces
 for _ in range(200):
     app.update()
     if tab.ticket_var.get():
@@ -212,7 +213,13 @@ def _start_server_process(env: dict, feed_fixture: Path) -> tuple[subprocess.Pop
         env=env, check=True, capture_output=True, text=True, timeout=30,
     )
     proc = subprocess.Popen(
-        [sys.executable, "-m", "roastnet.cli", "node", "serve"],
+        # --no-lan-discovery: the GUI's own NetworkTab now auto-starts a
+        # local server with LAN discovery on (that's the feature), which
+        # would otherwise race with this test's explicit sync call over
+        # the real network this sandbox is connected to -- this test is
+        # about manual sync through the GUI, not LAN discovery (that has
+        # its own dedicated test in test_net.py).
+        [sys.executable, "-m", "roastnet.cli", "node", "serve", "--no-lan-discovery"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     ticket_queue: queue.Queue[str] = queue.Queue()

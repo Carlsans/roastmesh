@@ -209,17 +209,30 @@ def node() -> None:
               help="Peer list to serve (default: ~/.local/share/roastnet/peers.json).")
 @click.option("--no-relay", is_flag=True,
               help="Disable Iroh's relay/hole-punch (same-machine/LAN testing only).")
-def node_serve(feed_dir: Path | None, peers_file: Path | None, no_relay: bool) -> None:
+@click.option("--no-lan-discovery", is_flag=True,
+              help="Don't broadcast/listen for other roastnet nodes on the local network.")
+@click.pass_context
+def node_serve(
+    ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
+    no_relay: bool, no_lan_discovery: bool,
+) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
     Your Iroh node identity IS your feed's Ed25519 identity -- the ticket
     printed here dials the exact key your feed entries are signed with.
+
+    Unless --no-lan-discovery, also finds other roastnet nodes on the same
+    local network automatically (no ticket-pasting needed) and syncs with
+    them, ingesting into --db.
     """
     ident, created = load_or_create_identity()
     _remind_backup_if_new(ident, created)
     feed_dir = feed_dir or default_feed_dir()
     peers_file = peers_file or default_peers_path()
-    asyncio.run(net.serve(ident, feed_dir, peers_file, relay=not no_relay))
+    asyncio.run(net.serve(
+        ident, feed_dir, peers_file, relay=not no_relay,
+        db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
+    ))
 
 
 @main.group()

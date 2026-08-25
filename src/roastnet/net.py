@@ -40,8 +40,19 @@ from typing import Callable
 
 import iroh
 
-from roastnet.feed import FeedEntry, FeedVerifyResult, blob_path_for, read_entries, verify_feed, write_received_entry
+from roastnet.feed import (
+    FeedEntry,
+    FeedVerifyResult,
+    blob_path_for,
+    default_peer_feeds_root,
+    read_entries,
+    verify_feed,
+    write_received_entry,
+)
 from roastnet.identity import Identity
+from roastnet.index.db import connect
+from roastnet.index.ingest import ingest_feed
+from roastnet.lan_discovery import BEACON_INTERVAL_S, BEACON_PORT, run_beacon
 from roastnet.peers import Peer, load_peers, save_peers, upsert_peer
 from roastnet.quota import QuotaCheckResult, QuotaLimits, check_feed_metadata
 
@@ -142,6 +153,38 @@ async def _handle_connection(incoming, feed_dir: Path, peers_path: Path) -> None
         asyncio.create_task(_handle_request(bi, feed_dir, peers_path))
 
 
+async def _auto_sync_discovered_peer(
+    peer_pubkey_hex: str,
+    peer_ticket: str,
+    *,
+    identity: Identity,
+    peer_feeds_root: Path,
+    peers_path: Path,
+    db_path: Path | None,
+    relay: bool,
+) -> None:
+    print(f"lan: discovered {peer_pubkey_hex[:16]}..., syncing", flush=True)
+    try:
+        report = await sync_with_peer(
+            peer_ticket, identity, peer_feeds_root, peers_path, relay=relay, added_via="lan",
+        )
+    except Exception as exc:  # noqa: BLE001 -- a bad/unreachable beacon shouldn't kill serve()
+        print(f"lan: sync with {peer_pubkey_hex[:16]}... failed: {exc!r}", flush=True)
+        return
+
+    verify_msg = "OK" if report.verify.ok else f"INVALID: {report.verify.error}"
+    print(f"lan: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
+          flush=True)
+
+    if db_path is not None and report.new_entry_count > 0:
+        mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+        conn = connect(db_path)
+        try:
+            ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
+        finally:
+            conn.close()
+
+
 async def serve(
     identity: Identity,
     feed_dir: Path,
@@ -149,8 +192,21 @@ async def serve(
     *,
     relay: bool = True,
     ready_callback: Callable[[str], None] | None = None,
+    db_path: Path | None = None,
+    peer_feeds_root: Path | None = None,
+    enable_lan_discovery: bool = True,
+    lan_discovery_port: int = BEACON_PORT,
+    lan_discovery_interval_s: float = BEACON_INTERVAL_S,
 ) -> None:
-    """Bind a node and serve get_peers/get_feed requests forever."""
+    """Bind a node and serve get_peers/get_feed requests forever.
+
+    If `enable_lan_discovery`, also broadcasts/listens for other roastnet
+    nodes on the local network (lan_discovery.run_beacon) and automatically
+    syncs with any it finds -- no manual ticket-pasting needed for two
+    machines on the same LAN. `db_path`, if given, makes those automatic
+    syncs also land in the local search index (same verify-then-ingest
+    pipeline `peer sync` already uses for manual syncs).
+    """
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
     ticket = str(iroh.EndpointTicket.from_addr(ep.addr()))
     if ready_callback:
@@ -163,6 +219,23 @@ async def serve(
         # in the buffer for the process's entire lifetime.
         print(f"listening as {identity.public_key_hex[:16]}...")
         print(f"ticket: {ticket}", flush=True)
+
+    beacon_task = None
+    if enable_lan_discovery:
+        resolved_peer_feeds_root = peer_feeds_root or default_peer_feeds_root()
+
+        async def _on_discovered(peer_pubkey_hex: str, peer_ticket: str) -> None:
+            await _auto_sync_discovered_peer(
+                peer_pubkey_hex, peer_ticket, identity=identity,
+                peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
+                db_path=db_path, relay=relay,
+            )
+
+        beacon_task = asyncio.create_task(run_beacon(
+            identity.public_key_hex, ticket, _on_discovered,
+            port=lan_discovery_port, interval_s=lan_discovery_interval_s,
+        ))
+
     try:
         while True:
             incoming = await ep.accept_next()
@@ -170,6 +243,8 @@ async def serve(
                 break
             asyncio.create_task(_handle_connection(incoming, feed_dir, peers_path))
     finally:
+        if beacon_task is not None:
+            beacon_task.cancel()
         await ep.close()
 
 

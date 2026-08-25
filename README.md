@@ -83,16 +83,24 @@ Three tabs, left to right:
   anything you've synced from peers). Blank search returns everything.
 - **Publish** — pick a `.alog` file and add it to your signed feed. Shows your feed's address
   (public key) at the top; your identity is created silently the first time you publish.
-- **Network** — the piece that talks to other machines:
-  - **Serve your feed**: click "Start serving" to become reachable. A **ticket** (a long string
-    starting with `endpoint...`) appears — that's what you share with someone else so they can
-    sync with you. Click "Copy" to put it on your clipboard. "Stop" when you're done; a fresh
-    "Start serving" later gets a new ticket (it encodes your current network address, not just
-    your identity, so it changes run to run — that's expected).
-  - **Sync with a peer**: paste a ticket *they* gave you and click "Sync". This pulls their new
-    feed entries into your search index and exchanges known-peer lists both ways.
-  - **Known peers**: everyone you've synced with or manually added, refreshed automatically
-    after every sync.
+- **Network** — the piece that talks to other machines. The network is **on automatically**
+  the moment this tab exists — no click needed — and stays on for as long as the app is open:
+  - **Serve your feed**: starts as soon as you open the app. A **ticket** (a long string
+    starting with `endpoint...`) appears — that's what you share with someone *not* on your
+    local network so they can sync with you directly. Click "Copy" to put it on your clipboard.
+    "Stop" if you deliberately want to go offline; "Start serving" resumes (with a fresh ticket
+    — it encodes your current network address, not just your identity, so it's expected to
+    change run to run).
+  - **Automatic LAN discovery**: also on by default. Any other roastnet node on the same local
+    network is found and synced with on its own, continuously, with zero clicks on either side
+    — open the app on two machines on the same LAN and they just find each other. (This is a
+    local broadcast, so it only works between machines on the same network; a peer somewhere
+    else still needs a pasted ticket, below.)
+  - **Sync with a peer**: for someone *not* on your local network — paste the ticket *they* gave
+    you and click "Sync". Pulls their new feed entries into your search index and exchanges
+    known-peer lists both ways, same as an automatic LAN sync does.
+  - **Known peers**: everyone found via LAN discovery, synced with manually, or gossiped about
+    by another peer — refreshes on its own every few seconds, so this stays live.
 
 That's the whole interface — every button just runs the equivalent command shown in the console
 under it, so nothing here is hidden from you.
@@ -138,47 +146,54 @@ Run `roastnet --help` or `roastnet <command> --help` for the full option list on
 This is the actual point of the project, so it's worth walking through end to end. "Machine A"
 and "Machine B" below are two different computers on the same local network — any mix of Linux,
 macOS, or Windows works, since the protocol is the same everywhere; only the [install](#install)
-step differs per OS. All of this is driven from the **Network** tab in `roastnet-gui`.
+step differs per OS.
 
-**1. On Machine A** — publish something so you have data to share, then go to the **Publish**
-tab, choose a `.alog` file, click Publish. Then go to the **Network** tab and click
-**"Start serving"**. A **ticket** appears (a long string starting with `endpoint...`) — click
-**"Copy"**. Leave the app running.
+**If both machines are on the same local network** (true for almost anyone testing this at
+home): there's nothing to click for the networking part at all.
 
-**2. On Machine B** — launch `roastnet-gui`, go to the **Network** tab, paste the ticket from
-Machine A into "Peer's ticket", and click **"Sync"**. The console below it shows how many new
-entries it pulled, whether the feed verified, and how many peers it now knows about; the "Known
-peers" table refreshes automatically. Then switch to the **Search** tab and run a blank search —
-you should see the roast you published on Machine A.
+**1. On Machine A** — launch `roastnet-gui`, go to the **Publish** tab, choose a `.alog` file,
+click Publish. Leave the app running (the **Network** tab is already serving — that started the
+moment the app opened).
 
-**3. Publish something new on Machine A** (Publish tab, while it's still serving), then click
-**"Sync"** again on Machine B with the same ticket still in the field — it should report pulling
-only the new entry, not re-fetching everything (confirms incremental sync is actually
-incremental, not a full re-copy each time).
+**2. On Machine B** — launch `roastnet-gui`. Within a few seconds it finds Machine A on its own
+(Network tab → Known peers) and automatically pulls its content — no ticket, no clicking Sync.
+Switch to the **Search** tab and run a blank search — you should see the roast you published on
+Machine A.
 
-The CLI equivalent of every button above, if you'd rather script it or watch it from a terminal:
+**3. Publish something new on Machine A** (Publish tab, while it's still open) — within the same
+few-second window, it shows up on Machine B automatically too.
+
+**If the two machines are *not* on the same local network**, automatic discovery can't reach
+across networks by nature (it's a local broadcast) — use the **Network** tab's manual path
+instead: "Start serving" on Machine A already ran automatically, so just copy its ticket and
+paste it into "Sync with a peer" on Machine B.
+
+The CLI equivalent, if you'd rather script it or watch it from a terminal (LAN discovery is on
+by default here too — pass `--no-lan-discovery` to `node serve` to turn it off):
 ```bash
 # Machine A
 roastnet feed publish path/to/some-roast.alog
-roastnet node serve                                            # prints the ticket
-# Machine B
-roastnet --db ~/roastnet.sqlite3 peer sync '<paste ticket here>'
+roastnet --db ~/roastnet.sqlite3 node serve
+# Machine B -- nothing else needed if on the same LAN; it'll auto-discover and
+# auto-sync within a few seconds. To sync across networks instead, manually:
+roastnet --db ~/roastnet.sqlite3 peer sync '<paste the ticket Machine A printed>'
 roastnet --db ~/roastnet.sqlite3 search
 ```
 
 **If it doesn't connect:**
-- Double-check you copied the *entire* ticket — it's long, and easy to truncate when
-  copy-pasting (the GUI's "Copy" button avoids this; if typing/pasting by hand in a terminal,
-  be careful).
-- A local firewall on either machine can block the connection — Iroh uses a UDP port (picked
-  automatically each run) for the QUIC handshake. If you have `ufw`/`firewalld`/Windows
-  Firewall/etc. active, try temporarily disabling it on both machines to confirm that's the
-  cause before figuring out a permanent rule.
+- Double-check you copied the *entire* ticket, for the manual/cross-network path — it's long,
+  and easy to truncate when copy-pasting (the GUI's "Copy" button avoids this; if typing/pasting
+  by hand in a terminal, be careful).
+- A local firewall on either machine can block the connection — both the Iroh QUIC handshake
+  (a UDP port picked automatically each run) and LAN auto-discovery (`UDP 41888`, broadcast)
+  need to get through. If you have `ufw`/`firewalld`/Windows Firewall/etc. active, try
+  temporarily disabling it on both machines to confirm that's the cause before figuring out a
+  permanent rule.
 - `roastnet node serve` (CLI only — not exposed as a GUI option yet) accepts `--no-relay`, which
   restricts it to direct connections only, no fallback to Iroh's relay infrastructure. This is
   what this project's own automated tests use for same-process testing; for two *separate*
-  machines it's untested by me specifically, but worth trying if the GUI/default CLI mode
-  doesn't connect.
+  machines it's untested by me specifically, but worth trying if the default mode doesn't
+  connect.
 - Both machines need real internet access even for a LAN-only test *unless* you use
   `--no-relay` — the default mode's relay/hole-punch path involves Iroh's public relay
   infrastructure as a fallback.

@@ -196,12 +196,14 @@ class NetworkTab(Tab):
         super().__init__(parent, app)
         self.serve_task: Task | None = None
         self.sync_task: Task | None = None
+        self._closed = False
 
         heading(self, "Network", "Serve your feed to peers, and pull theirs.")
-        explain(self, "Start serving to become reachable, then share the ticket shown below with "
-                       "someone on your network (or anywhere) -- they paste it under 'Sync with a "
-                       "peer' on their end. Syncing pulls their new feed entries into your search "
-                       "index and exchanges known-peer lists both ways.")
+        explain(self, "The network is on automatically while this app is running -- peers on your "
+                       "local network are found and synced with on their own, no clicking needed. "
+                       "For a peer that isn't on the same local network, share the ticket shown "
+                       "below with them, or paste theirs under 'Sync with a peer' to reach them "
+                       "directly.")
 
         serve_section = section(self, "Serve your feed")
         tk.Label(serve_section, text="Your ticket:", font=FONT_BOLD, bg=BG, fg=FG).pack(
@@ -224,13 +226,24 @@ class NetworkTab(Tab):
         peers_section = section(self, "Known peers")
         self.peers_table = PeerTable(peers_section)
 
-        self._refresh_peers()
+        self._on_start_serve()
+        self._schedule_peer_refresh()
 
     def cancel(self) -> None:
+        self._closed = True
         if self.serve_task is not None:
             self.serve_task.cancel()
         if self.sync_task is not None:
             self.sync_task.cancel()
+
+    def _schedule_peer_refresh(self) -> None:
+        # keeps "Known peers" (and thus visibility into LAN auto-discovery)
+        # live without the user ever clicking anything -- self-reschedules
+        # until the tab/app is torn down.
+        if self._closed:
+            return
+        self._refresh_peers()
+        self.after(5000, self._schedule_peer_refresh)
 
     def _copy_ticket(self) -> None:
         ticket = self.ticket_var.get()
@@ -242,7 +255,7 @@ class NetworkTab(Tab):
     def _on_start_serve(self) -> None:
         if self.serve_task is not None and self.serve_task.running:
             return
-        argv = roastnet_argv("node", "serve")
+        argv = roastnet_argv("--db", self.app.db_path.get(), "node", "serve")
         self.serve_console.clear()
         self.serve_console.set_command(describe(argv))
         self.ticket_var.set("")

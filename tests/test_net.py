@@ -19,7 +19,8 @@ FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:3]
 async def _start_server(identity, feed_dir, peers_path):
     ready: asyncio.Future = asyncio.get_event_loop().create_future()
     task = asyncio.create_task(
-        net.serve(identity, feed_dir, peers_path, relay=False, ready_callback=ready.set_result)
+        net.serve(identity, feed_dir, peers_path, relay=False, ready_callback=ready.set_result,
+                  enable_lan_discovery=False)  # these tests exercise manual sync, not LAN discovery
     )
     ticket = await asyncio.wait_for(ready, timeout=10)
     return task, ticket
@@ -285,3 +286,58 @@ async def test_sync_quota_allows_more_once_cap_room_frees_up_across_syncs(tmp_pa
         assert third.verify.valid_count == 3
     finally:
         await _stop_server(server_task)
+
+
+async def test_lan_discovery_auto_syncs_without_a_manual_sync_call(tmp_path: Path) -> None:
+    """The actual proof of the feature: two serve() instances with LAN
+    discovery on find each other and node B ends up with node A's entries
+    in its search index -- without net.sync_with_peer ever being called
+    directly anywhere in this test."""
+    from roastnet.index.db import connect
+
+    LAN_PORT = 41977  # dedicated test port -- distinct from the production default
+
+    node_a_identity = generate_identity()
+    node_a_feed_dir = tmp_path / "node_a_feed"
+    _publish(node_a_feed_dir, node_a_identity, FIXTURES[:2])
+
+    node_b_identity = generate_identity()
+    node_b_db_path = tmp_path / "node_b.sqlite3"
+
+    node_a_ready: asyncio.Future = asyncio.get_event_loop().create_future()
+    node_b_ready: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    task_a = asyncio.create_task(net.serve(
+        node_a_identity, node_a_feed_dir, tmp_path / "node_a_peers.json", relay=False,
+        ready_callback=node_a_ready.set_result, enable_lan_discovery=True,
+        lan_discovery_port=LAN_PORT, lan_discovery_interval_s=0.3,
+    ))
+    task_b = asyncio.create_task(net.serve(
+        node_b_identity, tmp_path / "node_b_feed", tmp_path / "node_b_peers.json", relay=False,
+        ready_callback=node_b_ready.set_result, enable_lan_discovery=True,
+        lan_discovery_port=LAN_PORT, lan_discovery_interval_s=0.3,
+        db_path=node_b_db_path, peer_feeds_root=tmp_path / "node_b_peer_feeds",
+    ))
+    try:
+        await asyncio.wait_for(node_a_ready, timeout=10)
+        await asyncio.wait_for(node_b_ready, timeout=10)
+
+        found = False
+        for _ in range(100):
+            await asyncio.sleep(0.2)
+            if node_b_db_path.exists():
+                conn = connect(node_b_db_path)
+                count = conn.execute("SELECT COUNT(*) FROM roasts").fetchone()[0]
+                conn.close()
+                if count == 2:
+                    found = True
+                    break
+        assert found, "node B never auto-synced node A's entries via LAN discovery"
+
+        b_peers = load_peers(tmp_path / "node_b_peers.json")
+        by_pubkey = {p.feed_pubkey_hex: p for p in b_peers}
+        assert node_a_identity.public_key_hex in by_pubkey
+        assert by_pubkey[node_a_identity.public_key_hex].added_via == "lan"
+    finally:
+        await _stop_server(task_a)
+        await _stop_server(task_b)
