@@ -378,3 +378,46 @@ async def test_serve_auto_publishes_files_dropped_in_the_watch_folder(tmp_path: 
         assert published, "dropped file was never auto-published"
     finally:
         await _stop_server(task)
+
+
+async def test_serve_auto_ingests_watch_folder_files_as_the_users_own_roasts(tmp_path: Path) -> None:
+    """The watch-folder path must also connect to search -- otherwise a
+    file dropped there gets shared with every peer but never shows up in
+    the user's own local search, the same disconnect `feed publish` used
+    to have before it auto-ingested too."""
+    from roastnet.index.db import connect
+
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    watch_dir = tmp_path / "watch"
+    db_path = tmp_path / "index.sqlite3"
+
+    ready: asyncio.Future = asyncio.get_event_loop().create_future()
+    task = asyncio.create_task(net.serve(
+        identity, feed_dir, tmp_path / "peers.json", relay=False,
+        ready_callback=ready.set_result, enable_lan_discovery=False,
+        publish_watch_dir=watch_dir, publish_watch_interval_s=0.2, db_path=db_path,
+    ))
+    try:
+        await asyncio.wait_for(ready, timeout=10)
+        for _ in range(50):
+            if watch_dir.is_dir():
+                break
+            await asyncio.sleep(0.1)
+        shutil.copy(FIXTURES[0], watch_dir / FIXTURES[0].name)
+
+        indexed_as_own = False
+        for _ in range(50):
+            await asyncio.sleep(0.2)
+            if db_path.exists():
+                conn = connect(db_path)
+                try:
+                    row = conn.execute("SELECT is_user_log FROM roasts").fetchone()
+                finally:
+                    conn.close()
+                if row is not None and row["is_user_log"] == 1:
+                    indexed_as_own = True
+                    break
+        assert indexed_as_own, "dropped file was never indexed as one of the user's own roasts"
+    finally:
+        await _stop_server(task)

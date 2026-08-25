@@ -47,17 +47,29 @@ def normalize_machine_key(roastertype: str | None) -> tuple[str, str, str]:
     return slug or "unknown", "unknown", roastertype or "Unknown"
 
 
-# DROP bean-temperature bands (Celsius) mapped to common home-roasting
-# roast-level names. There is no universal agreement on exact boundaries --
-# one roaster's "Vienna" is another's "Full City+" -- these are a reasonable
-# midpoint of published guides, used only as a last-resort fallback when no
-# explicit roast-level text is available.
+# DROP bean-temperature bands (Celsius), following
+# thecaptainscoffee.com/pages/roast-levels exactly: each cutoff below is
+# that level's own printed upper bound on that page (City 205C, City+
+# 207-210C, Full City 210-221C, Full City+ 218-224C, Vienna 221-227C,
+# French 227-235C, Italian/Spanish over 235C) -- not a value derived from
+# where the next level happens to start. That source's own ranges overlap
+# between adjacent levels (typical of these guides -- roast level is a
+# continuum, not a hard cutoff: Full City's 210-221C already overlaps
+# Full City+'s 218-224C, which overlaps Vienna's 221-227C); checked in
+# ascending order, a temperature in one of those overlaps resolves to
+# whichever named level's own range starts lower. There is no band below
+# "light" or above "italian/spanish" because the page doesn't define one --
+# it starts at Cinnamon (196C) and light-roast territory below that isn't
+# named on it at all, so "light" (this project's own pre-existing catch-all
+# for "cooler than City", not one of the page's named levels) is kept as
+# the floor rather than inventing a boundary the source doesn't state.
 ROAST_LEVEL_BANDS_C: list[tuple[float, str]] = [
     (205.0, "light"),
-    (215.0, "city"),
-    (221.0, "city+"),
-    (227.0, "full city"),
-    (230.0, "full city+"),
-    (238.0, "vienna"),
-    (float("inf"), "french"),
+    (207.0, "city"),
+    (210.0, "city+"),
+    (221.0, "full city"),
+    (224.0, "full city+"),
+    (227.0, "vienna"),
+    (235.0, "french"),
+    (float("inf"), "italian/spanish"),
 ]

@@ -82,10 +82,11 @@ class RoastRecord:
     density_g_per_l: float | None
 
     # bean / roast metadata
+    title: str | None  # Artisan's own `title` field -- often left at its default ("Roaster Scope")
     beans_text: str | None
     roast_date: str | None
     roast_epoch: int | None
-    roast_type: str | None  # e.g. "full city" -- explicit tag, else heuristically classified
+    roast_type: str | None  # e.g. "full city" -- always from peak bean temperature, see roast_level.py
 
     # raw curves (kept for display/export; not persisted as first-class columns)
     timex_s: list[float]

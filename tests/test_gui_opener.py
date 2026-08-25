@@ -22,6 +22,14 @@ was handed. _find_artisan_launcher/_stage_for_artisan are the fix, kept
 general on purpose (not hardcoded to just the one packaging this was
 found on) so the same class of bug doesn't resurface for some other
 sandboxed distribution of Artisan later.
+
+Part three: even once Artisan launched and could read the file, a
+different real machine hit "openssl not found" / libcrypto.so errors --
+the frozen roastnet-gui sets LD_LIBRARY_PATH to its own PyInstaller temp
+extraction dir (confirmed via /proc/<pid>/environ on a real frozen
+build), and every external program _run_opener launches inherited it,
+picking up roastnet's *bundled* libcrypto over the system's own.
+_external_subprocess_env is the fix.
 """
 from __future__ import annotations
 
@@ -33,6 +41,7 @@ import pytest
 pytest.importorskip("tkinter")
 
 from roastnet.gui.app import (
+    _external_subprocess_env,
     _find_artisan_launcher,
     _is_snap_wrapper,
     _open_alog_file,
@@ -254,3 +263,51 @@ def test_open_alog_file_does_not_stage_for_a_plain_native_install(monkeypatch, t
     assert error is None
     seen_path = (tmp_path / "seen_path.txt").read_text().strip()
     assert seen_path == str(source)
+
+
+# _external_subprocess_env: the real bug behind "openssl not found" /
+# libcrypto.so errors a user hit on a different machine than the one
+# above -- a frozen roastnet-gui's LD_LIBRARY_PATH (pointing at its own
+# PyInstaller temp extraction dir) leaking into every external program
+# _run_opener launches.
+
+def test_external_subprocess_env_is_none_when_not_frozen(monkeypatch) -> None:
+    monkeypatch.delattr("sys.frozen", raising=False)
+    assert _external_subprocess_env() is None
+
+
+def test_external_subprocess_env_drops_ld_library_path_when_frozen_with_no_original(monkeypatch) -> None:
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxxxxxx")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+
+    env = _external_subprocess_env()
+
+    assert env is not None
+    assert "LD_LIBRARY_PATH" not in env
+
+
+def test_external_subprocess_env_restores_the_original_when_frozen(monkeypatch) -> None:
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxxxxxx")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/lib/some-real-system-path")
+
+    env = _external_subprocess_env()
+
+    assert env is not None
+    assert env["LD_LIBRARY_PATH"] == "/usr/lib/some-real-system-path"
+
+
+def test_run_opener_never_leaks_a_frozen_ld_library_path_to_the_child(monkeypatch) -> None:
+    """The actual integration point, not just _external_subprocess_env in
+    isolation: the child reports its own view of LD_LIBRARY_PATH as its
+    error text (via a nonzero exit) -- if _run_opener didn't sanitize the
+    environment before spawning it, this would come back containing the
+    fake PyInstaller temp path set below."""
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxxxxxx")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+
+    error = _run_opener(["sh", "-c", 'echo "LD=[$LD_LIBRARY_PATH]"; exit 1'])
+
+    assert error == "LD=[]"

@@ -39,6 +39,33 @@ def test_reingesting_same_file_is_a_dedup_noop(conn) -> None:
     assert row_count == 1
 
 
+def test_reingesting_same_file_refreshes_derived_fields_without_duplicating_the_row(conn) -> None:
+    """"Dedup" means "don't duplicate the source/blob row", not "never
+    look at this content again" -- a parser/schema improvement (a newly
+    extracted field, say) must take effect the next time a file happens
+    to be (re-)ingested, or every already-ingested roast is stuck showing
+    stale data indefinitely with no way to refresh it short of wiping the
+    whole index. Confirmed as a real gap in production: a field added to
+    the parser after this project had already shipped left an
+    already-ingested roast's title blank forever, even though the
+    original file on disk had a real one, until this fix."""
+    path = FIXTURES_DIR / "kaleido_1.alog"
+    first = ingest_file(conn, path, is_user_log=False)
+    assert first.record.is_user_log is False
+
+    second = ingest_file(conn, path, is_user_log=True)
+    assert second.skipped_duplicate is True
+    assert second.record.is_user_log is True
+    assert second.record.roast_id == first.record.roast_id  # same row, not a new one
+
+    row_count = conn.execute("SELECT COUNT(*) FROM roasts").fetchone()[0]
+    assert row_count == 1
+    stored = conn.execute(
+        "SELECT is_user_log FROM roasts WHERE roast_id = ?", (first.record.roast_id,)
+    ).fetchone()
+    assert stored["is_user_log"] == 1
+
+
 def test_milestones_and_phase_profile_stored(conn) -> None:
     result = ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog")
     roast_id = result.record.roast_id
@@ -81,6 +108,47 @@ def test_search_with_no_filters_returns_everything(conn) -> None:
     ingest_path(conn, FIXTURES_DIR)
     total = conn.execute("SELECT COUNT(*) FROM roasts").fetchone()[0]
     assert len(repo.search_roasts(conn)) == total
+
+
+def test_search_own_only_filters_to_is_user_log(conn) -> None:
+    ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog", is_user_log=True)
+    ingest_file(conn, FIXTURES_DIR / "hottop_1.alog", is_user_log=False)
+
+    own = repo.search_roasts(conn, own_only=True)
+    assert len(own) == 1
+    assert own[0].is_user_log is True
+
+    everything = repo.search_roasts(conn, own_only=False)
+    assert len(everything) == 2
+
+
+def test_set_hidden_excludes_from_search_by_default_and_include_hidden_reveals_it(conn) -> None:
+    result = ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog")
+    roast_id = result.record.roast_id
+
+    assert len(repo.search_roasts(conn)) == 1
+    assert repo.find_hidden(conn, roast_id) is False
+
+    updated = repo.set_hidden(conn, roast_id, True)
+    assert updated is True
+    assert repo.find_hidden(conn, roast_id) is True
+
+    assert repo.search_roasts(conn) == []
+    shown = repo.search_roasts(conn, include_hidden=True)
+    assert len(shown) == 1
+    assert shown[0].hidden is True
+
+    repo.set_hidden(conn, roast_id, False)
+    assert repo.find_hidden(conn, roast_id) is False
+    assert len(repo.search_roasts(conn)) == 1
+
+
+def test_set_hidden_returns_false_for_an_unknown_roast_id(conn) -> None:
+    assert repo.set_hidden(conn, "not-a-real-id", True) is False
+
+
+def test_find_hidden_returns_none_for_an_unknown_roast_id(conn) -> None:
+    assert repo.find_hidden(conn, "not-a-real-id") is None
 
 
 def test_load_full_record_round_trips(conn) -> None:

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS roasts (
     batch_weight_in_g              REAL,
     batch_weight_out_g               REAL,
     density_g_per_l                    REAL,
+    title                                 TEXT,  -- Artisan's own `title` field, often left at its default
     beans_text                           TEXT,
     roast_date                             TEXT,
     roast_epoch                              INTEGER,
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS roasts (
     roasting_notes                               TEXT,
     cupping_notes                                  TEXT,
     is_user_log                                      INTEGER NOT NULL DEFAULT 0,
+    hidden                                             INTEGER NOT NULL DEFAULT 0,  -- local-only: hidden from this machine's own search, never touches the feed or peers
     parse_warnings_json                                TEXT,
     raw_json                                             TEXT NOT NULL
 );

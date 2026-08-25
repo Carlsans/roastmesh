@@ -26,16 +26,25 @@ from pathlib import Path
 
 from roastnet.feed import FeedEntry, append_entry, read_entries
 from roastnet.identity import Identity
+from roastnet.index.db import connect
+from roastnet.index.ingest import ingest_file
 
 
 def default_watch_dir() -> Path:
     return Path.home() / "RoastNetShare"
 
 
-def publish_new_files(feed_dir: Path, identity: Identity, watch_dir: Path) -> list[FeedEntry]:
+def publish_new_files(
+    feed_dir: Path, identity: Identity, watch_dir: Path, *, db_path: Path | None = None,
+) -> list[FeedEntry]:
     """Publish every `.alog` file directly under `watch_dir` that isn't
     already in the feed (by content hash), in filename order. Safe to call
-    repeatedly -- already-published files are skipped, not re-published."""
+    repeatedly -- already-published files are skipped, not re-published.
+
+    If `db_path` is given, each newly-published file is also added to the
+    local search index as one of "your own roasts" (is_user_log=True) --
+    without this, publishing and search are disconnected: a file could be
+    shared with every peer yet never show up in your own search results."""
     watch_dir = Path(watch_dir)
     if not watch_dir.is_dir():
         return []
@@ -52,4 +61,10 @@ def publish_new_files(feed_dir: Path, identity: Identity, watch_dir: Path) -> li
         entry = append_entry(feed_dir, identity, path, timestamp=datetime.now(timezone.utc).isoformat())
         existing_hashes.add(content_sha256)
         published.append(entry)
+        if db_path is not None:
+            conn = connect(db_path)
+            try:
+                ingest_file(conn, path, is_user_log=True)
+            finally:
+                conn.close()
     return published

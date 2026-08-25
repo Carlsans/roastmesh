@@ -19,6 +19,34 @@ def find_source_by_hash(conn: sqlite3.Connection, content_sha256: str) -> sqlite
     return cur.fetchone()
 
 
+def find_roast_id_by_source(conn: sqlite3.Connection, source_id: str) -> str | None:
+    cur = conn.execute("SELECT roast_id FROM roasts WHERE source_id = ?", (source_id,))
+    row = cur.fetchone()
+    return row["roast_id"] if row else None
+
+
+def set_hidden(conn: sqlite3.Connection, roast_id: str, hidden: bool) -> bool:
+    """Hide (or unhide) one roast from this machine's own search results.
+
+    Purely local: never touches the feed, so it doesn't retroactively
+    remove anything already replicated to a peer, and doesn't stop it
+    from being replicated to a peer syncing for the first time in the
+    future either -- the feed's signed, hash-chained entries can't be
+    selectively skipped when serving get_feed without breaking every
+    later entry's prev_hash for that peer (ARCHITECTURE.md's Core Model).
+    This only ever changes what THIS machine chooses to show itself.
+    Returns whether a row was actually found and updated."""
+    cur = conn.execute("UPDATE roasts SET hidden = ? WHERE roast_id = ?", (int(hidden), roast_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def find_hidden(conn: sqlite3.Connection, roast_id: str) -> bool | None:
+    cur = conn.execute("SELECT hidden FROM roasts WHERE roast_id = ?", (roast_id,))
+    row = cur.fetchone()
+    return bool(row["hidden"]) if row else None
+
+
 def insert_source(
     conn: sqlite3.Connection,
     *,
@@ -42,14 +70,14 @@ def insert_roast(conn: sqlite3.Connection, record: RoastRecord, source_id: str) 
     conn.execute(
         """INSERT OR REPLACE INTO roasts
            (roast_id, source_id, roast_uuid, roaster_type_raw, machine_key, mechanism_family,
-            batch_weight_in_g, batch_weight_out_g, density_g_per_l, beans_text, roast_date,
+            batch_weight_in_g, batch_weight_out_g, density_g_per_l, title, beans_text, roast_date,
             roast_epoch, roast_type, roasting_notes, cupping_notes, is_user_log,
             parse_warnings_json, raw_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             record.roast_id, source_id, record.roast_uuid, record.roaster_type_raw,
             record.machine_key, record.mechanism_family, record.batch_weight_in_g,
-            record.batch_weight_out_g, record.density_g_per_l, record.beans_text,
+            record.batch_weight_out_g, record.density_g_per_l, record.title, record.beans_text,
             record.roast_date, record.roast_epoch, record.roast_type, record.roasting_notes,
             record.cupping_notes, int(record.is_user_log),
             json.dumps(record.parse_warnings), json.dumps(record.to_dict()),
@@ -102,12 +130,17 @@ class RoastSearchRow:
     roast_type: str | None
     batch_weight_in_g: float | None
     density_g_per_l: float | None
+    title: str | None
     beans_text: str | None
     roast_date: str | None
     dtr_pct: float | None
     total_time_s: float | None
     drop_bt_c: float | None
     source_ref: str
+    source_type: str
+    raw_path: str
+    is_user_log: bool
+    hidden: bool
 
 
 def _fts_query(text: str) -> str:
@@ -128,11 +161,13 @@ def search_roasts(
     dtr_max: float | None = None,
     drop_bt_min: float | None = None,
     after_second_crack: bool | None = None,
+    own_only: bool = False,
+    include_hidden: bool = False,
 ) -> list[RoastSearchRow]:
     sql = """
         SELECT r.roast_id, r.machine_key, r.mechanism_family, r.roast_type,
-               r.batch_weight_in_g, r.density_g_per_l, r.beans_text, r.roast_date,
-               s.source_ref, p.dtr_pct, p.total_time_s,
+               r.batch_weight_in_g, r.density_g_per_l, r.title, r.beans_text, r.roast_date,
+               r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, p.dtr_pct, p.total_time_s,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'DROP') AS drop_bt_c,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'SC_START') AS sc_start_bt_c
         FROM roasts r
@@ -163,6 +198,10 @@ def search_roasts(
             "(SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'DROP') >= ?"
         )
         params.append(drop_bt_min)
+    if own_only:
+        conditions.append("r.is_user_log = 1")
+    if not include_hidden:
+        conditions.append("r.hidden = 0")
 
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
@@ -176,12 +215,17 @@ def search_roasts(
             roast_type=row["roast_type"],
             batch_weight_in_g=row["batch_weight_in_g"],
             density_g_per_l=row["density_g_per_l"],
+            title=row["title"],
             beans_text=row["beans_text"],
             roast_date=row["roast_date"],
             dtr_pct=row["dtr_pct"],
             total_time_s=row["total_time_s"],
             drop_bt_c=row["drop_bt_c"],
             source_ref=row["source_ref"],
+            source_type=row["source_type"],
+            raw_path=row["raw_path"],
+            is_user_log=bool(row["is_user_log"]),
+            hidden=bool(row["hidden"]),
         )
         for row in cur.fetchall()
         # after_second_crack can't be expressed as a plain SQL predicate

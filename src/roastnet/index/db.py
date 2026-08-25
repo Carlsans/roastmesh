@@ -32,7 +32,28 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+# Columns added to a table after it first shipped: `CREATE TABLE IF NOT
+# EXISTS` in schema.sql only creates a *new* table with the current
+# definition -- it does nothing to a table an earlier version already
+# created on disk, so a column added there needs an explicit, idempotent
+# ALTER TABLE here too, or every already-existing database silently never
+# gets it. (table, column, sql_type) -- add a row here, never edit an
+# already-shipped one.
+_ADDED_COLUMNS: list[tuple[str, str, str]] = [
+    ("roasts", "title", "TEXT"),
+    ("roasts", "hidden", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
+def _apply_added_columns(conn: sqlite3.Connection) -> None:
+    for table, column, sql_type in _ADDED_COLUMNS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     schema_sql = resources.files("roastnet.index").joinpath("schema.sql").read_text()
     conn.executescript(schema_sql)
+    _apply_added_columns(conn)
     conn.commit()

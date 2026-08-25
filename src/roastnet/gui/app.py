@@ -15,12 +15,14 @@ above its output.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import signal
 import subprocess
 import sys
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, ttk
 
@@ -46,6 +48,36 @@ from roastnet.gui.widgets import (
 )
 
 
+def _external_subprocess_env() -> dict[str, str] | None:
+    """The environment to launch an external (non-roastnet) program with.
+
+    A PyInstaller-frozen roastnet-gui sets LD_LIBRARY_PATH to point at its
+    own self-extracted temp directory, so its bundled .so files (built
+    for roastnet's own Python/cryptography/etc.) are what get found first
+    -- confirmed as the cause of a real bug: opening a roast crashed with
+    "openssl not found" / libcrypto.so errors, because the external
+    program's dynamic linker picked up roastnet's *bundled* libcrypto
+    over the system's own, and the bundled one isn't a complete, ABI-
+    compatible OpenSSL install for anything but roastnet itself.
+    subprocess.Popen inherits the parent's environment by default, so
+    every external program launched (xdg-open, flatpak, a plain Artisan
+    binary) picked this up. PyInstaller's bootloader preserves whatever
+    LD_LIBRARY_PATH existed before it overrode it as LD_LIBRARY_PATH_ORIG
+    (only set if one existed at all) -- restore that, or drop the
+    variable entirely if there was none. Returns None (meaning "use the
+    parent's environment, unmodified") when not running frozen, so this
+    has zero effect on a from-source run."""
+    if not getattr(sys, "frozen", False):
+        return None
+    env = dict(os.environ)
+    original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original is not None:
+        env["LD_LIBRARY_PATH"] = original
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def _run_opener(cmd: list[str]) -> str | None:
     """Run an opener command and report what happened. Returns None if it
     looks like it worked, or a short message to show the user if it
@@ -53,7 +85,8 @@ def _run_opener(cmd: list[str]) -> str | None:
     behavior here) is exactly the kind of black box this project's GUI
     otherwise avoids everywhere else."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 env=_external_subprocess_env())
     except OSError as exc:
         return f"could not run {cmd[0]}: {exc}"
     try:
@@ -79,7 +112,6 @@ def _open_with_default_app(path: str) -> str | None:
     """Open `path` (file or folder) with whatever the OS would normally
     use. Returns None on apparent success, or a short error message."""
     if sys.platform == "win32":
-        import os
         try:
             os.startfile(path)  # type: ignore[attr-defined]
             return None
@@ -175,7 +207,7 @@ def _find_artisan_launcher(path: str) -> tuple[list[str], bool] | None:
         # itself is -- `flatpak run` finds the app by id regardless.
         try:
             check = subprocess.run(["flatpak", "info", ARTISAN_FLATPAK_ID],
-                                    capture_output=True, timeout=3)
+                                    capture_output=True, timeout=3, env=_external_subprocess_env())
         except (OSError, subprocess.TimeoutExpired):
             check = None
         if check is not None and check.returncode == 0:
@@ -237,7 +269,9 @@ class SearchTab(Tab):
         super().__init__(parent, app)
         heading(self, "Search", "Find roast profiles in your local index.")
         explain(self, "Text (optional) is matched against bean/process notes and roast type. "
-                       "The filters below narrow further -- leave any blank to not filter on it.")
+                       "The filters below narrow further -- leave any blank to not filter on it. "
+                       "\"LAN only\" is on by default, so a stranger found through internet-wide "
+                       "discovery doesn't show up in results just for being nearby on the network.")
 
         self.query = Field(self, "Text", help_text="Free-text search, e.g. 'washed ethiopian'.")
         self.machine = Field(self, "Machine", help_text="Exact machine_key, e.g. kaleido_m2.")
@@ -246,6 +280,24 @@ class SearchTab(Tab):
         self.dtr_max = Field(self, "DTR max %", width=8)
         self.drop_after = Field(self, "Drop after (°C)", width=8)
         self.second_crack = Choice(self, "After second crack?", ["any", "yes", "no"], default="any")
+
+        self.lan_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            self, text="LAN only (hide results from internet-wide or manually-added peers)",
+            variable=self.lan_only,
+        ).pack(anchor="w", padx=10, pady=(6, 2))
+
+        self.own_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self, text="Only my own roasts (hide everything synced from any peer)",
+            variable=self.own_only,
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+
+        self.show_hidden = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self, text="Show hidden roasts too",
+            variable=self.show_hidden,
+        ).pack(anchor="w", padx=10, pady=(0, 2))
 
         self._output: list[str] = []
         self.runbar = RunBar(self, "Search", self._on_run, self.cancel)
@@ -273,6 +325,12 @@ class SearchTab(Tab):
             args.append("--after-second-crack")
         elif choice == "no":
             args.append("--not-after-second-crack")
+        if not self.lan_only.get():
+            args.append("--all-peers")
+        if self.own_only.get():
+            args.append("--own-only")
+        if self.show_hidden.get():
+            args.append("--show-hidden")
         args.append("--json")
         return args
 
@@ -308,32 +366,45 @@ class SearchTab(Tab):
         buf: list[str] = []
         task = Task(argv=argv)
         task.start()
-        stream_into(task, buf.append, lambda code: self._open_row_loaded(code, buf),
+        stream_into(task, buf.append, lambda code: self._open_row_loaded(code, buf, roast_id),
                     lambda ms, fn: self.after(ms, fn))
 
-    def _open_row_loaded(self, code: int, buf: list[str]) -> None:
+    def _open_row_loaded(self, code: int, buf: list[str], roast_id: str) -> None:
         if code != 0:
             return
         try:
             payload = json.loads("".join(buf))
         except json.JSONDecodeError:
             return
-        RoastDetailWindow(self, payload.get("record") or {}, payload.get("raw_path"))
+        # kept as an attribute (not just a local) so tests can reach the
+        # window that opened without needing to walk winfo_children()
+        self._last_detail_window = RoastDetailWindow(
+            self, self.app, roast_id, payload.get("record") or {}, payload.get("raw_path"),
+            bool(payload.get("hidden")), on_change=self._on_run,
+        )
 
 
 class RoastDetailWindow(tk.Toplevel):
-    """A search result, opened: full metadata, milestones, notes, and a
-    button to open the original .alog file -- with a real Artisan install
+    """A search result, opened: full metadata, milestones, notes, and
+    buttons to open the original .alog file -- with a real Artisan install
     if one is found on PATH, since the OS's generic file-type handler for
-    .alog is very often a text editor instead (see _open_alog_file).
-    Whatever happens, success or failure, is reported in the status line
-    below the button -- never silent."""
+    .alog is very often a text editor instead (see _open_alog_file) -- and
+    to hide/unhide it from this machine's own search results. Whatever
+    happens (opening the file, or hide/unhide), success or failure is
+    reported in the status line below the buttons -- never silent."""
 
-    def __init__(self, parent: tk.Widget, record: dict, raw_path: str | None) -> None:
+    def __init__(
+        self, parent: tk.Widget, app: "RoastnetApp", roast_id: str, record: dict,
+        raw_path: str | None, hidden: bool, *, on_change: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.app = app
+        self.roast_id = roast_id
+        self.hidden = hidden
+        self.on_change = on_change
         self.configure(bg=BG)
         beans_lines = (record.get("beans_text") or "").splitlines()
-        title = beans_lines[0] if beans_lines else "Roast detail"
+        title = record.get("title") or (beans_lines[0] if beans_lines else "Roast detail")
         self.title(title)
 
         heading(self, title)
@@ -350,7 +421,11 @@ class RoastDetailWindow(tk.Toplevel):
                      bg=BG, fg=MUTED, anchor="w", wraplength=600, justify="left").pack(side="left")
 
         row("Machine", f"{record.get('machine_key')} ({record.get('roaster_type_raw')})")
-        row("Roast type", record.get("roast_type"))
+        roast_type_value = (
+            f"{record['roast_type']} (estimated from peak temperature -- "
+            "may not hold for every machine's probe)"
+        ) if record.get("roast_type") else None
+        row("Roast type", roast_type_value)
         row("Batch in / out", f"{record.get('batch_weight_in_g')}g / {record.get('batch_weight_out_g')}g")
         row("Roast date", record.get("roast_date"))
 
@@ -374,21 +449,44 @@ class RoastDetailWindow(tk.Toplevel):
                        command=lambda: self._on_open_file(raw_path)).pack(side="left")
             ttk.Button(btn_row, text="Copy path",
                        command=lambda: _copy_to_clipboard(self, raw_path)).pack(side="left", padx=(6, 0))
+        self.hide_button = ttk.Button(
+            btn_row, text=("Unhide" if hidden else "Hide"), command=self._on_toggle_hidden,
+        )
+        self.hide_button.pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
 
         if raw_path:
             tk.Label(self, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
                      wraplength=840, justify="left").pack(fill="x", padx=14, pady=(4, 0))
 
-        self.open_status_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self.open_status_var, font=("TkDefaultFont", 9), fg=MUTED,
+        self.status_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self.status_var, font=("TkDefaultFont", 9), fg=MUTED,
                  bg=BG, anchor="w", wraplength=840, justify="left").pack(fill="x", padx=14, pady=(2, 12))
 
     def _on_open_file(self, path: str) -> None:
         error = _open_alog_file(path)
-        self.open_status_var.set(
+        self.status_var.set(
             f"Couldn't open it: {error}. The file itself is at the path shown above." if error else ""
         )
+
+    def _on_toggle_hidden(self) -> None:
+        command = "unhide" if self.hidden else "hide"
+        argv = roastnet_argv("--db", self.app.db_path.get(), command, self.roast_id)
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._on_hide_toggled(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_hide_toggled(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            self.status_var.set(f"Couldn't change hidden status: {''.join(buf).strip()}")
+            return
+        self.hidden = not self.hidden
+        self.hide_button.configure(text="Unhide" if self.hidden else "Hide")
+        self.status_var.set("Hidden from your own search results." if self.hidden else "Unhidden.")
+        if self.on_change:
+            self.on_change()
 
 
 class PublishTab(Tab):

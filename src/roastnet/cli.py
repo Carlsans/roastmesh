@@ -15,7 +15,7 @@ from roastnet.gateway import make_server
 from roastnet.identity import load_or_create_identity
 from roastnet.index import repository as repo
 from roastnet.index.db import connect
-from roastnet.index.ingest import ingest_feed, ingest_path
+from roastnet.index.ingest import ingest_feed, ingest_file, ingest_path
 from roastnet.peers import Peer, default_peers_path, load_peers, node_id_from_ticket, prune_stale, save_peers, upsert_peer
 from roastnet.watch_folder import default_watch_dir
 
@@ -85,6 +85,27 @@ def reindex(ctx: click.Context, path: Path) -> None:
             click.echo(f"error: {result.error}", err=True)
 
 
+def _filter_lan_only(rows: list, peers_file: Path) -> list:
+    """Keep own roasts (source_type != "p2p") and roasts from peers whose
+    `added_via` is "lan" (peer discovered by LAN broadcast, not the
+    internet-wide DHT, a manual paste, or gossip); drop everything else.
+    Provenance for a p2p row lives in peers.json, not the SQLite index --
+    source_ref for those rows is "<pubkey_hex>:<seq>" (see
+    ingest.ingest_feed), so the pubkey is its part before the colon.
+    A peer no longer in peers.json (e.g. pruned since) is treated as
+    unknown provenance and dropped too -- can't confirm "lan" for it."""
+    added_via_by_pubkey = {p.feed_pubkey_hex: p.added_via for p in load_peers(peers_file)}
+    kept = []
+    for row in rows:
+        if row.source_type != "p2p":
+            kept.append(row)
+            continue
+        pubkey = row.source_ref.split(":", 1)[0]
+        if added_via_by_pubkey.get(pubkey) == "lan":
+            kept.append(row)
+    return kept
+
+
 @main.command()
 @click.argument("text", required=False)
 @click.option("--machine", "machine_key", help="Filter by machine_key, e.g. kaleido_m2.")
@@ -94,6 +115,16 @@ def reindex(ctx: click.Context, path: Path) -> None:
 @click.option("--drop-after", "drop_bt_min", type=float, help="Minimum DROP bean temp (C).")
 @click.option("--after-second-crack/--not-after-second-crack", "after_second_crack",
               default=None, help="Only roasts dropped at or after SC_START.")
+@click.option("--lan-only/--all-peers", default=True, show_default=True,
+              help="Only show results from your own roasts and peers found on your local "
+                   "network -- not the internet-wide DHT, a manually-added peer, or gossip.")
+@click.option("--peers-file", default=None, type=click.Path(path_type=Path),
+              help="Peer list to check provenance against for --lan-only "
+                   "(default: ~/.local/share/roastnet/peers.json).")
+@click.option("--own-only", is_flag=True,
+              help="Only show your own roasts -- hide everything synced from any peer.")
+@click.option("--show-hidden", is_flag=True,
+              help="Also include roasts you've hidden (see `roastnet hide`).")
 @click.option("--json", "as_json", is_flag=True, help="Output matches as a JSON array instead of text.")
 @click.pass_context
 def search(
@@ -105,6 +136,10 @@ def search(
     dtr_max: float | None,
     drop_bt_min: float | None,
     after_second_crack: bool | None,
+    lan_only: bool,
+    peers_file: Path | None,
+    own_only: bool,
+    show_hidden: bool,
     as_json: bool,
 ) -> None:
     """Search the local index. TEXT is matched against beans/notes/roast type."""
@@ -112,8 +147,12 @@ def search(
     rows = repo.search_roasts(
         conn, text=text, machine_key=machine_key, roast_type=roast_type,
         dtr_min=dtr_min, dtr_max=dtr_max, drop_bt_min=drop_bt_min,
-        after_second_crack=after_second_crack,
+        after_second_crack=after_second_crack, own_only=own_only, include_hidden=show_hidden,
     )
+    if own_only:
+        lan_only = False  # own roasts are never peer-sourced -- nothing left for it to filter
+    if lan_only:
+        rows = _filter_lan_only(rows, peers_file or default_peers_path())
     if as_json:
         click.echo(json.dumps([asdict(row) for row in rows]))
         return
@@ -121,11 +160,29 @@ def search(
         click.echo("no matches")
         return
     for row in rows:
-        beans = (row.beans_text or "").splitlines()[0][:50] if row.beans_text else "(no beans text)"
+        if row.title:
+            title = row.title
+        elif row.beans_text:
+            title = row.beans_text.splitlines()[0][:50]
+        else:
+            title = "(untitled)"
         dtr = f"{row.dtr_pct:.1f}%" if row.dtr_pct is not None else "?"
         drop = f"{row.drop_bt_c:.0f}C" if row.drop_bt_c is not None else "?"
+        hidden_note = " [hidden]" if row.hidden else ""
         click.echo(f"{row.roast_id[:8]}  {row.machine_key:<16} {row.roast_type or '?':<12} "
-                   f"DTR={dtr:<7} DROP={drop:<6} {beans}")
+                   f"DTR={dtr:<7} DROP={drop:<6} {title}{hidden_note}")
+
+
+def _resolve_roast_id(conn, roast_id_prefix: str) -> str:
+    """ROAST_ID arguments across show/hide/unhide may be a prefix, e.g. the
+    8 characters `search` displays -- resolve it to exactly one full id,
+    or fail clearly if it matches none or more than one."""
+    matches = repo.find_ids_by_prefix(conn, roast_id_prefix)
+    if not matches:
+        raise click.ClickException(f"no roast found matching {roast_id_prefix!r}")
+    if len(matches) > 1:
+        raise click.ClickException(f"{roast_id_prefix!r} matches {len(matches)} roasts -- use more characters")
+    return matches[0]
 
 
 @main.command("show")
@@ -137,23 +194,21 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
     characters `search` displays) and the on-disk path to its original
     .alog file, for opening it in Artisan directly."""
     conn = connect(ctx.obj["db_path"])
-    matches = repo.find_ids_by_prefix(conn, roast_id)
-    if not matches:
-        raise click.ClickException(f"no roast found matching {roast_id!r}")
-    if len(matches) > 1:
-        raise click.ClickException(f"{roast_id!r} matches {len(matches)} roasts -- use more characters")
-    full_id = matches[0]
+    full_id = _resolve_roast_id(conn, roast_id)
     record = repo.load_full_record(conn, full_id)
     raw_path = repo.find_raw_path(conn, full_id)
+    hidden = repo.find_hidden(conn, full_id)
 
     if as_json:
-        click.echo(json.dumps({"record": record, "raw_path": raw_path}))
+        click.echo(json.dumps({"record": record, "raw_path": raw_path, "hidden": hidden}))
         return
 
     beans = record.get("beans_text") or "(no beans text)"
     click.echo(beans.splitlines()[0])
     click.echo(f"machine: {record.get('machine_key')} ({record.get('roaster_type_raw')})")
-    click.echo(f"roast type: {record.get('roast_type') or '?'}")
+    roast_type_note = " (estimated from peak temperature -- may not hold for every machine's probe)" \
+        if record.get("roast_type") else ""
+    click.echo(f"roast type: {record.get('roast_type') or '?'}{roast_type_note}")
     click.echo(f"batch weight in/out: {record.get('batch_weight_in_g')}g / {record.get('batch_weight_out_g')}g")
     click.echo(f"roast date: {record.get('roast_date') or '?'}")
     for m in record.get("milestones") or []:
@@ -161,6 +216,38 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
     if record.get("roasting_notes"):
         click.echo(f"notes: {record['roasting_notes']}")
     click.echo(f"file: {raw_path}")
+    if hidden:
+        click.echo("hidden: yes -- hidden from your own search results (unhide to see it there again)")
+
+
+@main.command("hide")
+@click.argument("roast_id")
+@click.pass_context
+def hide(ctx: click.Context, roast_id: str) -> None:
+    """Hide one roast from your own search results.
+
+    Local only: doesn't touch the feed, so it doesn't retroactively remove
+    anything already replicated to a peer, and doesn't stop it being
+    replicated to a peer syncing for the first time in the future either --
+    a signed, hash-chained feed entry can't be selectively unpublished
+    without breaking the chain for every entry after it. `search --show-hidden`
+    still finds it if you want to `unhide` it later.
+    """
+    conn = connect(ctx.obj["db_path"])
+    full_id = _resolve_roast_id(conn, roast_id)
+    repo.set_hidden(conn, full_id, True)
+    click.echo(f"hidden {full_id[:8]}... (local only -- see `roastnet hide --help`)")
+
+
+@main.command("unhide")
+@click.argument("roast_id")
+@click.pass_context
+def unhide(ctx: click.Context, roast_id: str) -> None:
+    """Un-hide a previously hidden roast."""
+    conn = connect(ctx.obj["db_path"])
+    full_id = _resolve_roast_id(conn, roast_id)
+    repo.set_hidden(conn, full_id, False)
+    click.echo(f"unhidden {full_id[:8]}...")
 
 
 @main.group()
@@ -201,12 +288,17 @@ def feed(ctx: click.Context, feed_dir: Path | None) -> None:
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.pass_context
 def feed_publish(ctx: click.Context, path: Path) -> None:
-    """Append a .alog file to your feed, signed with your identity."""
+    """Append a .alog file to your feed, signed with your identity, and add
+    it to your own local search index (as one of "your own roasts")."""
     ident, created = load_or_create_identity()
     _remind_backup_if_new(ident, created)
     entry = append_entry(ctx.obj["feed_dir"], ident, path, timestamp=datetime.now(timezone.utc).isoformat())
     click.echo(f"published entry {entry.seq} ({entry.content_sha256[:12]}...) "
                f"to feed {ident.public_key_hex[:12]}...")
+    conn = connect(ctx.obj["db_path"])
+    result = ingest_file(conn, path, is_user_log=True)
+    if result.error:
+        click.echo(f"warning: could not add it to your local search index: {result.error}", err=True)
 
 
 @feed.command("verify")
@@ -225,11 +317,17 @@ def feed_verify(ctx: click.Context, pubkey_hex: str | None) -> None:
 
 @feed.command("ingest")
 @click.option("--pubkey", "pubkey_hex", required=True, help="Expected public key (hex) for this feed.")
+@click.option("--user-log", is_flag=True,
+              help="Mark these as your own roasts -- use when --feed-dir/--pubkey is your own "
+                   "feed, not a peer's, so they're searchable/filterable as \"my own roasts\".")
 @click.pass_context
-def feed_ingest(ctx: click.Context, pubkey_hex: str) -> None:
+def feed_ingest(ctx: click.Context, pubkey_hex: str, user_log: bool) -> None:
     """Verify a feed, then load its valid entries into the search index."""
     conn = connect(ctx.obj["db_path"])
-    results = ingest_feed(conn, ctx.obj["feed_dir"], expected_pubkey_hex=pubkey_hex)
+    results = ingest_feed(
+        conn, ctx.obj["feed_dir"], expected_pubkey_hex=pubkey_hex,
+        source_type="local" if user_log else "p2p", is_user_log=user_log,
+    )
     _report_ingest_results(results)
 
 

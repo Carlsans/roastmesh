@@ -191,7 +191,9 @@ async def _auto_sync_discovered_peer(
             conn.close()
 
 
-async def _watch_publish_loop(feed_dir: Path, identity: Identity, watch_dir: Path, interval_s: float) -> None:
+async def _watch_publish_loop(
+    feed_dir: Path, identity: Identity, watch_dir: Path, interval_s: float, db_path: Path | None,
+) -> None:
     watch_dir = Path(watch_dir)
     try:
         watch_dir.mkdir(parents=True, exist_ok=True)
@@ -200,7 +202,9 @@ async def _watch_publish_loop(feed_dir: Path, identity: Identity, watch_dir: Pat
         return
     while True:
         try:
-            published = await asyncio.to_thread(publish_new_files, feed_dir, identity, watch_dir)
+            published = await asyncio.to_thread(
+                publish_new_files, feed_dir, identity, watch_dir, db_path=db_path,
+            )
             for entry in published:
                 print(f"watch: published entry {entry.seq} ({entry.content_sha256[:12]}...) "
                       f"from {watch_dir}", flush=True)
@@ -292,7 +296,7 @@ async def serve(
 
     if publish_watch_dir is not None:
         background_tasks.append(asyncio.create_task(
-            _watch_publish_loop(feed_dir, identity, publish_watch_dir, publish_watch_interval_s)
+            _watch_publish_loop(feed_dir, identity, publish_watch_dir, publish_watch_interval_s, db_path)
         ))
 
     try:

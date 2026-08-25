@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (opt-in) over the whole internet via the public BitTorrent DHT, no
 tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 134 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 195 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -83,9 +83,19 @@ Launch it:
 Four tabs, left to right:
 
 - **Search** — free-text and filtered search over your local index (your own roasts plus
-  anything you've synced from peers). Blank search returns everything. **Double-click a result**
-  to see its full detail and open the original `.alog` file with whatever your system would
-  normally open it with (Artisan, if it's installed).
+  anything you've synced from peers). Blank search returns everything. Results show each
+  roast's title (Artisan's own `title` field -- often left at its default unless you've renamed
+  it) and filename, not an opaque id. **LAN only** is checked by default: it hides results from
+  peers found via internet-wide discovery, manually pasted, or gossiped about -- only your own
+  roasts and LAN-discovered peers show up unless you uncheck it. **Only my own roasts** hides
+  everything synced from any peer. **Show hidden roasts too** reveals anything you've hidden (see
+  below). **Double-click a result** to see its full detail, open the original `.alog` file with
+  whatever your system would normally open it with (Artisan, if it's installed), or **Hide** it
+  from your own search results -- local only: it doesn't touch the feed, so it can't retroactively
+  un-share something already replicated to a peer (a signed, hash-chained feed entry can't be
+  selectively removed without breaking the chain for everything after it); it only changes what
+  this machine shows itself. Hide is reversible (**Unhide**, or "Show hidden roasts too" to find
+  it again).
 - **Publish** — the recommended way is the **shared folder** shown at the top (default
   `~/RoastNetShare`, changeable in Settings): drop `.alog` files in there and they're published
   automatically, no button to click, as long as Network is serving. "Publish a single file"
@@ -162,6 +172,16 @@ you happen to run commands from.
 roastnet --db ~/roastnet.sqlite3 ingest path/to/some.alog     # or a directory of .alog files
 roastnet --db ~/roastnet.sqlite3 search washed ethiopian --machine kaleido_m2 --dtr-min 15
 roastnet --db ~/roastnet.sqlite3 show <roast_id>               # roast_id may be a prefix
+```
+`search` only shows your own roasts and peers found via LAN discovery by default -- pass
+`--all-peers` to also include internet-discovered, manually-added, or gossiped-about peers,
+`--own-only` to show only your own, or `--show-hidden` to also include roasts you've hidden.
+
+**Hide a roast from your own search results** (local only -- see the GUI bullet above for why
+this can't retroactively un-share it from a peer):
+```bash
+roastnet --db ~/roastnet.sqlite3 hide <roast_id>      # roast_id may be a prefix
+roastnet --db ~/roastnet.sqlite3 unhide <roast_id>
 ```
 
 **Publish one of your own roasts** (creates your Ed25519 identity silently on first use):

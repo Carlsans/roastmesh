@@ -32,7 +32,6 @@ def ingest_file(
     source_ref: str | None = None,
     source_url: str | None = None,
     is_user_log: bool = False,
-    roast_type: str | None = None,
     machine_key: str | None = None,
     mechanism_family: str | None = None,
 ) -> IngestResult:
@@ -45,8 +44,6 @@ def ingest_file(
 
     content_sha256 = repo.sha256_bytes(raw_bytes)
     existing = repo.find_source_by_hash(conn, content_sha256)
-    if existing is not None:
-        return IngestResult(None, True, None)
 
     try:
         text = raw_bytes.decode("utf-8")
@@ -59,10 +56,7 @@ def ingest_file(
         return IngestResult(None, False, f"{path}: {exc}")
 
     source_meta = SourceMeta(source_type=source_type, source_ref=source_ref, source_url=source_url)
-    record = to_roast_record(
-        raw, source_meta, is_user_log=is_user_log,
-        roast_type_override=roast_type, filename_hint=path.name,
-    )
+    record = to_roast_record(raw, source_meta, is_user_log=is_user_log)
     # An explicit machine identity (e.g. "this whole folder is my Kaleido M2
     # Lite") overrides whatever the file's own roastertype field implied --
     # the person providing the file knows their machine better than a
@@ -71,6 +65,26 @@ def ingest_file(
         record.machine_key = machine_key
     if mechanism_family is not None:
         record.mechanism_family = mechanism_family
+
+    if existing is not None:
+        # Same bytes already indexed -- don't duplicate the source/blob
+        # row, but still refresh the derived `roasts` row from a fresh
+        # parse. The index is meant to be a pure function of the corpus
+        # (ARCHITECTURE.md), so a parser improvement (a newly-extracted
+        # field, say) should take effect the next time this file happens
+        # to be (re-)ingested, not require a full `reindex` to notice --
+        # confirmed as a real gap: a field added to the parser after this
+        # project had already shipped left every already-ingested roast
+        # showing that field blank indefinitely, with no way to refresh it
+        # short of wiping the whole index. Reuses the existing roast_id
+        # (looked up by source_id) so this is an update, not a duplicate
+        # row for the same content.
+        existing_roast_id = repo.find_roast_id_by_source(conn, existing["source_id"])
+        if existing_roast_id is not None:
+            record.roast_id = existing_roast_id
+        repo.insert_roast(conn, record, existing["source_id"])
+        conn.commit()
+        return IngestResult(record, True, None)
 
     source_id = str(uuid4())
     repo.insert_source(
@@ -100,6 +114,8 @@ def ingest_feed(
     feed_dir: Path,
     *,
     expected_pubkey_hex: str | None = None,
+    source_type: str = "p2p",
+    is_user_log: bool = False,
 ) -> list[IngestResult]:
     """Verify a feed's signature chain, then ingest each of its valid entries.
 
@@ -107,6 +123,12 @@ def ingest_feed(
     trust content whose provenance doesn't check out (ARCHITECTURE.md's
     Abuse Resistance principle). If verification fails partway through, only
     the entries before the failure (the verified prefix) are ingested.
+
+    `source_type`/`is_user_log` default to "this is a peer's feed" -- pass
+    source_type="local", is_user_log=True when this is the caller's *own*
+    feed (see cli.py's `feed ingest --user-log`), so it's searchable and
+    filterable as "my own roasts" rather than indistinguishable from a
+    peer's replicated content.
     """
     from roastnet import feed as feedmod
 
@@ -123,8 +145,9 @@ def ingest_feed(
         ingest_file(
             conn,
             feedmod.blob_path_for(feed_dir, entry),
-            source_type="p2p",
+            source_type=source_type,
             source_ref=f"{pubkey_hex}:{entry.seq:08d}",
+            is_user_log=is_user_log,
         )
         for entry in entries
     ]

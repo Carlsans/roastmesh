@@ -6,7 +6,7 @@ from roastnet.alog.machine import normalize_machine_key
 from roastnet.alog.notes_tagger import tag_notes
 from roastnet.alog.parser import SourceMeta
 from roastnet.alog.phase_profile import compute_phase_profile
-from roastnet.alog.roast_level import classify_roast_level, guess_roast_type_from_text
+from roastnet.alog.roast_level import classify_roast_level
 from roastnet.models import (
     Milestone,
     RoastRecord,
@@ -41,8 +41,6 @@ def to_roast_record(
     raw: dict,
     source: SourceMeta,
     is_user_log: bool = False,
-    roast_type_override: str | None = None,
-    filename_hint: str | None = None,
 ) -> RoastRecord:
     warnings: list[str] = []
 
@@ -81,15 +79,17 @@ def to_roast_record(
     cupping_notes = _clean(raw.get("cuppingnotes"))
     beans_text = _clean(raw.get("beans"))
 
-    # Precedence: an explicit level token in the filename/beans_text is
-    # per-roast evidence and outranks a blanket override; the DROP-temperature
-    # heuristic is the last resort for anything with neither signal.
-    drop = next((m for m in milestones if m.name == "DROP"), None)
-    roast_type = (
-        guess_roast_type_from_text(filename_hint, beans_text)
-        or _clean(roast_type_override)
-        or classify_roast_level(drop.bt_c if drop else None)
-    )
+    # Always the peak bean temperature reached anywhere in the roast, not
+    # just whatever's recorded at the DROP milestone specifically -- probe
+    # thermal lag means BT can keep climbing for a few seconds after DROP
+    # is marked, so the true peak is occasionally a little higher.
+    # Deliberately the *only* input: an earlier version of this also
+    # trusted an explicit level token typed into the file's own notes
+    # ahead of temperature, which produced results nobody could make
+    # sense of (a roast peaking at 196C -- unambiguously "light" on any
+    # standard chart -- showing "full city+" because of a note, with no
+    # way to tell that from a real bug). See roast_level.py's docstring.
+    roast_type = classify_roast_level(max(bt_c) if bt_c else None)
 
     return RoastRecord(
         roast_id=RoastRecord.new_roast_id(),
@@ -104,6 +104,7 @@ def to_roast_record(
         batch_weight_in_g=batch_in_g,
         batch_weight_out_g=batch_out_g,
         density_g_per_l=density,
+        title=_clean(raw.get("title")),
         beans_text=beans_text,
         roast_date=_clean(raw.get("roastisodate") or raw.get("roastdate")),
         roast_epoch=raw.get("roastepoch"),

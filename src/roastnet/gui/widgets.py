@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from collections.abc import Callable
+from pathlib import Path
 from tkinter import ttk
 
 # Palette. Deliberately muted -- this is a tool for reading search results,
@@ -217,14 +218,19 @@ def scrollable(parent: tk.Widget) -> ttk.Frame:
     return inner
 
 
-# roast_id, machine_key, roast_type, dtr_pct, drop_bt_c, beans_text
+# title, filename, machine_key, roast_type, dtr_pct, drop_bt_c, beans_text
+# -- no roast_id column; it's still the Treeview's iid under the hood
+# (double-click handlers read it back via identify_row/selection), just
+# not shown, since it's meaningless to look at and the title/filename
+# below are what actually identify a roast to a person.
 _COLUMNS = [
-    ("roast_id", "ID", 90),
-    ("machine_key", "Machine", 120),
-    ("roast_type", "Roast type", 100),
-    ("dtr_pct", "DTR %", 70),
-    ("drop_bt_c", "Drop °C", 70),
-    ("beans_text", "Beans", 320),
+    ("title", "Title", 160),
+    ("filename", "Filename", 150),
+    ("machine_key", "Machine", 110),
+    ("roast_type", "Roast type", 90),
+    ("dtr_pct", "DTR %", 60),
+    ("drop_bt_c", "Drop °C", 65),
+    ("beans_text", "Beans", 260),
 ]
 
 
@@ -246,9 +252,14 @@ class ResultsTable(ttk.Frame):
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor="w")
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=ybar.set)
+        # A horizontal scrollbar too: the columns above add up to wider
+        # than the window at its default size, and unlike a plain label,
+        # a Treeview doesn't wrap or shrink its columns to fit on its own.
+        xbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         ybar.pack(side="right", fill="y")
+        xbar.pack(fill="x")
 
         self.count_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.count_var, font=FONT, fg=MUTED, bg=BG,
@@ -258,13 +269,14 @@ class ResultsTable(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         for row in rows:
             beans = (row.get("beans_text") or "").splitlines()[0][:80] if row.get("beans_text") else ""
+            title = row.get("title") or ""
+            if row.get("hidden"):
+                title = f"{title} (hidden)" if title else "(hidden)"
+            filename = Path(row["raw_path"]).name if row.get("raw_path") else ""
             dtr = f"{row['dtr_pct']:.1f}" if row.get("dtr_pct") is not None else ""
             drop = f"{row['drop_bt_c']:.0f}" if row.get("drop_bt_c") is not None else ""
-            # iid is the full roast_id (not the truncated one shown in the
-            # ID column) -- double-click handlers read it back via
-            # identify_row/selection to know which full id to open.
             self.tree.insert("", "end", iid=row.get("roast_id"), values=(
-                (row.get("roast_id") or "")[:8], row.get("machine_key") or "",
+                title, filename, row.get("machine_key") or "",
                 row.get("roast_type") or "", dtr, drop, beans,
             ))
         self.count_var.set(f"{len(rows)} result{'s' if len(rows) != 1 else ''}")

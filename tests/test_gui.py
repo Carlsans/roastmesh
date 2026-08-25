@@ -118,6 +118,88 @@ print("OK")
     assert f"ROWS {len(results)}" in r.stdout, r.stdout
 
 
+def test_search_tab_columns_show_title_and_filename_not_id(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    conn = connect(db_path)
+    ingest_path(conn, FIXTURES_DIR / "kaleido_1.alog")
+    conn.close()
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[0]
+print("COLUMNS", tab.table.tree["columns"])
+tab._on_run()
+for _ in range(200):
+    app.update()
+    if tab.task is not None and not tab.task.running and tab.table.count_var.get() != "running...":
+        break
+    import time; time.sleep(0.05)
+row_id = tab.table.tree.get_children()[0]
+print("VALUES", tab.table.tree.item(row_id)["values"])
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "'roast_id'" not in r.stdout
+    columns_line = [line for line in r.stdout.splitlines() if line.startswith("COLUMNS")][0]
+    assert "title" in columns_line and "filename" in columns_line
+    values_line = [line for line in r.stdout.splitlines() if line.startswith("VALUES")][0]
+    assert "kaleido_1.alog" in values_line  # the real filename, not a content hash or an id
+
+
+def test_search_tab_lan_only_checkbox_is_checked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.update()
+tab = app.tabs[0]
+print("DEFAULT_CHECKED", tab.lan_only.get())
+print("DEFAULT_ARGS", tab._build_args())
+tab.lan_only.set(False)
+print("UNCHECKED_ARGS", tab._build_args())
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "DEFAULT_CHECKED True" in r.stdout, r.stdout
+    assert "--all-peers" not in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
+    assert "--all-peers" in [line for line in r.stdout.splitlines() if line.startswith("UNCHECKED_ARGS")][0]
+
+
+def test_search_tab_own_only_checkbox_is_unchecked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.update()
+tab = app.tabs[0]
+print("DEFAULT_CHECKED", tab.own_only.get())
+print("DEFAULT_ARGS", tab._build_args())
+tab.own_only.set(True)
+print("CHECKED_ARGS", tab._build_args())
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "DEFAULT_CHECKED False" in r.stdout, r.stdout
+    assert "--own-only" not in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
+    assert "--own-only" in [line for line in r.stdout.splitlines() if line.startswith("CHECKED_ARGS")][0]
+
+
 def test_publish_tab_publishes_a_real_entry(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -241,7 +323,11 @@ def _start_server_process(env: dict, feed_fixture: Path) -> tuple[subprocess.Pop
     hanging it."""
     subprocess.run(
         [sys.executable, "-m", "roastnet.cli", "feed", "publish", str(feed_fixture)],
-        env=env, check=True, capture_output=True, text=True, timeout=30,
+        # cwd=env["HOME"]: `feed publish` now also ingests into --db, which
+        # defaults to a cwd-relative path -- without pinning cwd here, that
+        # lands as a stray roastnet.sqlite3 in whatever directory pytest
+        # itself was invoked from, not this test's isolated tmp_path.
+        env=env, cwd=env["HOME"], check=True, capture_output=True, text=True, timeout=30,
     )
     proc = subprocess.Popen(
         # --no-lan-discovery: the GUI's own NetworkTab now auto-starts a
@@ -414,3 +500,90 @@ def test_sigterm_cleans_up_the_background_node_serve_process(tmp_path: Path) -> 
             except subprocess.TimeoutExpired:
                 proc.kill()
         subprocess.run(["pkill", "-f", marker])  # belt and braces if the assertion above failed
+
+
+def test_hide_button_removes_the_roast_and_unhide_restores_it(tmp_path: Path) -> None:
+    """Real end-to-end drive of the actual double-click-to-detail-window
+    path (via a real computed row bbox under Xvfb, not a shortcut around
+    it), then the Hide button, confirming the roast actually disappears
+    from a re-run search, and Unhide brings it back."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    conn = connect(db_path)
+    ingest_path(conn, FIXTURES_DIR / "kaleido_1.alog")
+    conn.close()
+
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[0]
+
+def run_search():
+    tab._on_run()
+    for _ in range(200):
+        app.update()
+        if tab.task is not None and not tab.task.running and tab.table.count_var.get() != "running...":
+            break
+        time.sleep(0.05)
+
+run_search()
+print("COUNT_BEFORE_HIDE", tab.table.count_var.get())
+
+row_id = tab.table.tree.get_children()[0]
+x, y, w, h = tab.table.tree.bbox(row_id)
+
+class FakeEvent:
+    pass
+
+event = FakeEvent()
+event.y = y + h // 2
+tab._on_open_row(event)
+for _ in range(100):
+    app.update()
+    if getattr(tab, "_last_detail_window", None) is not None:
+        break
+    time.sleep(0.05)
+detail = tab._last_detail_window
+print("INITIAL_BUTTON_TEXT", detail.hide_button.cget("text"))
+
+detail._on_toggle_hidden()
+for _ in range(100):
+    app.update()
+    if detail.hide_button.cget("text") == "Unhide":
+        break
+    time.sleep(0.05)
+print("BUTTON_TEXT_AFTER_HIDE", detail.hide_button.cget("text"))
+
+run_search()
+print("COUNT_AFTER_HIDE", tab.table.count_var.get())
+
+tab.show_hidden.set(True)
+run_search()
+print("COUNT_WITH_SHOW_HIDDEN", tab.table.count_var.get())
+
+detail._on_toggle_hidden()
+for _ in range(100):
+    app.update()
+    if detail.hide_button.cget("text") == "Hide":
+        break
+    time.sleep(0.05)
+
+tab.show_hidden.set(False)
+run_search()
+print("COUNT_AFTER_UNHIDE", tab.table.count_var.get())
+
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "COUNT_BEFORE_HIDE 1 result" in r.stdout, r.stdout
+    assert "INITIAL_BUTTON_TEXT Hide" in r.stdout, r.stdout
+    assert "BUTTON_TEXT_AFTER_HIDE Unhide" in r.stdout, r.stdout
+    assert "COUNT_AFTER_HIDE 0 result" in r.stdout, r.stdout
+    assert "COUNT_WITH_SHOW_HIDDEN 1 result" in r.stdout, r.stdout
+    assert "COUNT_AFTER_UNHIDE 1 result" in r.stdout, r.stdout
