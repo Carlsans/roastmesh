@@ -6,7 +6,12 @@ search everyone else's, no server and no accounts. Full design rationale lives i
 
 All 7 steps of that document's build order are implemented: local parsing/search index, signed
 feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a desktop GUI,
-standalone binaries, and a read-only web gateway. 108 tests, all passing.
+standalone binaries, and a read-only web gateway. 110 tests, all passing.
+
+The desktop app (`roastnet-gui`) is the primary way to use this — search, publish, and now serve
+and sync with peers, all from three tabs, no typing required. The command line (`roastnet`) does
+everything the GUI does and more (it's what the GUI itself runs under the hood), and is there for
+scripting or if you just prefer a terminal.
 
 ## Install
 
@@ -62,13 +67,42 @@ macOS (python.org installer) and Windows (python.org installer) both bundle `tki
 nothing extra needed there. If you installed Python via Homebrew on macOS instead:
 `brew install python-tk`.
 
-## Usage
+## Quick start (GUI)
 
-Everything below assumes either `roastnet` is on your `PATH` (activated venv) or you're running
-`./roastnet` / `.venv/bin/roastnet` directly — same commands either way. `--db` on the top-level
-command picks the SQLite index file (default `roastnet.sqlite3` in the current directory); pass
-an explicit path if you want it somewhere stable regardless of what directory you happen to run
-commands from.
+Launch it:
+```bash
+roastnet-gui              # from source, activated venv
+./roastnet-gui            # prebuilt binary -- keep it next to ./roastnet, it shells out to it
+```
+
+Three tabs, left to right:
+
+- **Search** — free-text and filtered search over your local index (your own roasts plus
+  anything you've synced from peers). Blank search returns everything.
+- **Publish** — pick a `.alog` file and add it to your signed feed. Shows your feed's address
+  (public key) at the top; your identity is created silently the first time you publish.
+- **Network** — the piece that talks to other machines:
+  - **Serve your feed**: click "Start serving" to become reachable. A **ticket** (a long string
+    starting with `endpoint...`) appears — that's what you share with someone else so they can
+    sync with you. Click "Copy" to put it on your clipboard. "Stop" when you're done; a fresh
+    "Start serving" later gets a new ticket (it encodes your current network address, not just
+    your identity, so it changes run to run — that's expected).
+  - **Sync with a peer**: paste a ticket *they* gave you and click "Sync". This pulls their new
+    feed entries into your search index and exchanges known-peer lists both ways.
+  - **Known peers**: everyone you've synced with or manually added, refreshed automatically
+    after every sync.
+
+That's the whole interface — every button just runs the equivalent command shown in the console
+under it, so nothing here is hidden from you.
+
+## Usage (command line)
+
+Everything the GUI does, it does by running these same commands — useful for scripting, or if
+you just prefer a terminal. Assumes either `roastnet` is on your `PATH` (activated venv) or
+you're running `./roastnet` / `.venv/bin/roastnet` directly — same commands either way. `--db`
+on the top-level command picks the SQLite index file (default `roastnet.sqlite3` in the current
+directory); pass an explicit path if you want it somewhere stable regardless of what directory
+you happen to run commands from.
 
 **Search your local index:**
 ```bash
@@ -89,11 +123,6 @@ roastnet --db ~/roastnet.sqlite3 peer sync <their-ticket>    # pulls their feed 
 roastnet peer list
 ```
 
-**Desktop app** (Search tab first, Publish tab second):
-```bash
-roastnet-gui
-```
-
 **Read-only web view** of your local index, browsable from any browser on the machine (or your
 LAN, with `--host`):
 ```bash
@@ -107,44 +136,47 @@ Run `roastnet --help` or `roastnet <command> --help` for the full option list on
 This is the actual point of the project, so it's worth walking through end to end. "Machine A"
 and "Machine B" below are two different computers on the same local network — any mix of Linux,
 macOS, or Windows works, since the protocol is the same everywhere; only the [install](#install)
-step differs per OS.
+step differs per OS. All of this is driven from the **Network** tab in `roastnet-gui`.
 
-**1. On Machine A** — publish something and start serving:
+**1. On Machine A** — publish something so you have data to share, then go to the **Publish**
+tab, choose a `.alog` file, click Publish. Then go to the **Network** tab and click
+**"Start serving"**. A **ticket** appears (a long string starting with `endpoint...`) — click
+**"Copy"**. Leave the app running.
+
+**2. On Machine B** — launch `roastnet-gui`, go to the **Network** tab, paste the ticket from
+Machine A into "Peer's ticket", and click **"Sync"**. The console below it shows how many new
+entries it pulled, whether the feed verified, and how many peers it now knows about; the "Known
+peers" table refreshes automatically. Then switch to the **Search** tab and run a blank search —
+you should see the roast you published on Machine A.
+
+**3. Publish something new on Machine A** (Publish tab, while it's still serving), then click
+**"Sync"** again on Machine B with the same ticket still in the field — it should report pulling
+only the new entry, not re-fetching everything (confirms incremental sync is actually
+incremental, not a full re-copy each time).
+
+The CLI equivalent of every button above, if you'd rather script it or watch it from a terminal:
 ```bash
+# Machine A
 roastnet feed publish path/to/some-roast.alog
-roastnet node serve
-```
-This prints your identity's public key and a **ticket** — a long string starting with `endpoint...`.
-Copy the whole thing; you'll paste it on Machine B. Leave this command running.
-
-**2. On Machine B** — sync with Machine A using the ticket you just copied:
-```bash
-roastnet --db ~/roastnet.sqlite3 peer sync '<paste the ticket here>'
-```
-On success this prints how many new entries it pulled, whether the feed verified, and how many
-peers it now knows about. Then confirm it's actually searchable:
-```bash
+roastnet node serve                                            # prints the ticket
+# Machine B
+roastnet --db ~/roastnet.sqlite3 peer sync '<paste ticket here>'
 roastnet --db ~/roastnet.sqlite3 search
 ```
-You should see the roast you published on Machine A, with `source_type` recorded as `p2p` (check
-with `sqlite3 ~/roastnet.sqlite3 "SELECT source_type, source_ref FROM sources;"` if you want to
-see that directly).
-
-**3. Publish something new on Machine A while it's still serving**, then run `peer sync` again on
-Machine B with the same ticket — it should report pulling only the new entry, not re-fetching
-everything (confirms incremental sync is actually incremental, not a full re-copy each time).
 
 **If it doesn't connect:**
-- Double-check you copied the *entire* ticket string — it's long and easy to truncate when
-  copy-pasting across a terminal.
+- Double-check you copied the *entire* ticket — it's long, and easy to truncate when
+  copy-pasting (the GUI's "Copy" button avoids this; if typing/pasting by hand in a terminal,
+  be careful).
 - A local firewall on either machine can block the connection — Iroh uses a UDP port (picked
   automatically each run) for the QUIC handshake. If you have `ufw`/`firewalld`/Windows
   Firewall/etc. active, try temporarily disabling it on both machines to confirm that's the
   cause before figuring out a permanent rule.
-- `node serve` accepts `--no-relay`, which restricts it to direct connections only (no fallback
-  to Iroh's relay infrastructure). This is what this project's own automated tests use for
-  same-process testing; for two *separate* machines it's untested by me specifically, but worth
-  trying in both directions (with and without it) if the default doesn't connect.
+- `roastnet node serve` (CLI only — not exposed as a GUI option yet) accepts `--no-relay`, which
+  restricts it to direct connections only, no fallback to Iroh's relay infrastructure. This is
+  what this project's own automated tests use for same-process testing; for two *separate*
+  machines it's untested by me specifically, but worth trying if the GUI/default CLI mode
+  doesn't connect.
 - Both machines need real internet access even for a LAN-only test *unless* you use
   `--no-relay` — the default mode's relay/hole-punch path involves Iroh's public relay
   infrastructure as a fallback.

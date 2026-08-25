@@ -253,10 +253,14 @@ def peer_add(ctx: click.Context, ticket: str) -> None:
 
 
 @peer.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Output peers as a JSON array instead of text.")
 @click.pass_context
-def peer_list(ctx: click.Context) -> None:
+def peer_list(ctx: click.Context, as_json: bool) -> None:
     """List known peers."""
     peers = load_peers(ctx.obj["peers_file"])
+    if as_json:
+        click.echo(json.dumps([asdict(p) for p in peers]))
+        return
     if not peers:
         click.echo("no known peers")
         return

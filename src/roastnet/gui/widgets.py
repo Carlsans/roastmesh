@@ -258,3 +258,38 @@ class ResultsTable(ttk.Frame):
     def set_error(self, message: str) -> None:
         self.tree.delete(*self.tree.get_children())
         self.count_var.set(message)
+
+
+_PEER_COLUMNS = [
+    ("feed_pubkey_hex", "Pubkey", 280),
+    ("last_seen", "Last seen", 220),
+    ("added_via", "Via", 90),
+]
+
+
+class PeerTable(ttk.Frame):
+    """Known-peer list for the Network tab."""
+
+    def __init__(self, parent: tk.Widget, height: int = 6) -> None:
+        super().__init__(parent)
+        self.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            wrap, columns=[c[0] for c in _PEER_COLUMNS], show="headings", height=height,
+        )
+        for key, label, width in _PEER_COLUMNS:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor="w")
+        ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ybar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ybar.pack(side="right", fill="y")
+
+    def set_rows(self, rows: list[dict]) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for row in rows:
+            self.tree.insert("", "end", values=(
+                row.get("feed_pubkey_hex") or "?", row.get("last_seen") or "", row.get("added_via") or "",
+            ))

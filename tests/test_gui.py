@@ -10,9 +10,11 @@ than pixel layout.
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -55,7 +57,7 @@ def _run_headless(body: str, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def test_both_tabs_construct_and_can_be_selected() -> None:
+def test_all_tabs_construct_and_can_be_selected() -> None:
     r = _run_headless("""
 from roastnet.gui.app import RoastnetApp
 app = RoastnetApp()
@@ -69,7 +71,7 @@ app._on_close()
 print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
-    assert "TABS 2" in r.stdout, r.stdout
+    assert "TABS 3" in r.stdout, r.stdout
 
 
 def test_search_tab_runs_a_real_search_and_populates_the_table(tmp_path: Path) -> None:
@@ -88,7 +90,10 @@ tab = app.tabs[0]
 tab._on_run()
 for _ in range(200):
     app.update()
-    if tab.task is not None and not tab.task.running:
+    # wait for the actual side effect, not just the thread's running flag --
+    # that flag can flip False slightly before the scheduled stream_into
+    # callback (which is what actually populates the table) has run.
+    if tab.task is not None and not tab.task.running and tab.table.count_var.get() != "running...":
         break
     import time; time.sleep(0.05)
 rows = tab.table.tree.get_children()
@@ -121,7 +126,10 @@ tab.path_field.set({str(fixture)!r})
 tab._on_run()
 for _ in range(200):
     app.update()
-    if tab.task is not None and not tab.task.running:
+    # wait for the console to actually have content, not just the thread's
+    # running flag -- that can flip False before the scheduled stream_into
+    # callback that writes to the console has run.
+    if tab.task is not None and not tab.task.running and tab.console.get_text().strip():
         break
     import time; time.sleep(0.05)
 print(tab.console.get_text())
@@ -148,3 +156,124 @@ def test_cancel_stops_a_running_task_quickly() -> None:
         time.sleep(0.05)
     assert not task.running
     assert time.monotonic() - start < 5
+
+
+def test_network_tab_start_stop_serving_produces_and_clears_a_ticket(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.update()
+tab = app.tabs[2]
+tab._on_start_serve()
+for _ in range(200):
+    app.update()
+    if tab.ticket_var.get():
+        break
+    import time; time.sleep(0.05)
+ticket = tab.ticket_var.get()
+print("TICKET_LEN", len(ticket))
+assert ticket.startswith("endpoint"), ticket
+
+tab._on_stop_serve()
+for _ in range(100):
+    app.update()
+    # wait for both the task to actually stop AND the scheduled
+    # stream_into callback that clears the ticket to have run -- the
+    # thread's running flag can flip slightly before that callback fires
+    # on a later app.update() cycle.
+    if tab.serve_task is not None and not tab.serve_task.running and not tab.ticket_var.get():
+        break
+    import time; time.sleep(0.05)
+print("STILL_RUNNING", tab.serve_task.running if tab.serve_task else None)
+print("TICKET_AFTER_STOP", repr(tab.ticket_var.get()))
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "STILL_RUNNING False" in r.stdout, r.stdout
+    assert "TICKET_AFTER_STOP ''" in r.stdout, r.stdout
+    ticket_len_line = [l for l in r.stdout.splitlines() if l.startswith("TICKET_LEN")][0]
+    assert int(ticket_len_line.split()[1]) > 0
+
+
+def _start_server_process(env: dict, feed_fixture: Path) -> tuple[subprocess.Popen, str]:
+    """Publish one entry and start a real `roastnet node serve` for a test
+    to sync against. Reads stdout in a background thread into a queue with
+    a bounded wait, rather than a plain blocking readline() loop, so a
+    server that never prints a ticket fails the test cleanly instead of
+    hanging it."""
+    subprocess.run(
+        [sys.executable, "-m", "roastnet.cli", "feed", "publish", str(feed_fixture)],
+        env=env, check=True, capture_output=True, text=True, timeout=30,
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "roastnet.cli", "node", "serve"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    ticket_queue: queue.Queue[str] = queue.Queue()
+
+    def _reader() -> None:
+        for line in proc.stdout:
+            if line.startswith("ticket: "):
+                ticket_queue.put(line[len("ticket: "):].strip())
+                return
+
+    threading.Thread(target=_reader, daemon=True).start()
+    ticket = ticket_queue.get(timeout=15)
+    return proc, ticket
+
+
+def test_network_tab_syncs_with_a_real_peer_end_to_end(tmp_path: Path) -> None:
+    server_env = {**os.environ, "HOME": str(tmp_path / "server_home")}
+    (tmp_path / "server_home").mkdir()
+    proc, ticket = _start_server_process(server_env, FIXTURES_DIR / "kaleido_1.alog")
+
+    try:
+        client_home = tmp_path / "client_home"
+        client_home.mkdir()
+        db_path = tmp_path / "client.sqlite3"
+
+        r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(client_home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[2]
+tab.peer_ticket_field.set({ticket!r})
+tab._on_sync()
+for _ in range(200):
+    app.update()
+    if tab.sync_task is not None and not tab.sync_task.running and tab.sync_console.get_text().strip():
+        break
+    import time; time.sleep(0.05)
+print(tab.sync_console.get_text())
+for _ in range(50):
+    app.update()
+    if tab.peers_table.tree.get_children():
+        break
+    import time; time.sleep(0.05)
+print("PEER_ROWS", len(tab.peers_table.tree.get_children()))
+app._on_close()
+print("OK")
+""", timeout=60)
+        assert "OK" in r.stdout, r.stderr
+        assert "1 new entries" in r.stdout, r.stdout
+        assert "PEER_ROWS 1" in r.stdout, r.stdout
+
+        conn = connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM roasts").fetchone()[0]
+        conn.close()
+        assert count == 1
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()

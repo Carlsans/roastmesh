@@ -1,13 +1,12 @@
 """roastnet desktop GUI.
 
-Two tabs, in the order ARCHITECTURE.md's build order names them: Search
-first, Publish second. Every action shells out to the same `roastnet` CLI a
-terminal user would run -- see gui/runner.py for why -- and the exact
+Three tabs: Search and Publish, in the order ARCHITECTURE.md's build order
+names them ("search first, publish second"), then Network -- start serving,
+sync with a peer, see who you know -- which makes the actual point of the
+project (talking to another machine) fully driveable from the GUI instead
+of needing the CLI for it. Every action shells out to the same `roastnet`
+CLI a terminal user would run -- see gui/runner.py for why -- and the exact
 command is shown above its output.
-
-Peer/node management (roastnet peer/node) stays CLI-only for this step --
-not named by "search first, publish second," and adding it here would be
-scope creep.
 """
 from __future__ import annotations
 
@@ -25,10 +24,12 @@ from roastnet.gui.widgets import (
     Choice,
     Console,
     Field,
+    PeerTable,
     ResultsTable,
     RunBar,
     explain,
     heading,
+    section,
 )
 from roastnet.index.db import default_db_path
 
@@ -182,6 +183,129 @@ class PublishTab(Tab):
             self._load_identity()
 
 
+class NetworkTab(Tab):
+    """Serve your feed to peers, and sync with theirs. Third tab -- the
+    piece that makes cross-machine testing fully GUI-driven.
+
+    Tracks two independent background processes (you can be serving and
+    syncing at once), so it doesn't use the base Tab's single self.task --
+    it overrides cancel() to stop both instead.
+    """
+
+    def __init__(self, parent: tk.Widget, app: "RoastnetApp") -> None:
+        super().__init__(parent, app)
+        self.serve_task: Task | None = None
+        self.sync_task: Task | None = None
+
+        heading(self, "Network", "Serve your feed to peers, and pull theirs.")
+        explain(self, "Start serving to become reachable, then share the ticket shown below with "
+                       "someone on your network (or anywhere) -- they paste it under 'Sync with a "
+                       "peer' on their end. Syncing pulls their new feed entries into your search "
+                       "index and exchanges known-peer lists both ways.")
+
+        serve_section = section(self, "Serve your feed")
+        tk.Label(serve_section, text="Your ticket:", font=FONT_BOLD, bg=BG, fg=FG).pack(
+            anchor="w", padx=10, pady=(6, 0))
+        ticket_row = ttk.Frame(serve_section)
+        ticket_row.pack(fill="x", padx=10, pady=(0, 6))
+        self.ticket_var = tk.StringVar(value="")
+        self.ticket_entry = ttk.Entry(ticket_row, textvariable=self.ticket_var, state="readonly")
+        self.ticket_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(ticket_row, text="Copy", command=self._copy_ticket).pack(side="left", padx=(6, 0))
+        self.serve_runbar = RunBar(serve_section, "Start serving", self._on_start_serve, self._on_stop_serve)
+        self.serve_console = Console(serve_section, height=4)
+
+        sync_section = section(self, "Sync with a peer")
+        self.peer_ticket_field = Field(sync_section, "Peer's ticket",
+                                        help_text="Paste the ticket they shared with you.")
+        self.sync_runbar = RunBar(sync_section, "Sync", self._on_sync, self._on_cancel_sync)
+        self.sync_console = Console(sync_section, height=4)
+
+        peers_section = section(self, "Known peers")
+        self.peers_table = PeerTable(peers_section)
+
+        self._refresh_peers()
+
+    def cancel(self) -> None:
+        if self.serve_task is not None:
+            self.serve_task.cancel()
+        if self.sync_task is not None:
+            self.sync_task.cancel()
+
+    def _copy_ticket(self) -> None:
+        ticket = self.ticket_var.get()
+        if not ticket:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(ticket)
+
+    def _on_start_serve(self) -> None:
+        if self.serve_task is not None and self.serve_task.running:
+            return
+        argv = roastnet_argv("node", "serve")
+        self.serve_console.clear()
+        self.serve_console.set_command(describe(argv))
+        self.ticket_var.set("")
+        self.serve_task = Task(argv=argv)
+        self.serve_runbar.set_running(True, "starting...")
+        self.serve_task.start()
+        stream_into(self.serve_task, self._on_serve_output, self._on_serve_finished,
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_serve_output(self, text: str) -> None:
+        self.serve_console.append(text)
+        for line in text.splitlines():
+            if line.startswith("ticket: "):
+                self.ticket_var.set(line[len("ticket: "):].strip())
+                self.serve_runbar.set_running(True, "serving")
+
+    def _on_stop_serve(self) -> None:
+        if self.serve_task is not None:
+            self.serve_task.cancel()
+
+    def _on_serve_finished(self, code: int) -> None:
+        self.serve_runbar.set_running(False, "stopped" if code == 0 else f"stopped (exit {code})")
+        self.ticket_var.set("")
+
+    def _on_sync(self) -> None:
+        if self.sync_task is not None and self.sync_task.running:
+            return
+        ticket = self.peer_ticket_field.get()
+        if not ticket:
+            self.sync_console.clear()
+            self.sync_console.append("paste a peer's ticket first\n")
+            return
+        argv = roastnet_argv("--db", self.app.db_path.get(), "peer", "sync", ticket)
+        self.sync_console.clear()
+        self.sync_console.set_command(describe(argv))
+        self.sync_task = Task(argv=argv)
+        self.sync_runbar.set_running(True, "syncing...")
+        self.sync_task.start()
+        stream_into(self.sync_task, self.sync_console.append, self._on_sync_finished,
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_cancel_sync(self) -> None:
+        if self.sync_task is not None:
+            self.sync_task.cancel()
+
+    def _on_sync_finished(self, code: int) -> None:
+        self.sync_runbar.set_running(False, "done" if code == 0 else f"exited with code {code}")
+        self._refresh_peers()
+
+    def _refresh_peers(self) -> None:
+        buf: list[str] = []
+        task = Task(argv=roastnet_argv("peer", "list", "--json"))
+        task.start()
+        stream_into(task, buf.append, lambda code: self._peers_loaded(buf), lambda ms, fn: self.after(ms, fn))
+
+    def _peers_loaded(self, buf: list[str]) -> None:
+        try:
+            peers = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            return
+        self.peers_table.set_rows(peers)
+
+
 class RoastnetApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -204,9 +328,11 @@ class RoastnetApp(tk.Tk):
 
         search_tab = SearchTab(notebook, self)
         publish_tab = PublishTab(notebook, self)
+        network_tab = NetworkTab(notebook, self)
         notebook.add(search_tab, text="Search")
         notebook.add(publish_tab, text="Publish")
-        self.tabs: list[Tab] = [search_tab, publish_tab]
+        notebook.add(network_tab, text="Network")
+        self.tabs: list[Tab] = [search_tab, publish_tab, network_tab]
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
