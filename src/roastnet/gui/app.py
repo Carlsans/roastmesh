@@ -15,6 +15,7 @@ above its output.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tkinter as tk
@@ -42,21 +43,61 @@ from roastnet.gui.widgets import (
 )
 
 
-def _open_with_default_app(path: str) -> None:
-    """Launch `path` in whatever the OS would open it with -- for a .alog
-    file, that's normally Artisan itself, which is the whole point: seeing
-    a roast from search should be as direct as double-clicking it in a
-    file manager."""
+def _run_opener(cmd: list[str]) -> str | None:
+    """Run an opener command and report what happened. Returns None if it
+    looks like it worked, or a short message to show the user if it
+    clearly didn't -- silently doing nothing on failure (the previous
+    behavior here) is exactly the kind of black box this project's GUI
+    otherwise avoids everywhere else."""
     try:
-        if sys.platform == "win32":
-            import os
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except OSError as exc:
+        return f"could not run {cmd[0]}: {exc}"
+    try:
+        # Most openers (xdg-open, a real Artisan launch) either hand off
+        # to a long-running app (still running after this) or return
+        # quickly with a nonzero code when nothing could open the target --
+        # a short wait is enough to tell "launched" from "failed
+        # immediately" without blocking the GUI on a real app's lifetime.
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode != 0:
+        output = (proc.stdout.read() if proc.stdout else "").strip()
+        return output or f"{cmd[0]} exited with code {proc.returncode}"
+    return None
+
+
+def _open_with_default_app(path: str) -> str | None:
+    """Open `path` (file or folder) with whatever the OS would normally
+    use. Returns None on apparent success, or a short error message."""
+    if sys.platform == "win32":
+        import os
+        try:
             os.startfile(path)  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except OSError:
-        pass  # no handler registered / command not found -- nothing more we can do here
+            return None
+        except OSError as exc:
+            return f"could not open: {exc}"
+    if sys.platform == "darwin":
+        return _run_opener(["open", path])
+    return _run_opener(["xdg-open", path])
+
+
+def _open_alog_file(path: str) -> str | None:
+    """Same contract as _open_with_default_app, but for a .alog file
+    specifically: tries a real Artisan install first, since a .alog file
+    is, on disk, just a Python dict literal with no MIME type registered
+    on most systems -- the OS's generic handler for it very often turns
+    out to be a text editor, not the roasting software the file is
+    actually for (confirmed during development: xdg-open opened one in
+    Kate, not Artisan, on a machine with no Artisan install). Not used for
+    opening a folder -- Artisan isn't a file manager."""
+    artisan = shutil.which("artisan") or shutil.which("Artisan")
+    if artisan:
+        return _run_opener([artisan, path])
+    if sys.platform == "darwin" and Path("/Applications/Artisan.app").exists():
+        return _run_opener(["open", "-a", "Artisan", path])
+    return _open_with_default_app(path)
 
 
 class Tab(ttk.Frame):
@@ -166,8 +207,11 @@ class SearchTab(Tab):
 
 class RoastDetailWindow(tk.Toplevel):
     """A search result, opened: full metadata, milestones, notes, and a
-    button to open the original .alog file with whatever the OS would
-    normally open it with (Artisan, for anyone who has it installed)."""
+    button to open the original .alog file -- with a real Artisan install
+    if one is found on PATH, since the OS's generic file-type handler for
+    .alog is very often a text editor instead (see _open_alog_file).
+    Whatever happens, success or failure, is reported in the status line
+    below the button -- never silent."""
 
     def __init__(self, parent: tk.Widget, record: dict, raw_path: str | None) -> None:
         super().__init__(parent)
@@ -208,13 +252,23 @@ class RoastDetailWindow(tk.Toplevel):
             explain(self, notes)
 
         btn_row = ttk.Frame(self)
-        btn_row.pack(fill="x", padx=14, pady=(12, 12))
+        btn_row.pack(fill="x", padx=14, pady=(12, 2))
         if raw_path:
             ttk.Button(btn_row, text="Open original file",
-                       command=lambda: _open_with_default_app(raw_path)).pack(side="left")
+                       command=lambda: self._on_open_file(raw_path)).pack(side="left")
             tk.Label(btn_row, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG).pack(
                 side="left", padx=(8, 0))
         ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
+
+        self.open_status_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self.open_status_var, font=("TkDefaultFont", 9), fg=MUTED,
+                 bg=BG, anchor="w", wraplength=840, justify="left").pack(fill="x", padx=14, pady=(0, 12))
+
+    def _on_open_file(self, path: str) -> None:
+        error = _open_alog_file(path)
+        self.open_status_var.set(
+            f"Couldn't open it: {error}. The file itself is at the path shown above." if error else ""
+        )
 
 
 class PublishTab(Tab):
@@ -242,11 +296,15 @@ class PublishTab(Tab):
                  font=("TkDefaultFont", 9), fg=MUTED, bg=BG, wraplength=840, justify="left",
                  anchor="w").pack(fill="x", padx=10, pady=(6, 2))
         folder_row = ttk.Frame(folder_section)
-        folder_row.pack(fill="x", padx=10, pady=(0, 8))
+        folder_row.pack(fill="x", padx=10, pady=(0, 2))
         tk.Label(folder_row, textvariable=self.app.watch_dir, font=FONT_MONO, bg=BG, fg=FG).pack(
             side="left")
         ttk.Button(folder_row, text="Open folder", command=self._open_watch_folder).pack(
             side="left", padx=(8, 0))
+        self.folder_status_var = tk.StringVar(value="")
+        tk.Label(folder_section, textvariable=self.folder_status_var, font=("TkDefaultFont", 9),
+                 fg=MUTED, bg=BG, anchor="w", wraplength=840, justify="left").pack(
+            fill="x", padx=10, pady=(0, 8))
 
         single_file_section = section(self, "Publish a single file")
         self.path_field = Field(single_file_section, "File to publish", help_text="An Artisan .alog file.")
@@ -262,9 +320,11 @@ class PublishTab(Tab):
         path = self.app.watch_dir.get()
         try:
             Path(path).mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        _open_with_default_app(path)
+        except OSError as exc:
+            self.folder_status_var.set(f"couldn't create {path}: {exc}")
+            return
+        error = _open_with_default_app(path)
+        self.folder_status_var.set(f"couldn't open it: {error}. The folder itself is at: {path}" if error else "")
 
     def _browse(self) -> None:
         path = filedialog.askopenfilename(
