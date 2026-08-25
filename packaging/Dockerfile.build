@@ -1,0 +1,34 @@
+# Portable build environment for the roastnet/roastnet-gui standalone
+# binaries. Built here rather than on whatever machine happens to run
+# build.sh because glibc (and the linker's relocation format) is
+# forward-compatible only -- a binary built on a very new system can
+# require glibc symbols/features an older system doesn't have, never the
+# reverse. Confirmed empirically: a binary built on Arch (glibc 2.44)
+# failed to even start on Ubuntu 22.04 with
+#   `GLIBC_ABI_DT_RELR' not found
+# Building on Ubuntu 22.04 (glibc 2.35) instead fixes that for every newer
+# system too, at the (correct) cost of not supporting anything older than
+# roughly a 2022-era distro -- a reasonable line for "major Linux
+# distributions" as they exist today.
+#
+# Ubuntu 22.04 ships Python 3.10.6 directly via apt, which matches this
+# project's `requires-python = ">=3.10"` exactly -- no PPA or from-source
+# Python build needed.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3.10-venv python3.10-dev python3-pip python3-tk binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+
+RUN python3.10 -m venv /app/.venv-build \
+    && /app/.venv-build/bin/pip install --upgrade pip \
+    && /app/.venv-build/bin/pip install -e ".[build]"
+
+# Writes into /app/dist and /app/build -- build-docker.sh bind-mounts the
+# host's dist/ (and a scratch build/) over these so the binaries land back
+# on the host.
+ENTRYPOINT ["/app/.venv-build/bin/pyinstaller", "packaging/roastnet.spec", "--clean", "--noconfirm"]

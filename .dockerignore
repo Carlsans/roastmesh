@@ -1,0 +1,10 @@
+.venv/
+.venv-build/
+.git/
+dist/
+build/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+*.sqlite3

@@ -15,24 +15,26 @@ scripting or if you just prefer a terminal.
 
 ## Install
 
-Pick whichever of these fits the machine you're on.
+### Linux — one command
 
-### Option A — prebuilt binary (Linux x86_64 only, for now)
+```bash
+curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | bash
+```
 
-This repo's `dist/` (after running `packaging/build.sh` once, see [Packaging](#packaging)) has
-two standalone binaries that need nothing else installed — no Python, no venv:
+Downloads the prebuilt binaries from the [latest release](https://github.com/Carlsans/roastnet/releases/latest),
+installs them to `~/.local/bin` (no sudo, no system packages touched), and adds a roastnet entry
+to your applications menu so it's a normal double-clickable app afterward. Safe to re-run any
+time — re-running just upgrades in place.
 
-- `dist/roastnet` — the CLI (search, publish, node, peer, gateway).
-- `dist/roastnet-gui` — the desktop app. **Keep both files in the same directory** — the GUI
-  shells out to the CLI binary sitting next to it.
+These binaries are built inside an Ubuntu 22.04 container specifically for portability (glibc is
+forward-compatible only, so building on an old base is what makes the same binary work on newer
+systems too — see `packaging/Dockerfile.build` for why this matters) and are verified, in Docker,
+to actually run — both the CLI and the GUI under Xvfb — on Ubuntu 22.04, Ubuntu 24.04, Debian 12,
+Fedora, and Arch Linux (`packaging/test-docker.sh` reruns this check any time). x86_64 only for
+now; no prebuilt binaries yet for other architectures or for macOS/Windows (PyInstaller doesn't
+cross-compile) — see the from-source option below for those.
 
-Copy both to the other machine (`scp dist/roastnet dist/roastnet-gui user@host:~/roastnet/`, a USB
-stick, whatever you normally use) and run them directly, e.g. `./roastnet search`. There's
-currently no prebuilt macOS or Windows binary — PyInstaller doesn't cross-compile, so one has to
-actually be built by running `packaging/build.sh` on a real machine of that OS (see
-[Packaging](#packaging)).
-
-### Option B — from source (Linux, macOS, Windows)
+### Everyone else — from source (Linux, macOS, Windows)
 
 Needs Python 3.10+.
 
@@ -70,10 +72,10 @@ nothing extra needed there. If you installed Python via Homebrew on macOS instea
 ## Quick start (GUI)
 
 Launch it:
-```bash
-roastnet-gui              # from source, activated venv
-./roastnet-gui            # prebuilt binary -- keep it next to ./roastnet, it shells out to it
-```
+- Installed via the one-command installer above? Click "roastnet" in your applications menu.
+- From source (activated venv): `roastnet-gui`
+- Ran a prebuilt binary yourself without the installer: `./roastnet-gui` — keep it next to
+  `./roastnet`, it shells out to it.
 
 Three tabs, left to right:
 
@@ -183,12 +185,22 @@ roastnet --db ~/roastnet.sqlite3 search
 
 ## Packaging
 
-`packaging/build.sh` runs PyInstaller and produces `dist/roastnet` + `dist/roastnet-gui`. Requires
-the `build` extra: `pip install -e ".[build]"`. This has to be run **on each target OS** —
-PyInstaller does not cross-compile. Only been built and verified on Linux x86_64 so far (including
-running the binaries fully standalone with no dev environment present, and a real two-binary
-network sync — see git history / commit message for details); macOS and Windows builds are
-unverified.
+Two ways to produce `dist/roastnet` + `dist/roastnet-gui`:
+
+- **`packaging/build-docker.sh`** — the one that actually produces distributable binaries (this
+  is what built the ones attached to the [releases](https://github.com/Carlsans/roastnet/releases)).
+  Builds inside an Ubuntu 22.04 Docker container for portability across newer distros (see
+  `packaging/Dockerfile.build`'s comments for why the build machine's glibc matters). Requires
+  Docker; needs nothing else installed on the host.
+- **`packaging/build.sh`** — builds directly on whatever machine you run it on (needs
+  `pip install -e ".[build]"` locally first). Faster for quick local iteration, but the result
+  is only guaranteed to run on systems at least as new as the build machine — not what you want
+  for something you're about to hand to someone else.
+
+Either way, this has to be run **on each target OS** — PyInstaller does not cross-compile. Only
+Linux x86_64 exists today (built and verified, including running fully standalone with no dev
+environment present, a real two-binary network sync, and — via `packaging/test-docker.sh` — actually
+running on 5 different distros in Docker); macOS and Windows builds are unbuilt and unverified.
 
 ## Development
 
@@ -208,6 +220,7 @@ Some GUI tests need a display; they auto-skip if none is available (`$DISPLAY` u
 - `peer sync` only replicates the feed of the peer you directly connect to, not a relay of
   everyone *that* peer knows about ("every peer mirrors the entire corpus" from
   `ARCHITECTURE.md`'s Full Replication section is future work).
-- Binary sizes (~24 MB CLI, ~53 MB GUI) are well over the doc's aspirational "~10-20 MB" — that
+- Binary sizes (~20 MB each for CLI and GUI, from the portable Docker build) are a bit over the
+  doc's aspirational "~10-20 MB" — that
   number describes the JS/Bare or Rust/Iroh-native stacks it lists as alternatives to the Python
   stack actually used here.
