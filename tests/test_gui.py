@@ -57,8 +57,16 @@ def _run_headless(body: str, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def test_all_tabs_construct_and_can_be_selected() -> None:
-    r = _run_headless("""
+def test_all_tabs_construct_and_can_be_selected(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    # Isolated HOME: constructing RoastnetApp auto-starts a real `node
+    # serve` (Network tab is always-on) and reads/writes gui/config.py's
+    # settings file -- without this it would touch the real user's actual
+    # ~/.local/share/roastnet and create a real ~/RoastNetShare folder.
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
 from roastnet.gui.app import RoastnetApp
 app = RoastnetApp()
 app.update()
@@ -71,10 +79,12 @@ app._on_close()
 print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
-    assert "TABS 3" in r.stdout, r.stdout
+    assert "TABS 4" in r.stdout, r.stdout
 
 
 def test_search_tab_runs_a_real_search_and_populates_the_table(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
     db_path = tmp_path / "gui.sqlite3"
     conn = connect(db_path)
     results = ingest_path(conn, FIXTURES_DIR)
@@ -82,6 +92,8 @@ def test_search_tab_runs_a_real_search_and_populates_the_table(tmp_path: Path) -
     assert all(r.error is None for r in results)
 
     r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
 from roastnet.gui.app import RoastnetApp
 app = RoastnetApp()
 app.db_path.set({str(db_path)!r})

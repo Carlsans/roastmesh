@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -126,3 +127,46 @@ def test_feed_publish_then_ingest_shows_up_in_search(tmp_path: Path, monkeypatch
 
     search_result = runner.invoke(main, ["--db", str(db_path), "search"])
     assert "no matches" not in search_result.output
+
+
+def test_show_finds_a_roast_by_full_id_and_by_prefix(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    roast_id = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "search", "--json"]).output
+    )[0]["roast_id"]
+
+    full = runner.invoke(main, ["--db", str(db_path), "show", roast_id])
+    assert full.exit_code == 0, full.output
+    assert "file:" in full.output
+    assert str(FIXTURES_DIR / "kaleido_1.alog") in full.output
+
+    prefix = runner.invoke(main, ["--db", str(db_path), "show", roast_id[:8]])
+    assert prefix.exit_code == 0, prefix.output
+    assert prefix.output == full.output
+
+
+def test_show_json_includes_record_and_raw_path(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    roast_id = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "search", "--json"]).output
+    )[0]["roast_id"]
+
+    result = runner.invoke(main, ["--db", str(db_path), "show", roast_id, "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["record"]["roast_id"] == roast_id
+    assert payload["raw_path"] == str(FIXTURES_DIR / "kaleido_1.alog")
+
+
+def test_show_reports_no_match_for_an_unknown_id(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+
+    result = runner.invoke(main, ["--db", str(db_path), "show", "0000000000"])
+    assert result.exit_code != 0
+    assert "no roast found" in result.output

@@ -202,6 +202,14 @@ def load_full_record(conn: sqlite3.Connection, roast_id: str) -> dict | None:
     return json.loads(row["raw_json"]) if row else None
 
 
+def find_ids_by_prefix(conn: sqlite3.Connection, roast_id_prefix: str) -> list[str]:
+    """Resolve a (possibly truncated, e.g. the 8 characters a results table
+    displays) roast_id back to full id(s) -- `show` uses this so a user
+    never has to copy-paste a full UUID out of the GUI."""
+    cur = conn.execute("SELECT roast_id FROM roasts WHERE roast_id LIKE ? || '%'", (roast_id_prefix,))
+    return [row["roast_id"] for row in cur.fetchall()]
+
+
 def find_raw_path(conn: sqlite3.Connection, roast_id: str) -> str | None:
     cur = conn.execute(
         "SELECT s.raw_path FROM roasts r JOIN sources s ON s.source_id = r.source_id WHERE r.roast_id = ?",

@@ -17,6 +17,7 @@ from roastnet.index import repository as repo
 from roastnet.index.db import connect
 from roastnet.index.ingest import ingest_feed, ingest_path
 from roastnet.peers import Peer, default_peers_path, load_peers, node_id_from_ticket, prune_stale, save_peers, upsert_peer
+from roastnet.watch_folder import default_watch_dir
 
 DEFAULT_DB = "roastnet.sqlite3"
 
@@ -127,6 +128,41 @@ def search(
                    f"DTR={dtr:<7} DROP={drop:<6} {beans}")
 
 
+@main.command("show")
+@click.argument("roast_id")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON instead of text.")
+@click.pass_context
+def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
+    """Show one roast's full detail (ROAST_ID may be a prefix, e.g. the 8
+    characters `search` displays) and the on-disk path to its original
+    .alog file, for opening it in Artisan directly."""
+    conn = connect(ctx.obj["db_path"])
+    matches = repo.find_ids_by_prefix(conn, roast_id)
+    if not matches:
+        raise click.ClickException(f"no roast found matching {roast_id!r}")
+    if len(matches) > 1:
+        raise click.ClickException(f"{roast_id!r} matches {len(matches)} roasts -- use more characters")
+    full_id = matches[0]
+    record = repo.load_full_record(conn, full_id)
+    raw_path = repo.find_raw_path(conn, full_id)
+
+    if as_json:
+        click.echo(json.dumps({"record": record, "raw_path": raw_path}))
+        return
+
+    beans = record.get("beans_text") or "(no beans text)"
+    click.echo(beans.splitlines()[0])
+    click.echo(f"machine: {record.get('machine_key')} ({record.get('roaster_type_raw')})")
+    click.echo(f"roast type: {record.get('roast_type') or '?'}")
+    click.echo(f"batch weight in/out: {record.get('batch_weight_in_g')}g / {record.get('batch_weight_out_g')}g")
+    click.echo(f"roast date: {record.get('roast_date') or '?'}")
+    for m in record.get("milestones") or []:
+        click.echo(f"  {m.get('name'):<10} t={m.get('time_s')}  BT={m.get('bt_c')}  ET={m.get('et_c')}")
+    if record.get("roasting_notes"):
+        click.echo(f"notes: {record['roasting_notes']}")
+    click.echo(f"file: {raw_path}")
+
+
 @main.group()
 def identity() -> None:
     """Manage your Ed25519 feed identity (created silently on first publish)."""
@@ -211,10 +247,20 @@ def node() -> None:
               help="Disable Iroh's relay/hole-punch (same-machine/LAN testing only).")
 @click.option("--no-lan-discovery", is_flag=True,
               help="Don't broadcast/listen for other roastnet nodes on the local network.")
+@click.option("--wan-discovery", is_flag=True,
+              help="Find other roastnet nodes over the whole internet, via the public "
+                   "BitTorrent DHT (opt-in: unlike LAN discovery, this makes your public "
+                   "IP address visible to anyone else looking at the same DHT swarm).")
+@click.option("--publish-watch-dir", default=None, type=click.Path(path_type=Path),
+              help="Folder to auto-publish any .alog files dropped into it "
+                   "(default: ~/RoastNetShare).")
+@click.option("--no-publish-watch", is_flag=True,
+              help="Don't auto-publish files from the watch folder.")
 @click.pass_context
 def node_serve(
     ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
-    no_relay: bool, no_lan_discovery: bool,
+    no_relay: bool, no_lan_discovery: bool, wan_discovery: bool,
+    publish_watch_dir: Path | None, no_publish_watch: bool,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
@@ -223,15 +269,22 @@ def node_serve(
 
     Unless --no-lan-discovery, also finds other roastnet nodes on the same
     local network automatically (no ticket-pasting needed) and syncs with
-    them, ingesting into --db.
+    them, ingesting into --db. With --wan-discovery, does the same over the
+    whole internet via the public BitTorrent DHT.
+
+    Unless --no-publish-watch, also auto-publishes any .alog file dropped
+    into --publish-watch-dir (default ~/RoastNetShare) -- no `feed publish`
+    needed for files placed there.
     """
     ident, created = load_or_create_identity()
     _remind_backup_if_new(ident, created)
     feed_dir = feed_dir or default_feed_dir()
     peers_file = peers_file or default_peers_path()
+    watch_dir = None if no_publish_watch else (publish_watch_dir or default_watch_dir())
     asyncio.run(net.serve(
         ident, feed_dir, peers_file, relay=not no_relay,
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
+        enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
     ))
 
 

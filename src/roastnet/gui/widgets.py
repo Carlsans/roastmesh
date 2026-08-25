@@ -61,14 +61,25 @@ class Field(ttk.Frame):
     """
 
     def __init__(self, parent: tk.Widget, label: str, default: str = "",
-                 help_text: str = "", width: int = 28) -> None:
+                 help_text: str = "", width: int = 28,
+                 variable: tk.StringVar | None = None) -> None:
         super().__init__(parent)
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
         tk.Label(row, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=22,
                  anchor="w").pack(side="left")
-        self.var = tk.StringVar(value=default)
+        # `variable`, when given, is a StringVar owned by the caller (e.g.
+        # RoastnetApp) rather than one this Field creates for itself -- lets
+        # a setting shown here (Settings tab) be the exact same variable
+        # every other tab reads, so there's one source of truth instead of
+        # needing to keep two in sync.
+        if variable is not None:
+            self.var = variable
+            if default and not self.var.get():
+                self.var.set(default)
+        else:
+            self.var = tk.StringVar(value=default)
         self.entry = ttk.Entry(row, textvariable=self.var, width=width)
         self.entry.pack(side="left", fill="x", expand=True)
         if help_text:
@@ -249,7 +260,10 @@ class ResultsTable(ttk.Frame):
             beans = (row.get("beans_text") or "").splitlines()[0][:80] if row.get("beans_text") else ""
             dtr = f"{row['dtr_pct']:.1f}" if row.get("dtr_pct") is not None else ""
             drop = f"{row['drop_bt_c']:.0f}" if row.get("drop_bt_c") is not None else ""
-            self.tree.insert("", "end", values=(
+            # iid is the full roast_id (not the truncated one shown in the
+            # ID column) -- double-click handlers read it back via
+            # identify_row/selection to know which full id to open.
+            self.tree.insert("", "end", iid=row.get("roast_id"), values=(
                 (row.get("roast_id") or "")[:8], row.get("machine_key") or "",
                 row.get("roast_type") or "", dtr, drop, beans,
             ))

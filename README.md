@@ -6,12 +6,15 @@ search everyone else's, no server and no accounts. Full design rationale lives i
 
 All 7 steps of that document's build order are implemented: local parsing/search index, signed
 feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a desktop GUI,
-standalone binaries, and a read-only web gateway. 110 tests, all passing.
+standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
+on your local network and (opt-in) over the whole internet via the public BitTorrent DHT, no
+tracker or bootstrap node of roastnet's own required — see
+[Peer discovery](#peer-discovery-lan-and-internet) below. 134 tests, all passing.
 
-The desktop app (`roastnet-gui`) is the primary way to use this — search, publish, and now serve
-and sync with peers, all from three tabs, no typing required. The command line (`roastnet`) does
-everything the GUI does and more (it's what the GUI itself runs under the hood), and is there for
-scripting or if you just prefer a terminal.
+The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
+just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
+required. The command line (`roastnet`) does everything the GUI does and more (it's what the GUI
+itself runs under the hood), and is there for scripting or if you just prefer a terminal.
 
 ## Install
 
@@ -77,33 +80,73 @@ Launch it:
 - Ran a prebuilt binary yourself without the installer: `./roastnet-gui` — keep it next to
   `./roastnet`, it shells out to it.
 
-Three tabs, left to right:
+Four tabs, left to right:
 
 - **Search** — free-text and filtered search over your local index (your own roasts plus
-  anything you've synced from peers). Blank search returns everything.
-- **Publish** — pick a `.alog` file and add it to your signed feed. Shows your feed's address
-  (public key) at the top; your identity is created silently the first time you publish.
+  anything you've synced from peers). Blank search returns everything. **Double-click a result**
+  to see its full detail and open the original `.alog` file with whatever your system would
+  normally open it with (Artisan, if it's installed).
+- **Publish** — the recommended way is the **shared folder** shown at the top (default
+  `~/RoastNetShare`, changeable in Settings): drop `.alog` files in there and they're published
+  automatically, no button to click, as long as Network is serving. "Publish a single file"
+  below it is the original one-off flow, for a file you don't want to leave in that folder. Your
+  feed's address (public key) shows at the top; your identity is created silently the first time
+  you publish.
 - **Network** — the piece that talks to other machines. The network is **on automatically**
   the moment this tab exists — no click needed — and stays on for as long as the app is open:
   - **Serve your feed**: starts as soon as you open the app. A **ticket** (a long string
-    starting with `endpoint...`) appears — that's what you share with someone *not* on your
-    local network so they can sync with you directly. Click "Copy" to put it on your clipboard.
+    starting with `endpoint...`) appears — that's what you share with someone discovery won't
+    reach so they can sync with you directly. Click "Copy" to put it on your clipboard.
     "Stop" if you deliberately want to go offline; "Start serving" resumes (with a fresh ticket
     — it encodes your current network address, not just your identity, so it's expected to
     change run to run).
-  - **Automatic LAN discovery**: also on by default. Any other roastnet node on the same local
+  - **Automatic LAN discovery**: on by default. Any other roastnet node on the same local
     network is found and synced with on its own, continuously, with zero clicks on either side
-    — open the app on two machines on the same LAN and they just find each other. (This is a
-    local broadcast, so it only works between machines on the same network; a peer somewhere
-    else still needs a pasted ticket, below.)
-  - **Sync with a peer**: for someone *not* on your local network — paste the ticket *they* gave
+    — open the app on two machines on the same LAN and they just find each other.
+  - **Automatic internet-wide discovery**: off by default, turned on in Settings. Does the same
+    thing as LAN discovery but across the whole internet — see
+    [Peer discovery](#peer-discovery-lan-and-internet) below for how and the trade-off involved.
+  - **Sync with a peer**: for someone discovery doesn't reach — paste the ticket *they* gave
     you and click "Sync". Pulls their new feed entries into your search index and exchanges
-    known-peer lists both ways, same as an automatic LAN sync does.
-  - **Known peers**: everyone found via LAN discovery, synced with manually, or gossiped about
-    by another peer — refreshes on its own every few seconds, so this stays live.
+    known-peer lists both ways, same as an automatic sync does.
+  - **Known peers**: everyone found via LAN/internet discovery, synced with manually, or
+    gossiped about by another peer — refreshes on its own every few seconds, so this stays live.
+- **Settings** — the database file (used to be a bar repeated atop every tab; now set once
+  here), the shared publish folder's path, and the internet-wide discovery toggle. Changes to
+  the database file apply the next time a tab runs something; changes to the other two apply the
+  next time you Stop then Start serving on the Network tab.
 
 That's the whole interface — every button just runs the equivalent command shown in the console
 under it, so nothing here is hidden from you.
+
+## Peer discovery: LAN and internet
+
+Two independent, both opt-out-able, layers on top of manual ticket-pasting:
+
+- **LAN discovery** (on by default): a small UDP broadcast on your local network (port `41888`)
+  — any roastnet node nearby announces itself and reacts to others' announcements. Never leaves
+  the local network.
+- **Internet-wide discovery** (off by default, Settings tab or `--wan-discovery`): the same idea,
+  extended to the whole internet, as easy to join as a BitTorrent swarm. Every opted-in roastnet
+  node announces itself on the real, already-running, public **BitTorrent Mainline DHT** — under
+  one fixed made-up identifier shared by every roastnet node everywhere, the same way every user
+  of one specific torrent is a peer of every other user of that torrent. No tracker or bootstrap
+  server of roastnet's own to run or configure; it piggybacks entirely on infrastructure that
+  already exists (bootstrapped via the same well-known routers real BitTorrent clients use:
+  `router.bittorrent.com` and a couple of others). Once found, a peer goes through exactly the
+  same handshake, signature verification, and quota checks as a LAN-discovered or manually-pasted
+  one — discovery only ever produces a "try this address," never trust.
+
+  **The trade-off, worth knowing before you turn it on**: a LAN broadcast never leaves your local
+  network, but announcing on the public DHT makes your node's public IP address (and the fact
+  that it's running roastnet) visible to anyone else looking at that same swarm — a materially
+  bigger exposure. That's why this one defaults off while LAN discovery defaults on.
+
+  Like the LAN case, this needs a UDP path in and out — some strict NATs (rare for typical home
+  routers, more common on some mobile/corporate networks) won't let the initial handshake through
+  either direction; a node behind one of those just won't be found this way, but LAN discovery,
+  manual tickets, and Iroh's own relay/hole-punch fallback (for the connection itself, once a
+  ticket's in hand) are all unaffected.
 
 ## Usage (command line)
 
@@ -114,10 +157,11 @@ on the top-level command picks the SQLite index file (default `roastnet.sqlite3`
 directory); pass an explicit path if you want it somewhere stable regardless of what directory
 you happen to run commands from.
 
-**Search your local index:**
+**Search your local index, and look at one result in full:**
 ```bash
 roastnet --db ~/roastnet.sqlite3 ingest path/to/some.alog     # or a directory of .alog files
 roastnet --db ~/roastnet.sqlite3 search washed ethiopian --machine kaleido_m2 --dtr-min 15
+roastnet --db ~/roastnet.sqlite3 show <roast_id>               # roast_id may be a prefix
 ```
 
 **Publish one of your own roasts** (creates your Ed25519 identity silently on first use):
@@ -125,6 +169,8 @@ roastnet --db ~/roastnet.sqlite3 search washed ethiopian --machine kaleido_m2 --
 roastnet feed publish path/to/your-roast.alog
 roastnet identity export      # back up your secret key -- there is no recovery if it's lost
 ```
+Or drop `.alog` files into a folder and let a running `node serve` publish them for you --
+see the watch-folder flag below.
 
 **Run a node** so others can sync with you, and **sync with someone else's node**:
 ```bash
@@ -132,6 +178,12 @@ roastnet node serve                      # prints your ticket -- share it with p
 roastnet --db ~/roastnet.sqlite3 peer sync <their-ticket>    # pulls their feed + peer list
 roastnet peer list
 ```
+`node serve` also, by default: finds and syncs with other nodes on your local network
+(`--no-lan-discovery` to turn off), and auto-publishes any `.alog` file dropped into
+`~/RoastNetShare` (`--publish-watch-dir` to change the folder, `--no-publish-watch` to turn
+off). Add `--wan-discovery` to also find peers over the whole internet via the public BitTorrent
+DHT -- off by default; see [Peer discovery](#peer-discovery-lan-and-internet) above for the
+trade-off before turning it on.
 
 **Read-only web view** of your local index, browsable from any browser on the machine (or your
 LAN, with `--host`):
@@ -184,11 +236,12 @@ roastnet --db ~/roastnet.sqlite3 search
 - Double-check you copied the *entire* ticket, for the manual/cross-network path — it's long,
   and easy to truncate when copy-pasting (the GUI's "Copy" button avoids this; if typing/pasting
   by hand in a terminal, be careful).
-- A local firewall on either machine can block the connection — both the Iroh QUIC handshake
-  (a UDP port picked automatically each run) and LAN auto-discovery (`UDP 41888`, broadcast)
-  need to get through. If you have `ufw`/`firewalld`/Windows Firewall/etc. active, try
-  temporarily disabling it on both machines to confirm that's the cause before figuring out a
-  permanent rule.
+- A local firewall on either machine can block the connection — the Iroh QUIC handshake (a UDP
+  port picked automatically each run), LAN auto-discovery (`UDP 41888`, broadcast), and, if
+  `--wan-discovery`/the Settings toggle is on, internet-wide discovery (`UDP 41890`, plus
+  outbound UDP 6881 to the public DHT bootstrap routers) all need to get through. If you have
+  `ufw`/`firewalld`/Windows Firewall/etc. active, try temporarily disabling it on both machines
+  to confirm that's the cause before figuring out a permanent rule.
 - `roastnet node serve` (CLI only — not exposed as a GUI option yet) accepts `--no-relay`, which
   restricts it to direct connections only, no fallback to Iroh's relay infrastructure. This is
   what this project's own automated tests use for same-process testing; for two *separate*
@@ -231,7 +284,9 @@ Some GUI tests need a display; they auto-skip if none is available (`$DISPLAY` u
 
 - No real bootstrap nodes exist yet (`roastnet peer bootstrap` is a documented no-op until a
   maintainer runs an always-on node and its ticket gets added to `src/roastnet/bootstrap.py`) —
-  use `roastnet peer add <ticket>` (manual, from a friend) in the meantime.
+  in the meantime, use `roastnet peer add <ticket>` (manual, from a friend), or turn on
+  internet-wide discovery (Settings tab / `--wan-discovery`), which finds other opted-in nodes
+  without needing a bootstrap node at all.
 - `peer sync` only replicates the feed of the peer you directly connect to, not a relay of
   everyone *that* peer knows about ("every peer mirrors the entire corpus" from
   `ARCHITECTURE.md`'s Full Replication section is future work).

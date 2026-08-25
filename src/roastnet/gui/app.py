@@ -1,24 +1,33 @@
 """roastnet desktop GUI.
 
-Three tabs: Search and Publish, in the order ARCHITECTURE.md's build order
+Four tabs: Search and Publish, in the order ARCHITECTURE.md's build order
 names them ("search first, publish second"), then Network -- start serving,
 sync with a peer, see who you know -- which makes the actual point of the
 project (talking to another machine) fully driveable from the GUI instead
-of needing the CLI for it. Every action shells out to the same `roastnet`
-CLI a terminal user would run -- see gui/runner.py for why -- and the exact
-command is shown above its output.
+of needing the CLI for it -- then Settings, where the database file, the
+publish watch folder, and internet-wide discovery live. Those three used to
+be a bar repeated atop every tab (just the database file) or not exposed in
+the GUI at all; Settings exists so they're set once instead of nagging every
+screen. Every action shells out to the same `roastnet` CLI a terminal user
+would run -- see gui/runner.py for why -- and the exact command is shown
+above its output.
 """
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, ttk
 
+from roastnet.gui import config as gui_config
 from roastnet.gui.runner import Task, describe, roastnet_argv, stream_into
 from roastnet.gui.widgets import (
     BG,
     FG,
     FONT_BOLD,
+    FONT_H2,
     FONT_MONO,
     MUTED,
     Choice,
@@ -31,7 +40,23 @@ from roastnet.gui.widgets import (
     heading,
     section,
 )
-from roastnet.index.db import default_db_path
+
+
+def _open_with_default_app(path: str) -> None:
+    """Launch `path` in whatever the OS would open it with -- for a .alog
+    file, that's normally Artisan itself, which is the whole point: seeing
+    a roast from search should be as direct as double-clicking it in a
+    file manager."""
+    try:
+        if sys.platform == "win32":
+            import os
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError:
+        pass  # no handler registered / command not found -- nothing more we can do here
 
 
 class Tab(ttk.Frame):
@@ -68,6 +93,8 @@ class SearchTab(Tab):
         self._output: list[str] = []
         self.runbar = RunBar(self, "Search", self._on_run, self.cancel)
         self.table = ResultsTable(self)
+        self.table.tree.bind("<Double-1>", self._on_open_row)
+        explain(self, "Double-click a result to see its full detail and open the original .alog file.")
 
     def _build_args(self) -> list[str]:
         args = ["search"]
@@ -116,6 +143,79 @@ class SearchTab(Tab):
             return
         self.table.set_rows(rows)
 
+    def _on_open_row(self, event: tk.Event) -> None:
+        roast_id = self.table.tree.identify_row(event.y)
+        if not roast_id:
+            return
+        argv = roastnet_argv("--db", self.app.db_path.get(), "show", roast_id, "--json")
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._open_row_loaded(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _open_row_loaded(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            return
+        try:
+            payload = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            return
+        RoastDetailWindow(self, payload.get("record") or {}, payload.get("raw_path"))
+
+
+class RoastDetailWindow(tk.Toplevel):
+    """A search result, opened: full metadata, milestones, notes, and a
+    button to open the original .alog file with whatever the OS would
+    normally open it with (Artisan, for anyone who has it installed)."""
+
+    def __init__(self, parent: tk.Widget, record: dict, raw_path: str | None) -> None:
+        super().__init__(parent)
+        self.configure(bg=BG)
+        beans_lines = (record.get("beans_text") or "").splitlines()
+        title = beans_lines[0] if beans_lines else "Roast detail"
+        self.title(title)
+
+        heading(self, title)
+
+        info = ttk.Frame(self)
+        info.pack(fill="x", padx=14, pady=(0, 6))
+
+        def row(label: str, value) -> None:
+            r = ttk.Frame(info)
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=18,
+                     anchor="w").pack(side="left")
+            tk.Label(r, text=str(value) if value not in (None, "") else "?", font=FONT_MONO,
+                     bg=BG, fg=MUTED, anchor="w", wraplength=600, justify="left").pack(side="left")
+
+        row("Machine", f"{record.get('machine_key')} ({record.get('roaster_type_raw')})")
+        row("Roast type", record.get("roast_type"))
+        row("Batch in / out", f"{record.get('batch_weight_in_g')}g / {record.get('batch_weight_out_g')}g")
+        row("Roast date", record.get("roast_date"))
+
+        milestones = record.get("milestones") or []
+        if milestones:
+            tk.Label(self, text="Milestones", font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
+                fill="x", padx=14, pady=(10, 2))
+            for m in milestones:
+                row(m.get("name") or "?", f"t={m.get('time_s')}  BT={m.get('bt_c')}  ET={m.get('et_c')}")
+
+        notes = record.get("roasting_notes") or record.get("cupping_notes")
+        if notes:
+            tk.Label(self, text="Notes", font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
+                fill="x", padx=14, pady=(10, 2))
+            explain(self, notes)
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=14, pady=(12, 12))
+        if raw_path:
+            ttk.Button(btn_row, text="Open original file",
+                       command=lambda: _open_with_default_app(raw_path)).pack(side="left")
+            tk.Label(btn_row, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG).pack(
+                side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
+
 
 class PublishTab(Tab):
     """Append one of your own roasts to your signed feed. Second tab, per
@@ -126,8 +226,8 @@ class PublishTab(Tab):
         heading(self, "Publish", "Add one of your own roasts to your signed feed.")
         explain(self, "Publishing appends a signed entry to your local feed -- your identity is "
                        "created silently the first time you publish, if you don't have one yet. "
-                       "A peer only receives it once they sync with you (roastnet peer sync), which "
-                       "stays a command-line-only operation for now.")
+                       "A peer only receives it once they sync with you, which the Network tab "
+                       "now does on its own once you're serving.")
 
         identity_row = ttk.Frame(self)
         identity_row.pack(fill="x", padx=14, pady=(0, 6))
@@ -136,13 +236,35 @@ class PublishTab(Tab):
         tk.Label(identity_row, textvariable=self.identity_var, font=FONT_MONO, bg=BG,
                  fg=MUTED).pack(side="left", padx=(6, 0))
 
-        self.path_field = Field(self, "File to publish", help_text="An Artisan .alog file.")
-        ttk.Button(self, text="Browse...", command=self._browse).pack(padx=10, pady=(0, 6), anchor="w")
+        folder_section = section(self, "Shared folder (recommended)")
+        tk.Label(folder_section, text="Drop .alog files here and they're published automatically, "
+                 "as long as the Network tab is serving -- no button to click per file:",
+                 font=("TkDefaultFont", 9), fg=MUTED, bg=BG, wraplength=840, justify="left",
+                 anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        folder_row = ttk.Frame(folder_section)
+        folder_row.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(folder_row, textvariable=self.app.watch_dir, font=FONT_MONO, bg=BG, fg=FG).pack(
+            side="left")
+        ttk.Button(folder_row, text="Open folder", command=self._open_watch_folder).pack(
+            side="left", padx=(8, 0))
 
-        self.runbar = RunBar(self, "Publish", self._on_run, self.cancel)
-        self.console = Console(self)
+        single_file_section = section(self, "Publish a single file")
+        self.path_field = Field(single_file_section, "File to publish", help_text="An Artisan .alog file.")
+        ttk.Button(single_file_section, text="Browse...", command=self._browse).pack(
+            padx=10, pady=(0, 6), anchor="w")
+
+        self.runbar = RunBar(single_file_section, "Publish", self._on_run, self.cancel)
+        self.console = Console(single_file_section)
 
         self._load_identity()
+
+    def _open_watch_folder(self) -> None:
+        path = self.app.watch_dir.get()
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        _open_with_default_app(path)
 
     def _browse(self) -> None:
         path = filedialog.askopenfilename(
@@ -201,9 +323,10 @@ class NetworkTab(Tab):
         heading(self, "Network", "Serve your feed to peers, and pull theirs.")
         explain(self, "The network is on automatically while this app is running -- peers on your "
                        "local network are found and synced with on their own, no clicking needed. "
-                       "For a peer that isn't on the same local network, share the ticket shown "
-                       "below with them, or paste theirs under 'Sync with a peer' to reach them "
-                       "directly.")
+                       "Internet-wide discovery (Settings tab) finds peers beyond your LAN the same "
+                       "way, if you've turned it on. For a peer discovery won't reach, share the "
+                       "ticket shown below with them, or paste theirs under 'Sync with a peer'. "
+                       "Changes made in Settings apply the next time you Stop then Start serving.")
 
         serve_section = section(self, "Serve your feed")
         tk.Label(serve_section, text="Your ticket:", font=FONT_BOLD, bg=BG, fg=FG).pack(
@@ -255,7 +378,10 @@ class NetworkTab(Tab):
     def _on_start_serve(self) -> None:
         if self.serve_task is not None and self.serve_task.running:
             return
-        argv = roastnet_argv("--db", self.app.db_path.get(), "node", "serve")
+        argv = roastnet_argv("--db", self.app.db_path.get(), "node", "serve",
+                              "--publish-watch-dir", self.app.watch_dir.get())
+        if self.app.wan_discovery_enabled.get():
+            argv.append("--wan-discovery")
         self.serve_console.clear()
         self.serve_console.set_command(describe(argv))
         self.ticket_var.set("")
@@ -319,6 +445,59 @@ class NetworkTab(Tab):
         self.peers_table.set_rows(peers)
 
 
+class SettingsTab(Tab):
+    """Where things live, and how far discovery reaches. Its own tab
+    rather than a bar repeated atop every screen (the database file used
+    to be exactly that) because these are set-once choices, not something
+    to reconsider on every search or publish. Every field here writes
+    through to gui/config.py immediately, so a choice made here survives
+    closing and reopening the app."""
+
+    def __init__(self, parent: tk.Widget, app: "RoastnetApp") -> None:
+        super().__init__(parent, app)
+        heading(self, "Settings", "Where things live, and how far discovery reaches.")
+
+        db_section = section(self, "Database file")
+        explain(db_section, "Where your local search index lives. Search, Publish, and Network "
+                             "all use this. Existing tabs pick up a change the next time they run.")
+        self.db_field = Field(db_section, "Path", variable=self.app.db_path, width=60)
+        ttk.Button(db_section, text="Browse...", command=self._browse_db).pack(
+            padx=10, pady=(0, 8), anchor="w")
+
+        watch_section = section(self, "Shared publish folder")
+        explain(watch_section, "Any .alog file dropped here is published automatically while "
+                                "the Network tab is serving -- see the Publish tab.")
+        self.watch_field = Field(watch_section, "Path", variable=self.app.watch_dir, width=60)
+        ttk.Button(watch_section, text="Browse...", command=self._browse_watch_dir).pack(
+            padx=10, pady=(0, 8), anchor="w")
+
+        wan_section = section(self, "Internet-wide discovery")
+        explain(wan_section,
+                "Off by default. LAN discovery only ever broadcasts on your local network. "
+                "Turning this on also finds and syncs with roastnet peers anywhere on the "
+                "internet, the same way a BitTorrent client finds peers with no tracker of its "
+                "own: by announcing on the public BitTorrent DHT, a huge, already-running "
+                "public network -- no server of roastnet's own involved. The trade-off: your "
+                "public IP address (and the fact that it's running roastnet) becomes visible to "
+                "anyone else looking at that same swarm, which a LAN broadcast never exposes. "
+                "Restart serving (Network tab: Stop, then Start) after changing this.")
+        ttk.Checkbutton(wan_section, text="Find peers over the whole internet, not just my LAN",
+                         variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _browse_db(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Choose a database file", defaultextension=".sqlite3",
+            filetypes=[("SQLite database", "*.sqlite3"), ("All files", "*.*")],
+        )
+        if path:
+            self.app.db_path.set(path)
+
+    def _browse_watch_dir(self) -> None:
+        path = filedialog.askdirectory(title="Choose a folder to auto-publish from")
+        if path:
+            self.app.watch_dir.set(path)
+
+
 class RoastnetApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -330,11 +509,12 @@ class RoastnetApp(tk.Tk):
         except tk.TclError:
             pass
 
-        top = ttk.Frame(self)
-        top.pack(fill="x")
-        self.db_path = Field(top, "Database file", default=str(default_db_path()),
-                              help_text="Where your local search index lives.", width=60)
-        ttk.Button(top, text="Browse...", command=self._browse_db).pack(padx=10, pady=(0, 6), anchor="w")
+        cfg = gui_config.load_config()
+        self.db_path = tk.StringVar(value=cfg.db_path)
+        self.watch_dir = tk.StringVar(value=cfg.watch_dir)
+        self.wan_discovery_enabled = tk.BooleanVar(value=cfg.wan_discovery_enabled)
+        for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled):
+            var.trace_add("write", lambda *_args: self._save_config())
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=6, pady=6)
@@ -342,20 +522,20 @@ class RoastnetApp(tk.Tk):
         search_tab = SearchTab(notebook, self)
         publish_tab = PublishTab(notebook, self)
         network_tab = NetworkTab(notebook, self)
+        settings_tab = SettingsTab(notebook, self)
         notebook.add(search_tab, text="Search")
         notebook.add(publish_tab, text="Publish")
         notebook.add(network_tab, text="Network")
-        self.tabs: list[Tab] = [search_tab, publish_tab, network_tab]
+        notebook.add(settings_tab, text="Settings")
+        self.tabs: list[Tab] = [search_tab, publish_tab, network_tab, settings_tab]
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _browse_db(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Choose a database file", defaultextension=".sqlite3",
-            filetypes=[("SQLite database", "*.sqlite3"), ("All files", "*.*")],
-        )
-        if path:
-            self.db_path.set(path)
+    def _save_config(self) -> None:
+        gui_config.save_config(gui_config.GuiConfig(
+            db_path=self.db_path.get(), watch_dir=self.watch_dir.get(),
+            wan_discovery_enabled=self.wan_discovery_enabled.get(),
+        ))
 
     def _on_close(self) -> None:
         for tab in self.tabs:

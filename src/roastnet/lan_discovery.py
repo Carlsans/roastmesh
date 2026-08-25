@@ -18,10 +18,11 @@ attempt; it can't make roastnet trust unverified content.
 from __future__ import annotations
 
 import asyncio
-import json
 import socket
 import time
 from collections.abc import Awaitable, Callable
+
+from roastnet.hello import decode_hello, encode_hello
 
 BEACON_PORT = 41888
 BEACON_INTERVAL_S = 5.0
@@ -34,14 +35,10 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
         self._handle = handle
 
     def datagram_received(self, data: bytes, addr) -> None:
-        try:
-            msg = json.loads(data.decode("utf-8"))
-            pubkey = msg["pubkey"]
-            ticket = msg["ticket"]
-        except (json.JSONDecodeError, KeyError, UnicodeDecodeError, TypeError):
+        decoded = decode_hello(data)
+        if decoded is None:
             return
-        if not isinstance(pubkey, str) or not isinstance(ticket, str):
-            return
+        pubkey, ticket = decoded
         if pubkey == self._own_pubkey_hex:
             return  # broadcasts loop back to the sender on the same host
         self._handle(pubkey, ticket)
@@ -87,7 +84,7 @@ async def run_beacon(
         lambda: _BeaconProtocol(own_pubkey_hex, _handle), sock=sock,
     )
 
-    payload = json.dumps({"v": 1, "pubkey": own_pubkey_hex, "ticket": own_ticket}).encode("utf-8")
+    payload = encode_hello(own_pubkey_hex, own_ticket)
     try:
         while True:
             try:

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import shutil
 from pathlib import Path
 
 import iroh
@@ -341,3 +342,39 @@ async def test_lan_discovery_auto_syncs_without_a_manual_sync_call(tmp_path: Pat
     finally:
         await _stop_server(task_a)
         await _stop_server(task_b)
+
+
+async def test_serve_auto_publishes_files_dropped_in_the_watch_folder(tmp_path: Path) -> None:
+    """The other half of "convivial publishing": while a node is serving
+    with publish_watch_dir set, a file dropped into that folder shows up in
+    the feed on its own -- no `feed publish` call anywhere in this test."""
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    watch_dir = tmp_path / "watch"
+
+    ready: asyncio.Future = asyncio.get_event_loop().create_future()
+    task = asyncio.create_task(net.serve(
+        identity, feed_dir, tmp_path / "peers.json", relay=False,
+        ready_callback=ready.set_result, enable_lan_discovery=False,
+        publish_watch_dir=watch_dir, publish_watch_interval_s=0.2,
+    ))
+    try:
+        await asyncio.wait_for(ready, timeout=10)
+        # the loop itself creates the folder on first scan
+        for _ in range(50):
+            if watch_dir.is_dir():
+                break
+            await asyncio.sleep(0.1)
+        assert watch_dir.is_dir()
+
+        shutil.copy(FIXTURES[0], watch_dir / FIXTURES[0].name)
+
+        published = False
+        for _ in range(50):
+            await asyncio.sleep(0.2)
+            if len(read_entries(feed_dir)) == 1:
+                published = True
+                break
+        assert published, "dropped file was never auto-published"
+    finally:
+        await _stop_server(task)

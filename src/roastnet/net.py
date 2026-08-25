@@ -55,6 +55,8 @@ from roastnet.index.ingest import ingest_feed
 from roastnet.lan_discovery import BEACON_INTERVAL_S, BEACON_PORT, run_beacon
 from roastnet.peers import Peer, load_peers, save_peers, upsert_peer
 from roastnet.quota import QuotaCheckResult, QuotaLimits, check_feed_metadata
+from roastnet.wan_discovery import DHT_LOOKUP_INTERVAL_S, WAN_PORT, run_wan_discovery
+from roastnet.watch_folder import publish_new_files
 
 ALPN = b"roastnet/peer-sync/0"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -162,18 +164,22 @@ async def _auto_sync_discovered_peer(
     peers_path: Path,
     db_path: Path | None,
     relay: bool,
+    source: str = "lan",
 ) -> None:
-    print(f"lan: discovered {peer_pubkey_hex[:16]}..., syncing", flush=True)
+    """Shared by LAN and internet (DHT) auto-discovery -- `source` (used
+    both as a log-line prefix and as the peer's `added_via` tag) is the
+    only thing that differs between the two callers."""
+    print(f"{source}: discovered {peer_pubkey_hex[:16]}..., syncing", flush=True)
     try:
         report = await sync_with_peer(
-            peer_ticket, identity, peer_feeds_root, peers_path, relay=relay, added_via="lan",
+            peer_ticket, identity, peer_feeds_root, peers_path, relay=relay, added_via=source,
         )
-    except Exception as exc:  # noqa: BLE001 -- a bad/unreachable beacon shouldn't kill serve()
-        print(f"lan: sync with {peer_pubkey_hex[:16]}... failed: {exc!r}", flush=True)
+    except Exception as exc:  # noqa: BLE001 -- a bad/unreachable peer hint shouldn't kill serve()
+        print(f"{source}: sync with {peer_pubkey_hex[:16]}... failed: {exc!r}", flush=True)
         return
 
     verify_msg = "OK" if report.verify.ok else f"INVALID: {report.verify.error}"
-    print(f"lan: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
+    print(f"{source}: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
           flush=True)
 
     if db_path is not None and report.new_entry_count > 0:
@@ -183,6 +189,24 @@ async def _auto_sync_discovered_peer(
             ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
         finally:
             conn.close()
+
+
+async def _watch_publish_loop(feed_dir: Path, identity: Identity, watch_dir: Path, interval_s: float) -> None:
+    watch_dir = Path(watch_dir)
+    try:
+        watch_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"watch: could not create {watch_dir}: {exc!r}", flush=True)
+        return
+    while True:
+        try:
+            published = await asyncio.to_thread(publish_new_files, feed_dir, identity, watch_dir)
+            for entry in published:
+                print(f"watch: published entry {entry.seq} ({entry.content_sha256[:12]}...) "
+                      f"from {watch_dir}", flush=True)
+        except Exception as exc:  # noqa: BLE001 -- a bad file in the folder shouldn't kill serve()
+            print(f"watch: error scanning {watch_dir}: {exc!r}", flush=True)
+        await asyncio.sleep(interval_s)
 
 
 async def serve(
@@ -197,15 +221,32 @@ async def serve(
     enable_lan_discovery: bool = True,
     lan_discovery_port: int = BEACON_PORT,
     lan_discovery_interval_s: float = BEACON_INTERVAL_S,
+    enable_wan_discovery: bool = False,
+    wan_discovery_port: int = WAN_PORT,
+    wan_discovery_interval_s: float = DHT_LOOKUP_INTERVAL_S,
+    publish_watch_dir: Path | None = None,
+    publish_watch_interval_s: float = 10.0,
 ) -> None:
     """Bind a node and serve get_peers/get_feed requests forever.
 
     If `enable_lan_discovery`, also broadcasts/listens for other roastnet
     nodes on the local network (lan_discovery.run_beacon) and automatically
     syncs with any it finds -- no manual ticket-pasting needed for two
-    machines on the same LAN. `db_path`, if given, makes those automatic
-    syncs also land in the local search index (same verify-then-ingest
-    pipeline `peer sync` already uses for manual syncs).
+    machines on the same LAN.
+
+    If `enable_wan_discovery`, does the same thing but over the public
+    internet, via the real BitTorrent Mainline DHT (wan_discovery) instead
+    of a local broadcast -- opt-in, since it makes this node's public
+    address visible to anyone else looking at the same DHT swarm.
+
+    Either way, `db_path`, if given, makes those automatic syncs also land
+    in the local search index (same verify-then-ingest pipeline
+    `peer sync` already uses for manual syncs).
+
+    If `publish_watch_dir` is given, any `.alog` file placed there is
+    automatically appended to this feed (watch_folder.publish_new_files) --
+    "sharing" a roast becomes "drop the file in the folder", no publish
+    command needed, for as long as this node is serving.
     """
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
     ticket = str(iroh.EndpointTicket.from_addr(ep.addr()))
@@ -220,20 +261,38 @@ async def serve(
         print(f"listening as {identity.public_key_hex[:16]}...")
         print(f"ticket: {ticket}", flush=True)
 
-    beacon_task = None
-    if enable_lan_discovery:
-        resolved_peer_feeds_root = peer_feeds_root or default_peer_feeds_root()
+    resolved_peer_feeds_root = peer_feeds_root or default_peer_feeds_root()
 
-        async def _on_discovered(peer_pubkey_hex: str, peer_ticket: str) -> None:
+    background_tasks: list[asyncio.Task] = []
+    if enable_lan_discovery:
+        async def _on_lan_discovered(peer_pubkey_hex: str, peer_ticket: str) -> None:
             await _auto_sync_discovered_peer(
                 peer_pubkey_hex, peer_ticket, identity=identity,
                 peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
-                db_path=db_path, relay=relay,
+                db_path=db_path, relay=relay, source="lan",
             )
 
-        beacon_task = asyncio.create_task(run_beacon(
-            identity.public_key_hex, ticket, _on_discovered,
+        background_tasks.append(asyncio.create_task(run_beacon(
+            identity.public_key_hex, ticket, _on_lan_discovered,
             port=lan_discovery_port, interval_s=lan_discovery_interval_s,
+        )))
+
+    if enable_wan_discovery:
+        async def _on_wan_discovered(peer_pubkey_hex: str, peer_ticket: str) -> None:
+            await _auto_sync_discovered_peer(
+                peer_pubkey_hex, peer_ticket, identity=identity,
+                peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
+                db_path=db_path, relay=relay, source="wan",
+            )
+
+        background_tasks.append(asyncio.create_task(run_wan_discovery(
+            identity.public_key_hex, ticket, _on_wan_discovered,
+            port=wan_discovery_port, lookup_interval_s=wan_discovery_interval_s,
+        )))
+
+    if publish_watch_dir is not None:
+        background_tasks.append(asyncio.create_task(
+            _watch_publish_loop(feed_dir, identity, publish_watch_dir, publish_watch_interval_s)
         ))
 
     try:
@@ -243,8 +302,8 @@ async def serve(
                 break
             asyncio.create_task(_handle_connection(incoming, feed_dir, peers_path))
     finally:
-        if beacon_task is not None:
-            beacon_task.cancel()
+        for task in background_tasks:
+            task.cancel()
         await ep.close()
 
 
