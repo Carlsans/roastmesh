@@ -9,6 +9,7 @@ than pixel layout.
 """
 from __future__ import annotations
 
+import ast
 import os
 import queue
 import shutil
@@ -152,6 +153,56 @@ print("OK")
     assert "title" in columns_line and "filename" in columns_line
     values_line = [line for line in r.stdout.splitlines() if line.startswith("VALUES")][0]
     assert "kaleido_1.alog" in values_line  # the real filename, not a content hash or an id
+
+
+def test_search_tab_results_sort_by_clicking_a_column_header(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    conn = connect(db_path)
+    ingest_path(conn, FIXTURES_DIR)  # real fixtures: machine_key values hottop/kaleido_serial/unknown
+    conn.close()
+
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[0]
+tab._on_run()
+for _ in range(200):
+    app.update()
+    if tab.task is not None and not tab.task.running and tab.table.count_var.get() != "running...":
+        break
+    time.sleep(0.05)
+
+def machine_values():
+    return [tab.table.tree.set(iid, "machine_key") for iid in tab.table.tree.get_children()]
+
+print("UNSORTED_HEADING", tab.table.tree.heading("machine_key")["text"])
+
+tab.table._on_heading_click("machine_key")
+print("ASCENDING", machine_values())
+print("ASCENDING_HEADING", tab.table.tree.heading("machine_key")["text"])
+
+tab.table._on_heading_click("machine_key")
+print("DESCENDING", machine_values())
+print("DESCENDING_HEADING", tab.table.tree.heading("machine_key")["text"])
+
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "UNSORTED_HEADING Machine" in r.stdout, r.stdout  # no arrow before any click
+    lines = {line.split(" ", 1)[0]: line for line in r.stdout.splitlines()}
+    ascending = ast.literal_eval(lines["ASCENDING"].split(" ", 1)[1])
+    descending = ast.literal_eval(lines["DESCENDING"].split(" ", 1)[1])
+    assert ascending == sorted(ascending)
+    assert descending == sorted(descending, reverse=True)
+    assert "▲" in lines["ASCENDING_HEADING"]
+    assert "▼" in lines["DESCENDING_HEADING"]
 
 
 def test_search_tab_lan_only_checkbox_is_checked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:

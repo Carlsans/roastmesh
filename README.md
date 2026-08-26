@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (opt-in) over the whole internet via the public BitTorrent DHT, no
 tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 207 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 212 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -85,7 +85,8 @@ Four tabs, left to right:
 - **Search** — free-text and filtered search over your local index (your own roasts plus
   anything you've synced from peers). Blank search returns everything. Results show each
   roast's title (Artisan's own `title` field -- often left at its default unless you've renamed
-  it) and filename, not an opaque id. **LAN only** is checked by default: it hides results from
+  it) and filename, not an opaque id. Click a column header to sort by it (click again to
+  reverse); the sort sticks across new searches. **LAN only** is checked by default: it hides results from
   peers found via internet-wide discovery, manually pasted, or gossiped about -- only your own
   roasts and LAN-discovered peers show up unless you uncheck it. **Only my own roasts** hides
   everything synced from any peer. **Show hidden roasts too** reveals anything you've hidden (see

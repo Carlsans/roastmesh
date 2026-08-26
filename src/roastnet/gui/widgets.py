@@ -235,13 +235,17 @@ _COLUMNS = [
 
 
 class ResultsTable(ttk.Frame):
-    """A sortable-by-eye table of search results (roastnet has no
-    equivalent in roastlab's GUI, since none of that project's commands
-    produce a list of rows the way `roastnet search` does)."""
+    """A search results table, sortable by clicking any column header --
+    click again to reverse, and the current sort (if any) carries over to
+    the next search's results too, so it doesn't reset every time you
+    refine a query. A column showing numbers (DTR %, Drop °C) sorts
+    numerically, not alphabetically -- see _sort_key."""
 
     def __init__(self, parent: tk.Widget, height: int = 14) -> None:
         super().__init__(parent)
         self.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        self._sort_column: str | None = None
+        self._sort_reverse = False
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True)
@@ -249,7 +253,7 @@ class ResultsTable(ttk.Frame):
             wrap, columns=[c[0] for c in _COLUMNS], show="headings", height=height,
         )
         for key, label, width in _COLUMNS:
-            self.tree.heading(key, text=label)
+            self.tree.heading(key, text=label, command=lambda k=key: self._on_heading_click(k))
             self.tree.column(key, width=width, anchor="w")
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         # A horizontal scrollbar too: the columns above add up to wider
@@ -280,6 +284,39 @@ class ResultsTable(ttk.Frame):
                 row.get("roast_type") or "", dtr, drop, beans,
             ))
         self.count_var.set(f"{len(rows)} result{'s' if len(rows) != 1 else ''}")
+        if self._sort_column is not None:
+            self._apply_sort()  # keep whatever sort was active before this search ran
+
+    def _on_heading_click(self, column: str) -> None:
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+        self._apply_sort()
+
+    @staticmethod
+    def _sort_key(value: str) -> tuple[int, float | str]:
+        # Numeric columns (DTR %, Drop °C) must sort as numbers, not text
+        # ("10" belongs after "9", not before it) -- tag every value by
+        # whether it parses as one so mixed numeric/blank columns still
+        # sort sensibly (numbers grouped together, blanks trailing).
+        try:
+            return (0, float(value))
+        except ValueError:
+            return (1, value.lower())
+
+    def _apply_sort(self) -> None:
+        column = self._sort_column
+        if column is None:
+            return
+        items = [(self.tree.set(iid, column), iid) for iid in self.tree.get_children("")]
+        items.sort(key=lambda pair: self._sort_key(pair[0]), reverse=self._sort_reverse)
+        for index, (_value, iid) in enumerate(items):
+            self.tree.move(iid, "", index)
+        for key, label, _width in _COLUMNS:
+            arrow = "" if key != column else (" ▼" if self._sort_reverse else " ▲")
+            self.tree.heading(key, text=label + arrow)
 
     def set_error(self, message: str) -> None:
         self.tree.delete(*self.tree.get_children())
