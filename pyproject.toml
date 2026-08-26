@@ -1,6 +1,6 @@
 [project]
 name = "roastnet"
-version = "0.3.6"
+version = "0.3.7"
 description = "Local parser, metadata extractor, and search index for Artisan .alog roast profiles -- the standalone building block for a P2P roast-profile sharing network."
 requires-python = ">=3.10"
 dependencies = [
