@@ -10,6 +10,7 @@ than pixel layout.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import queue
 import shutil
@@ -55,7 +56,18 @@ def _run_headless(body: str, timeout: int = 30) -> subprocess.CompletedProcess:
     """
     cmd = [sys.executable, "-c", HEADLESS.format(body=body)]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        cmd = ["xvfb-run", "-a", *cmd]
+        # This system's xvfb-run defaults to a 640x480 virtual screen --
+        # confirmed as the root cause of a real intermittent failure: the
+        # search results Treeview's requested size (~850x400) didn't fit
+        # inside the app's own default 900x680 window once packed under a
+        # tab bar/heading at that resolution, leaving it unmapped
+        # (winfo_ismapped() == 0) so Treeview.bbox() returned nothing for
+        # an otherwise perfectly real, populated row. 1920x1080 comfortably
+        # fits this app's window at any of its resolution-based UI scales
+        # (gui/widgets.py's detect_ui_scale) -- a laptop-sized screen is
+        # exactly the scenario this whole feature is about, not a corner
+        # case to shrink away.
+        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
@@ -82,6 +94,87 @@ print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
     assert "TABS 4" in r.stdout, r.stdout
+
+
+def test_ui_scale_env_var_overrides_a_persisted_config_value(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".local" / "share" / "roastnet").mkdir(parents=True)
+    (home / ".local" / "share" / "roastnet" / "gui_config.json").write_text('{"ui_scale": 1.6}')
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+os.environ["ROASTNET_UI_SCALE"] = "2.0"
+from roastnet.gui import widgets
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.update()
+print("UI_SCALE", widgets.UI_SCALE)
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "UI_SCALE 2.0" in r.stdout, r.stdout
+
+
+def test_relaunch_with_scale_persists_and_restarts_with_the_new_scale(tmp_path: Path) -> None:
+    # Exercises the real os.execv self-relaunch in RoastnetApp._relaunch_with_scale
+    # end to end: not just that it writes the right config, but that the
+    # actual re-exec completes and the app comes back up with the new
+    # scale applied. This depends on single_instance's listening socket
+    # NOT surviving execv (confirmed separately -- Python sockets are
+    # non-inheritable by default, PEP 446) -- if that ever stopped being
+    # true, the relaunched process would wrongly think another instance
+    # is already running and this test would hang/fail rather than pass
+    # silently. A real script file, not `-c` (unlike _run_headless, which
+    # deliberately fakes sys.argv) -- execv needs a real argv[0] path to
+    # re-invoke itself with.
+    home = tmp_path / "home"
+    home.mkdir()
+    script = tmp_path / "relaunch_probe.py"
+    script.write_text(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui import config as gui_config
+from roastnet.gui import widgets
+from roastnet.gui.app import RoastnetApp
+
+cfg = gui_config.load_config()
+app = RoastnetApp()
+app.update()
+if cfg.ui_scale == 2.5:
+    print("AFTER_SCALE", widgets.UI_SCALE)
+    print("AFTER_TABS", len(app.tabs))
+    app._on_close()
+    print("OK")
+else:
+    # Nothing printed here survives -- os.execv discards this process's
+    # buffered (non-tty, so not line-buffered) stdout before any of it
+    # reaches the pipe pytest is capturing from. Confirmed the hard way:
+    # a "BEFORE_SCALE" print placed right here never showed up in
+    # r.stdout below despite the relaunch itself working correctly.
+    app._relaunch_with_scale(2.5)
+""")
+    cmd = [sys.executable, str(script)]
+    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
+        # This system's xvfb-run defaults to a 640x480 virtual screen --
+        # confirmed as the root cause of a real intermittent failure: the
+        # search results Treeview's requested size (~850x400) didn't fit
+        # inside the app's own default 900x680 window once packed under a
+        # tab bar/heading at that resolution, leaving it unmapped
+        # (winfo_ismapped() == 0) so Treeview.bbox() returned nothing for
+        # an otherwise perfectly real, populated row. 1920x1080 comfortably
+        # fits this app's window at any of its resolution-based UI scales
+        # (gui/widgets.py's detect_ui_scale) -- a laptop-sized screen is
+        # exactly the scenario this whole feature is about, not a corner
+        # case to shrink away.
+        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert "OK" in r.stdout, r.stderr
+    assert "AFTER_SCALE 2.5" in r.stdout, r.stdout
+    assert "AFTER_TABS 4" in r.stdout, r.stdout
+
+    saved = json.loads((home / ".local" / "share" / "roastnet" / "gui_config.json").read_text())
+    assert saved["ui_scale"] == 2.5
 
 
 def test_search_tab_runs_a_real_search_and_populates_the_table(tmp_path: Path) -> None:
@@ -206,7 +299,7 @@ print("OK")
     assert "▼" in lines["DESCENDING_HEADING"]
 
 
-def test_search_tab_lan_only_checkbox_is_checked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:
+def test_search_tab_lan_only_checkbox_is_unchecked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     r = _run_headless(f"""
@@ -218,15 +311,15 @@ app.update()
 tab = app.tabs[0]
 print("DEFAULT_CHECKED", tab.lan_only.get())
 print("DEFAULT_ARGS", tab._build_args())
-tab.lan_only.set(False)
-print("UNCHECKED_ARGS", tab._build_args())
+tab.lan_only.set(True)
+print("CHECKED_ARGS", tab._build_args())
 app._on_close()
 print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
-    assert "DEFAULT_CHECKED True" in r.stdout, r.stdout
-    assert "--all-peers" not in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
-    assert "--all-peers" in [line for line in r.stdout.splitlines() if line.startswith("UNCHECKED_ARGS")][0]
+    assert "DEFAULT_CHECKED False" in r.stdout, r.stdout
+    assert "--all-peers" in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
+    assert "--all-peers" not in [line for line in r.stdout.splitlines() if line.startswith("CHECKED_ARGS")][0]
 
 
 def test_search_tab_own_only_checkbox_is_unchecked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:
@@ -462,7 +555,18 @@ def _gui_launch_argv(port: int) -> list[str]:
     )
     cmd = [sys.executable, "-c", body]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        cmd = ["xvfb-run", "-a", *cmd]
+        # This system's xvfb-run defaults to a 640x480 virtual screen --
+        # confirmed as the root cause of a real intermittent failure: the
+        # search results Treeview's requested size (~850x400) didn't fit
+        # inside the app's own default 900x680 window once packed under a
+        # tab bar/heading at that resolution, leaving it unmapped
+        # (winfo_ismapped() == 0) so Treeview.bbox() returned nothing for
+        # an otherwise perfectly real, populated row. 1920x1080 comfortably
+        # fits this app's window at any of its resolution-based UI scales
+        # (gui/widgets.py's detect_ui_scale) -- a laptop-sized screen is
+        # exactly the scenario this whole feature is about, not a corner
+        # case to shrink away.
+        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
     return cmd
 
 

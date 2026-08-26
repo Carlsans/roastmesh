@@ -45,10 +45,6 @@ _COOL_BAND = "#dce9f5"
 _BAND_ALT = "#eeece6"
 _GRID = "#d8d5cd"
 
-_MARGIN_L = sp(52)
-_MARGIN_R = sp(46)
-_MARGIN_T = sp(12)
-_MARGIN_B = sp(26)
 _CONTROL_FRAC = 0.22  # bottom slice of the plot body reserved for burner/air/drum -- a ratio, not a pixel size
 _TICK_FONT = ("TkDefaultFont", 7)
 _LABEL_FONT = ("TkDefaultFont", 7)
@@ -66,6 +62,15 @@ class RoastChart(ttk.Frame):
         self._unit = unit
         self._series = self._build_series(record, unit)
         self._transform: dict | None = None
+        # Computed here, not as module constants, so a fresh scale (see
+        # gui/widgets.py's set_scale) is picked up by every chart opened
+        # after it changes -- a module-level `sp(52)` would freeze in
+        # whatever scale was active the first time this file was imported,
+        # for the rest of the process's life.
+        self._margin_l = sp(52)
+        self._margin_r = sp(46)
+        self._margin_t = sp(12)
+        self._margin_b = sp(26)
 
         self.phase_canvas = tk.Canvas(self, height=sp(46), bg=BG, highlightthickness=0)
         self.phase_canvas.pack(fill="x", pady=(4, 0))
@@ -180,8 +185,8 @@ class RoastChart(ttk.Frame):
         if width < 20 or height < 20:
             return  # not laid out yet -- a later <Configure> will redraw
 
-        body_left, body_right = _MARGIN_L, width - _MARGIN_R
-        body_top, body_bottom = _MARGIN_T, height - _MARGIN_B
+        body_left, body_right = self._margin_l, width - self._margin_r
+        body_top, body_bottom = self._margin_t, height - self._margin_b
         if body_right <= body_left or body_bottom <= body_top:
             return
 

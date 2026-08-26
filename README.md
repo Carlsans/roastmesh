@@ -7,8 +7,8 @@ search everyone else's, no server and no accounts. Full design rationale lives i
 All 7 steps of that document's build order are implemented: local parsing/search index, signed
 feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a desktop GUI,
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
-on your local network and (opt-in) over the whole internet via the public BitTorrent DHT, no
-tracker or bootstrap node of roastnet's own required — see
+on your local network and (on by default in the GUI, opt-in from the CLI) over the whole internet
+via the public BitTorrent DHT, no tracker or bootstrap node of roastnet's own required — see
 [Peer discovery](#peer-discovery-lan-and-internet) below. 261 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
@@ -49,6 +49,12 @@ to actually run — both the CLI and the GUI under Xvfb — on Ubuntu 22.04, Ubu
 Fedora, and Arch Linux (`packaging/test-docker.sh` reruns this check any time). x86_64 only for
 now; no prebuilt binaries yet for other architectures or for macOS/Windows (PyInstaller doesn't
 cross-compile) — see the from-source option below for those.
+
+**ARM (e.g. Raspberry Pi OS)**: no prebuilt binary yet, but the from-source install below works —
+confirmed with a real install and a real generated identity under aarch64 emulation. This needs
+64-bit Raspberry Pi OS (the default on Pi 3/4/5 and newer); 32-bit Raspberry Pi OS is not
+supported, because `iroh`, one of the three real dependencies, has never published a 32-bit ARM
+(armv7/armhf) wheel for Linux.
 
 ### Everyone else — from source (Linux, macOS, Windows)
 
@@ -93,16 +99,23 @@ Launch it:
 - Ran a prebuilt binary yourself without the installer: `./roastnet-gui` — keep it next to
   `./roastnet`, it shells out to it.
 
+Every label, button, and the roast chart scale together based on your screen's resolution (a
+laptop screen and a 4K monitor get noticeably different, appropriate sizes automatically) — adjust
+it yourself with Ctrl+scroll or Ctrl+plus/Ctrl+minus, and Ctrl+0 to go back to auto-detect
+(Settings tab shows the current percentage). Restarts roastnet to apply, the same brief interruption
+(and fresh ticket, if Network was serving) as Stop-then-Start already causes.
+
 Four tabs, left to right:
 
 - **Search** — free-text and filtered search over your local index (your own roasts plus
   anything you've synced from peers). Blank search returns everything. Results show each
   roast's title (Artisan's own `title` field -- often left at its default unless you've renamed
   it) and filename, not an opaque id. Click a column header to sort by it (click again to
-  reverse); the sort sticks across new searches. **LAN only** is checked by default: it hides results from
-  peers found via internet-wide discovery, manually pasted, or gossiped about -- only your own
-  roasts and LAN-discovered peers show up unless you uncheck it. **Only my own roasts** hides
-  everything synced from any peer. **Show hidden roasts too** reveals anything you've hidden (see
+  reverse); the sort sticks across new searches. **LAN only** is unchecked by default: peers found
+  via internet-wide discovery, manually pasted, or gossiped about show up in results the same as
+  LAN-discovered ones -- check it to restrict results to your own roasts and LAN-discovered peers
+  only. **Only my own roasts** hides everything synced from any peer (also unchecked by default —
+  synced roasts show up alongside your own). **Show hidden roasts too** reveals anything you've hidden (see
   below). **Double-click a result** to see its full detail, open the original `.alog` file with
   whatever your system would normally open it with (Artisan, if it's installed), or **Hide** it
   from your own search results -- local only: it doesn't touch the feed, so it can't retroactively
@@ -127,8 +140,8 @@ Four tabs, left to right:
   - **Automatic LAN discovery**: on by default. Any other roastnet node on the same local
     network is found and synced with on its own, continuously, with zero clicks on either side
     — open the app on two machines on the same LAN and they just find each other.
-  - **Automatic internet-wide discovery**: off by default, turned on in Settings. Does the same
-    thing as LAN discovery but across the whole internet — see
+  - **Automatic internet-wide discovery**: on by default, turned off in Settings if you'd rather
+    not. Does the same thing as LAN discovery but across the whole internet — see
     [Peer discovery](#peer-discovery-lan-and-internet) below for how and the trade-off involved.
   - **Sync with a peer**: for someone discovery doesn't reach — paste the ticket *they* gave
     you and click "Sync". Pulls their new feed entries into your search index and exchanges
@@ -150,7 +163,8 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
 - **LAN discovery** (on by default): a small UDP broadcast on your local network (port `41888`)
   — any roastnet node nearby announces itself and reacts to others' announcements. Never leaves
   the local network.
-- **Internet-wide discovery** (off by default, Settings tab or `--wan-discovery`): the same idea,
+- **Internet-wide discovery** (on by default in the GUI's Settings tab; off by default from the
+  CLI, where it's an explicit opt-in `--wan-discovery` flag): the same idea,
   extended to the whole internet, as easy to join as a BitTorrent swarm. Every opted-in roastnet
   node announces itself on the real, already-running, public **BitTorrent Mainline DHT** — under
   one fixed made-up identifier shared by every roastnet node everywhere, the same way every user
@@ -161,10 +175,13 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
   same handshake, signature verification, and quota checks as a LAN-discovered or manually-pasted
   one — discovery only ever produces a "try this address," never trust.
 
-  **The trade-off, worth knowing before you turn it on**: a LAN broadcast never leaves your local
-  network, but announcing on the public DHT makes your node's public IP address (and the fact
-  that it's running roastnet) visible to anyone else looking at that same swarm — a materially
-  bigger exposure. That's why this one defaults off while LAN discovery defaults on.
+  **The trade-off, worth knowing**: a LAN broadcast never leaves your local network, but
+  announcing on the public DHT makes your node's public IP address (and the fact that it's
+  running roastnet) visible to anyone else looking at that same swarm — a materially bigger
+  exposure. The GUI defaults this on alongside LAN discovery, since finding peers is the point of
+  the app; uncheck it in Settings if you'd rather stay LAN-only. The CLI's `--wan-discovery` flag
+  defaults off, since a script's behavior shouldn't change based on this without being asked
+  explicitly for it.
 
   Like the LAN case, this needs a UDP path in and out — some strict NATs (rare for typical home
   routers, more common on some mobile/corporate networks) won't let the initial handshake through

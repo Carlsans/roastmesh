@@ -32,14 +32,6 @@ FONT_H2 = ("TkDefaultFont", 11, "bold")
 FONT_MONO = ("TkFixedFont", 9)
 
 
-def _env_scale(name: str, default: float) -> float:
-    try:
-        value = float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
 # Every font in this app is specified in points, so raising Tk's global
 # scaling factor (RoastnetApp does this once, at startup) already makes
 # every point-sized font -- widget labels AND Canvas text alike -- bigger
@@ -48,17 +40,73 @@ def _env_scale(name: str, default: float) -> float:
 # real 4K display here, where X reported a bogus ~96 DPI (its physical
 # screen size was wrong, a common Linux/X quirk this project hit directly --
 # so auto-computing a "correct" scale from reported DPI isn't reliable
-# enough to trust). What that scaling call does NOT touch is anything
+# enough to trust; detect_ui_scale below buckets by actual screen
+# *resolution* instead, which is what was wrong on a real 4K display, and
+# also what was wrong the other way on a real 1080p laptop -- the same
+# fixed 3x this app used to always apply regardless of screen, confirmed
+# far too large there). What the scaling call does NOT touch is anything
 # specified in raw pixels -- window geometry, wraplength, Treeview column
 # widths, and (in gui/chart.py) hand-drawn Canvas margins/line
 # widths/tick sizes. UI_SCALE is applied to all of those explicitly via
 # `sp()` below so the whole app stays proportional once fonts grow.
-# LINE_SCALE is separate and smaller by convention (confirmed against a
-# real 4K display: 3x-thicker strokes at 3x-bigger text looked
-# disproportionately heavy) -- both are env-overridable for a different
-# display without editing code.
-UI_SCALE = _env_scale("ROASTNET_UI_SCALE", 3.0)
-LINE_SCALE = _env_scale("ROASTNET_LINE_SCALE", 2.0)
+# LINE_SCALE is derived from UI_SCALE, not independent -- by convention
+# it grows slower (confirmed against a real 4K display: 3x-thicker
+# strokes at 3x-bigger text looked disproportionately heavy), and this
+# formula reproduces that one already-tuned data point (3.0 -> 2.0)
+# exactly while extending smoothly to any other scale.
+#
+# Both start as inert placeholders -- the real value is resolved in
+# RoastnetApp.__init__ via resolve_ui_scale()/set_scale(), once a Tk root
+# exists to ask winfo_screenwidth() (nothing here can query the screen at
+# import time, before any window exists). Anything that reads UI_SCALE
+# must do so at call time (sp()/lw() already do, correctly), never import
+# the bare name -- see gui/chart.py's fix for what goes wrong otherwise.
+UI_SCALE = 1.0
+LINE_SCALE = 1.0
+
+MIN_UI_SCALE = 0.5
+MAX_UI_SCALE = 4.0
+SCALE_STEP = 0.15  # one Ctrl+scroll notch or Ctrl+plus/minus press, see app.py
+
+
+def detect_ui_scale(widget: tk.Widget) -> float:
+    """Bucket by actual screen pixel width. Only three buckets, deliberately
+    coarse -- this is a starting point a user can nudge with Ctrl+scroll or
+    Ctrl+plus/minus (see app.py), not an attempt at a precise formula."""
+    width = widget.winfo_screenwidth()
+    if width >= 3200:
+        return 3.0  # 4K and above -- the original, empirically-tuned value
+    if width >= 2200:
+        return 1.6  # 1440p/QHD-ish
+    return 1.0  # 1080p and below -- this app's original, unscaled sizing
+
+
+def resolve_ui_scale(widget: tk.Widget, configured: float | None) -> float:
+    """Precedence: $ROASTNET_UI_SCALE env var (testing/scripted-launch
+    override, same convention as gui/i18n.py's $ROASTNET_LANG) > a value
+    persisted in gui_config.json (set via Ctrl+scroll/Ctrl+plus/minus,
+    sticky across restarts and across screens) > detected from this
+    screen's resolution."""
+    env = os.environ.get("ROASTNET_UI_SCALE", "").strip()
+    if env:
+        try:
+            value = float(env)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    if configured is not None and configured > 0:
+        return configured
+    return detect_ui_scale(widget)
+
+
+def set_scale(value: float) -> None:
+    """Set UI_SCALE (clamped) and derive LINE_SCALE from it. Must run
+    before any widget that calls sp()/lw() is constructed -- see UI_SCALE's
+    docstring above."""
+    global UI_SCALE, LINE_SCALE
+    UI_SCALE = max(MIN_UI_SCALE, min(MAX_UI_SCALE, value))
+    LINE_SCALE = 1 + (UI_SCALE - 1) * 0.5
 
 
 def sp(px: float) -> int:

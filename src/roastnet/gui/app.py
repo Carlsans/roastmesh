@@ -32,6 +32,7 @@ from roastnet.gui import config as gui_config
 from roastnet.gui import i18n
 from roastnet.gui import single_instance
 from roastnet.gui import units
+from roastnet.gui import widgets
 from roastnet.gui.chart import RoastChart
 from roastnet.gui.i18n import t, tn
 from roastnet.gui.runner import Task, describe, roastnet_argv, stream_into
@@ -43,7 +44,6 @@ from roastnet.gui.widgets import (
     FONT_H2,
     FONT_MONO,
     MUTED,
-    UI_SCALE,
     Choice,
     Console,
     Field,
@@ -288,8 +288,8 @@ class SearchTab(Tab):
         heading(self, t("Search"), t("Find roast profiles in your local index."))
         explain(self, t("Text (optional) is matched against bean/process notes and roast type. "
                          "The filters below narrow further -- leave any blank to not filter on it. "
-                         "\"LAN only\" is on by default, so a stranger found through internet-wide "
-                         "discovery doesn't show up in results just for being nearby on the network."))
+                         "Peers found through internet-wide discovery show up in results by default, "
+                         "same as LAN peers -- check \"LAN only\" to hide anyone not on your local network."))
 
         self.query = Field(self, t("Text"), help_text=t("Free-text search, e.g. 'washed ethiopian'."))
         self.machine = Field(self, t("Machine"), help_text=t("Exact machine_key, e.g. kaleido_m2."))
@@ -304,7 +304,7 @@ class SearchTab(Tab):
         # dropdown is a smaller translation gap than breaking the filter.
         self.second_crack = Choice(self, t("After second crack?"), ["any", "yes", "no"], default="any")
 
-        self.lan_only = tk.BooleanVar(value=True)
+        self.lan_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             self, text=t("LAN only (hide results from internet-wide or manually-added peers)"),
             variable=self.lan_only,
@@ -830,14 +830,15 @@ class SettingsTab(Tab):
 
         wan_section = section(container, t("Internet-wide discovery"))
         explain(wan_section,
-                t("Off by default. LAN discovery only ever broadcasts on your local network. "
-                  "Turning this on also finds and syncs with roastnet peers anywhere on the "
-                  "internet, the same way a BitTorrent client finds peers with no tracker of its "
-                  "own: by announcing on the public BitTorrent DHT, a huge, already-running "
-                  "public network -- no server of roastnet's own involved. The trade-off: your "
-                  "public IP address (and the fact that it's running roastnet) becomes visible to "
-                  "anyone else looking at that same swarm, which a LAN broadcast never exposes. "
-                  "Restart serving (Network tab: Stop, then Start) after changing this."))
+                t("On by default. LAN discovery only ever broadcasts on your local network; this "
+                  "also finds and syncs with roastnet peers anywhere on the internet, the same way "
+                  "a BitTorrent client finds peers with no tracker of its own: by announcing on the "
+                  "public BitTorrent DHT, a huge, already-running public network -- no server of "
+                  "roastnet's own involved. The trade-off: your public IP address (and the fact "
+                  "that it's running roastnet) becomes visible to anyone else looking at that same "
+                  "swarm, which a LAN broadcast never exposes. Uncheck this if you'd rather only "
+                  "ever be found on your local network. Restart serving (Network tab: Stop, then "
+                  "Start) after changing this."))
         ttk.Checkbutton(wan_section, text=t("Find peers over the whole internet, not just my LAN"),
                          variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
 
@@ -868,6 +869,14 @@ class SettingsTab(Tab):
             ttk.Radiobutton(language_row, text=native_name, value=code,
                             variable=self.app.language).pack(side="left", padx=(0, 12))
 
+        scale_section = section(container, t("Display size"))
+        explain(scale_section,
+                t("Currently {pct}% -- scales every label, button, and chart together. "
+                  "Detected from this screen's resolution by default; Ctrl+scroll (or "
+                  "Ctrl+plus/Ctrl+minus) to adjust it, Ctrl+0 to go back to auto-detect. "
+                  "Restarts roastnet to apply, the same as Stop-then-Start serving does.",
+                  pct=round(widgets.UI_SCALE * 100)))
+
     def _browse_db(self) -> None:
         path = filedialog.asksaveasfilename(
             title=t("Choose a database file"), defaultextension=".sqlite3",
@@ -885,14 +894,27 @@ class SettingsTab(Tab):
 class RoastnetApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        cfg = gui_config.load_config()
+        # None until a user overrides it via Ctrl+scroll/Ctrl+plus/minus --
+        # kept separately from widgets.UI_SCALE (the resolved, in-effect
+        # number) so _save_config can round-trip "auto-detect" (None)
+        # rather than freezing in whatever this screen happened to resolve
+        # to. See gui/config.py's ui_scale field.
+        self._ui_scale_override = cfg.ui_scale
+
         # Every font in this app (and gui/chart.py's Canvas text) is
         # specified in points, so this one call is what actually makes
         # them all bigger together -- see UI_SCALE's docstring in
         # widgets.py for why this can't just be auto-detected from the
-        # display's reported DPI. Must happen before any widget is
-        # created, or already-built widgets keep their original size.
+        # display's reported DPI, and must instead be resolved (env var >
+        # persisted override > this screen's resolution) before any widget
+        # is created, or already-built widgets keep their original size --
+        # this includes gui/chart.py, whose margins are computed from
+        # sp() at each chart's own construction time specifically so they
+        # pick up whatever is resolved here.
+        widgets.set_scale(widgets.resolve_ui_scale(self, self._ui_scale_override))
         try:
-            self.tk.call("tk", "scaling", self.tk.call("tk", "scaling") * UI_SCALE)
+            self.tk.call("tk", "scaling", self.tk.call("tk", "scaling") * widgets.UI_SCALE)
         except tk.TclError:
             pass
         self.title("roastnet")
@@ -913,7 +935,6 @@ class RoastnetApp(tk.Tk):
         except tk.TclError:
             pass
 
-        cfg = gui_config.load_config()
         # Must happen before any tab is built below -- every widget label is
         # baked in at construction time (see gui/i18n.py's module docstring
         # for why a language switch applies on next launch rather than
@@ -944,12 +965,60 @@ class RoastnetApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Resizing (Ctrl+scroll or Ctrl+plus/minus, Ctrl+0 to go back to
+        # auto-detect) restarts the whole app rather than re-laying-out live
+        # -- see _relaunch_with_scale's docstring for why. bind_all so it
+        # works no matter which tab/widget has focus. Both wheel
+        # conventions are bound since this app only ships for Linux/X11
+        # (Button-4/5), but a Wayland/XWayland Tk build may deliver
+        # MouseWheel instead depending on the compositor.
+        self.bind_all("<Control-MouseWheel>", self._on_scale_wheel)
+        self.bind_all("<Control-Button-4>", lambda _e: self._nudge_scale(widgets.SCALE_STEP))
+        self.bind_all("<Control-Button-5>", lambda _e: self._nudge_scale(-widgets.SCALE_STEP))
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self.bind_all(seq, lambda _e: self._nudge_scale(widgets.SCALE_STEP))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self.bind_all(seq, lambda _e: self._nudge_scale(-widgets.SCALE_STEP))
+        for seq in ("<Control-0>", "<Control-KP_0>"):
+            self.bind_all(seq, lambda _e: self._relaunch_with_scale(None))
+
+    def _on_scale_wheel(self, event: tk.Event) -> None:
+        self._nudge_scale(widgets.SCALE_STEP if event.delta > 0 else -widgets.SCALE_STEP)
+
+    def _nudge_scale(self, delta: float) -> None:
+        self._relaunch_with_scale(widgets.UI_SCALE + delta)
+
+    def _relaunch_with_scale(self, new_scale: float | None) -> None:
+        """Persist `new_scale` (None = go back to auto-detecting from this
+        screen's resolution) and restart the whole process so it takes
+        effect.
+
+        Not applied live: UI_SCALE/LINE_SCALE feed sp()/lw() calls scattered
+        across every tab (Field widths, Treeview column widths, wraplength,
+        gui/chart.py's hand-drawn margins/line widths), almost all baked
+        into widget configuration once at construction time -- there's no
+        single place to re-apply a new value to everything already built
+        short of re-running that construction from scratch. A full restart
+        does exactly that for free, correctly, using the same code path
+        every other launch already goes through -- no separate "live
+        rescale" logic to maintain and independently verify. The cost is a
+        brief blip (a couple hundred ms) and, if Network was serving, a
+        fresh ticket -- the same trade-off Stop-then-Start already asks of
+        a user changing Settings, just automatic here."""
+        if new_scale is not None:
+            new_scale = max(widgets.MIN_UI_SCALE, min(widgets.MAX_UI_SCALE, new_scale))
+        self._ui_scale_override = new_scale
+        self._save_config()
+        self._on_close()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     def _save_config(self) -> None:
         gui_config.save_config(gui_config.GuiConfig(
             db_path=self.db_path.get(), watch_dir=self.watch_dir.get(),
             wan_discovery_enabled=self.wan_discovery_enabled.get(),
             temp_unit=self.temp_unit.get(),
             language=self.language.get(),
+            ui_scale=self._ui_scale_override,
         ))
 
     def _on_close(self) -> None:
