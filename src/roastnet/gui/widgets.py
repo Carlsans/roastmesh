@@ -8,10 +8,13 @@ in roastlab's GUI produces tabular output, so it had no equivalent.
 """
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from collections.abc import Callable
-from pathlib import Path
 from tkinter import ttk
+
+from roastnet.gui import units
+from roastnet.gui.i18n import t, tn
 
 # Palette. Deliberately muted -- this is a tool for reading search results,
 # not a dashboard to be impressed by.
@@ -29,6 +32,59 @@ FONT_H2 = ("TkDefaultFont", 11, "bold")
 FONT_MONO = ("TkFixedFont", 9)
 
 
+def _env_scale(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Every font in this app is specified in points, so raising Tk's global
+# scaling factor (RoastnetApp does this once, at startup) already makes
+# every point-sized font -- widget labels AND Canvas text alike -- bigger
+# together; confirmed empirically, not assumed: a 10pt TkDefaultFont's
+# rendered line height went from 19px to 55px after a 3x scaling bump on a
+# real 4K display here, where X reported a bogus ~96 DPI (its physical
+# screen size was wrong, a common Linux/X quirk this project hit directly --
+# so auto-computing a "correct" scale from reported DPI isn't reliable
+# enough to trust). What that scaling call does NOT touch is anything
+# specified in raw pixels -- window geometry, wraplength, Treeview column
+# widths, and (in gui/chart.py) hand-drawn Canvas margins/line
+# widths/tick sizes. UI_SCALE is applied to all of those explicitly via
+# `sp()` below so the whole app stays proportional once fonts grow.
+# LINE_SCALE is separate and smaller by convention (confirmed against a
+# real 4K display: 3x-thicker strokes at 3x-bigger text looked
+# disproportionately heavy) -- both are env-overridable for a different
+# display without editing code.
+UI_SCALE = _env_scale("ROASTNET_UI_SCALE", 3.0)
+LINE_SCALE = _env_scale("ROASTNET_LINE_SCALE", 2.0)
+
+
+def sp(px: float) -> int:
+    """Scale a raw pixel measurement (window geometry, wraplength, column
+    width) by UI_SCALE. Never used for font point sizes -- those scale
+    globally via `tk scaling` instead, see UI_SCALE's docstring above."""
+    return max(1, round(px * UI_SCALE))
+
+
+def lw(px: float) -> int:
+    """Scale a stroke/line width by LINE_SCALE (grows slower than
+    UI_SCALE -- see UI_SCALE's docstring)."""
+    return max(1, round(px * LINE_SCALE))
+
+
+def screen_geometry(widget: tk.Widget, width_px: int, height_px: int) -> str:
+    """A `sp()`-scaled "WxH" geometry string, capped to 90% of the actual
+    screen so a large UI_SCALE (a window whose *unscaled* size was already
+    most of a normal screen) can't request something taller or wider than
+    the display itself -- still resizable afterward either way, this is
+    only the initial size hint."""
+    max_w = int(widget.winfo_screenwidth() * 0.9)
+    max_h = int(widget.winfo_screenheight() * 0.9)
+    return f"{min(sp(width_px), max_w)}x{min(sp(height_px), max_h)}"
+
+
 def heading(parent: tk.Widget, text: str, sub: str = "") -> ttk.Frame:
     """A tab's title and one-line purpose."""
     frame = ttk.Frame(parent)
@@ -36,14 +92,14 @@ def heading(parent: tk.Widget, text: str, sub: str = "") -> ttk.Frame:
     tk.Label(frame, text=text, font=FONT_H1, fg=ACCENT, bg=BG, anchor="w").pack(fill="x")
     if sub:
         tk.Label(frame, text=sub, font=FONT, fg=MUTED, bg=BG, anchor="w",
-                 wraplength=900, justify="left").pack(fill="x", pady=(2, 0))
+                 wraplength=sp(900), justify="left").pack(fill="x", pady=(2, 0))
     return frame
 
 
 def explain(parent: tk.Widget, text: str) -> tk.Label:
     """A block of plain-language explanation of what a screen is for."""
     lbl = tk.Label(parent, text=text.strip(), font=FONT, fg=FG, bg=BG,
-                   wraplength=900, justify="left", anchor="w")
+                   wraplength=sp(900), justify="left", anchor="w")
     lbl.pack(fill="x", padx=14, pady=(6, 4))
     return lbl
 
@@ -85,8 +141,8 @@ class Field(ttk.Frame):
         self.entry.pack(side="left", fill="x", expand=True)
         if help_text:
             tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=MUTED,
-                     bg=BG, wraplength=840, justify="left", anchor="w").pack(
-                fill="x", padx=(224, 0), pady=(1, 0))
+                     bg=BG, wraplength=sp(840), justify="left", anchor="w").pack(
+                fill="x", padx=(sp(224), 0), pady=(1, 0))
 
     def get(self) -> str:
         return self.var.get().strip()
@@ -111,8 +167,8 @@ class Choice(ttk.Frame):
                      state="readonly").pack(side="left")
         if help_text:
             tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=MUTED,
-                     bg=BG, wraplength=840, justify="left", anchor="w").pack(
-                fill="x", padx=(224, 0), pady=(1, 0))
+                     bg=BG, wraplength=sp(840), justify="left", anchor="w").pack(
+                fill="x", padx=(sp(224), 0), pady=(1, 0))
 
     def get(self) -> str:
         return self.var.get().strip()
@@ -131,7 +187,7 @@ class Console(ttk.Frame):
 
         self.cmd_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.cmd_var, font=("TkFixedFont", 8),
-                 fg=MUTED, bg=BG, anchor="w", wraplength=900,
+                 fg=MUTED, bg=BG, anchor="w", wraplength=sp(900),
                  justify="left").pack(fill="x", pady=(0, 3))
 
         wrap = ttk.Frame(self)
@@ -179,10 +235,10 @@ class RunBar(ttk.Frame):
         self.pack(fill="x", padx=14, pady=(8, 2))
         self.run_btn = ttk.Button(self, text=run_label, command=on_run)
         self.run_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(self, text="Cancel", command=on_cancel,
+        self.cancel_btn = ttk.Button(self, text=t("Cancel"), command=on_cancel,
                                      state="disabled")
         self.cancel_btn.pack(side="left", padx=(8, 0))
-        self.status = tk.StringVar(value="ready")
+        self.status = tk.StringVar(value=t("ready"))
         tk.Label(self, textvariable=self.status, font=FONT, fg=MUTED, bg=BG,
                  anchor="w").pack(side="left", padx=(14, 0))
 
@@ -218,14 +274,16 @@ def scrollable(parent: tk.Widget) -> ttk.Frame:
     return inner
 
 
-# title, filename, machine_key, roast_type, dtr_pct, drop_bt_c, beans_text
+# title, roast_date, machine_key, roast_type, dtr_pct, drop_bt_c, beans_text
 # -- no roast_id column; it's still the Treeview's iid under the hood
 # (double-click handlers read it back via identify_row/selection), just
-# not shown, since it's meaningless to look at and the title/filename
-# below are what actually identify a roast to a person.
+# not shown, since it's meaningless to look at and title/roast_date/beans
+# below are what actually identify a roast to a person. drop_bt_c's label
+# is placeholder text -- ResultsTable._column_label rewrites it to match
+# the selected temperature unit whenever set_rows() runs.
 _COLUMNS = [
     ("title", "Title", 160),
-    ("filename", "Filename", 150),
+    ("roast_date", "Roast date", 100),
     ("machine_key", "Machine", 110),
     ("roast_type", "Roast type", 90),
     ("dtr_pct", "DTR %", 60),
@@ -246,15 +304,17 @@ class ResultsTable(ttk.Frame):
         self.pack(fill="both", expand=True, padx=14, pady=(4, 12))
         self._sort_column: str | None = None
         self._sort_reverse = False
+        self._unit = units.CELSIUS
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(
             wrap, columns=[c[0] for c in _COLUMNS], show="headings", height=height,
         )
-        for key, label, width in _COLUMNS:
-            self.tree.heading(key, text=label, command=lambda k=key: self._on_heading_click(k))
-            self.tree.column(key, width=width, anchor="w")
+        for key, _label, width in _COLUMNS:
+            self.tree.heading(key, command=lambda k=key: self._on_heading_click(k))
+            self.tree.column(key, width=sp(width), anchor="w")
+        self._refresh_headers()
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         # A horizontal scrollbar too: the columns above add up to wider
         # than the window at its default size, and unlike a plain label,
@@ -269,23 +329,35 @@ class ResultsTable(ttk.Frame):
         tk.Label(self, textvariable=self.count_var, font=FONT, fg=MUTED, bg=BG,
                  anchor="w").pack(fill="x", pady=(4, 0))
 
-    def set_rows(self, rows: list[dict]) -> None:
+    def set_rows(self, rows: list[dict], unit: str = units.CELSIUS) -> None:
+        self._unit = unit
         self.tree.delete(*self.tree.get_children())
         for row in rows:
             beans = (row.get("beans_text") or "").splitlines()[0][:80] if row.get("beans_text") else ""
             title = row.get("title") or ""
             if row.get("hidden"):
-                title = f"{title} (hidden)" if title else "(hidden)"
-            filename = Path(row["raw_path"]).name if row.get("raw_path") else ""
+                title = t("{title} (hidden)", title=title) if title else t("(hidden)")
+            drop_c = units.convert_temp(row.get("drop_bt_c"), unit)
             dtr = f"{row['dtr_pct']:.1f}" if row.get("dtr_pct") is not None else ""
-            drop = f"{row['drop_bt_c']:.0f}" if row.get("drop_bt_c") is not None else ""
+            drop = f"{drop_c:.0f}" if drop_c is not None else ""
             self.tree.insert("", "end", iid=row.get("roast_id"), values=(
-                title, filename, row.get("machine_key") or "",
+                title, row.get("roast_date") or "", row.get("machine_key") or "",
                 row.get("roast_type") or "", dtr, drop, beans,
             ))
-        self.count_var.set(f"{len(rows)} result{'s' if len(rows) != 1 else ''}")
+        self.count_var.set(tn(len(rows), "{n} result", "{n} results"))
+        self._refresh_headers()
         if self._sort_column is not None:
             self._apply_sort()  # keep whatever sort was active before this search ran
+
+    def _column_label(self, key: str, label: str) -> str:
+        return f"{t('Drop')} °{self._unit}" if key == "drop_bt_c" else t(label)
+
+    def _refresh_headers(self) -> None:
+        for key, label, _width in _COLUMNS:
+            text = self._column_label(key, label)
+            if key == self._sort_column:
+                text += " ▼" if self._sort_reverse else " ▲"
+            self.tree.heading(key, text=text)
 
     def _on_heading_click(self, column: str) -> None:
         if self._sort_column == column:
@@ -314,9 +386,7 @@ class ResultsTable(ttk.Frame):
         items.sort(key=lambda pair: self._sort_key(pair[0]), reverse=self._sort_reverse)
         for index, (_value, iid) in enumerate(items):
             self.tree.move(iid, "", index)
-        for key, label, _width in _COLUMNS:
-            arrow = "" if key != column else (" ▼" if self._sort_reverse else " ▲")
-            self.tree.heading(key, text=label + arrow)
+        self._refresh_headers()
 
     def set_error(self, message: str) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -343,8 +413,8 @@ class PeerTable(ttk.Frame):
             wrap, columns=[c[0] for c in _PEER_COLUMNS], show="headings", height=height,
         )
         for key, label, width in _PEER_COLUMNS:
-            self.tree.heading(key, text=label)
-            self.tree.column(key, width=width, anchor="w")
+            self.tree.heading(key, text=t(label))
+            self.tree.column(key, width=sp(width), anchor="w")
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ybar.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -354,5 +424,5 @@ class PeerTable(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         for row in rows:
             self.tree.insert("", "end", values=(
-                row.get("feed_pubkey_hex") or "?", row.get("last_seen") or "", row.get("added_via") or "",
+                row.get("feed_pubkey_hex") or t("?"), row.get("last_seen") or "", row.get("added_via") or "",
             ))

@@ -40,13 +40,17 @@ from PyInstaller.utils.hooks import collect_all
 
 iroh_datas, iroh_binaries, iroh_hiddenimports = collect_all("iroh")
 
-# schema.sql is read at runtime via importlib.resources (index/db.py's
-# migrate()) rather than imported, so -- same story as iroh above --
-# PyInstaller's static analysis has no way to know it's needed. It's listed
-# in pyproject.toml's [tool.setuptools.package-data], but that's a
-# setuptools/wheel concept PyInstaller doesn't read. Must be added explicitly.
+# schema.sql and the gui/locales/*.json translation catalogs are both read
+# at runtime via importlib.resources (index/db.py's migrate(), gui/i18n.py's
+# _load_catalog()) rather than imported, so -- same story as iroh above --
+# PyInstaller's static analysis has no way to know either is needed. Both
+# are listed in pyproject.toml's [tool.setuptools.package-data], but that's
+# a setuptools/wheel concept PyInstaller doesn't read. Must be added
+# explicitly, or translations work from source and silently fall back to
+# English in the packaged binary -- the artifact most users actually run.
 package_datas = [
     (str(SRC / "roastnet" / "index" / "schema.sql"), "roastnet/index"),
+    (str(SRC / "roastnet" / "gui" / "locales"), "roastnet/gui/locales"),
     *iroh_datas,
 ]
 

@@ -35,6 +35,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from roastnet.gui.i18n import t
+
 
 @dataclass
 class Task:
@@ -69,11 +71,11 @@ class Task:
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
-            self.output.put(("error", f"could not start: {exc}"))
+            self.output.put(("error", t("could not start: {error}", error=exc)))
             self.output.put(("done", "1"))
             return
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user, never swallowed
-            self.output.put(("error", f"could not start: {exc!r}"))
+            self.output.put(("error", t("could not start: {error}", error=repr(exc))))
             self.output.put(("done", "1"))
             return
 
@@ -89,9 +91,9 @@ class Task:
                 self.output.put(("line", line.rstrip("\n")))
             code = self._proc.wait()
             if self._cancelled:
-                self.output.put(("line", "-- cancelled --"))
+                self.output.put(("line", t("-- cancelled --")))
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user, never swallowed
-            self.output.put(("error", f"failed while reading output: {exc!r}"))
+            self.output.put(("error", t("failed while reading output: {error}", error=repr(exc))))
             code = 1
         self.output.put(("done", str(code)))
 
@@ -154,7 +156,7 @@ def stream_into(
                 if kind == "done":
                     finished = int(payload)
                 elif kind == "error":
-                    drained.append(f"ERROR: {payload}")
+                    drained.append(t("ERROR: {message}", message=payload))
                 else:
                     drained.append(payload)
         except queue.Empty:

@@ -229,10 +229,14 @@ async def _watch_publish_loop(
     except OSError as exc:
         print(f"watch: could not create {watch_dir}: {exc!r}", flush=True)
         return
+    # Persists across every tick of this loop for as long as `serve` runs --
+    # see publish_new_files' skip_cache docstring for why this matters.
+    skip_cache: dict[Path, tuple[float, int]] = {}
     while True:
         try:
             published = await asyncio.to_thread(
                 publish_new_files, feed_dir, identity, watch_dir, db_path=db_path,
+                skip_cache=skip_cache,
             )
             for entry in published:
                 print(f"watch: published entry {entry.seq} ({entry.content_sha256[:12]}...) "

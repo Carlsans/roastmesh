@@ -26,7 +26,19 @@ from roastnet.hello import decode_hello, encode_hello
 
 BEACON_PORT = 41888
 BEACON_INTERVAL_S = 5.0
-RESYNC_INTERVAL_S = 60.0  # minimum time between auto-syncs with the same discovered peer
+# Minimum time between auto-syncs with the same discovered peer. A real bug
+# found by benchmarking this against an actually-live LAN peer (not just
+# two processes on one host, which -- confirmed separately -- sync in
+# ~30ms and completely hid this): the sync itself took ~9 seconds of
+# mostly-CPU-bound work (Iroh's own connection-establishment cost, not
+# roastnet's), not the near-zero cost assumed when this was first set to
+# 60s. At 60s, one always-on peer on the LAN means roughly 9/60 = 15% of a
+# core, continuously, forever -- with two (also observed live), more like
+# 30% -- easily enough to keep a laptop's fan cycling even while nobody's
+# touching the app. 900s (15 minutes) cuts that to about 1% while a LAN
+# peer still shows up automatically well within a coffee break, and a user
+# who wants it sooner can always hit "Sync" manually.
+RESYNC_INTERVAL_S = 900.0
 
 
 class _BeaconProtocol(asyncio.DatagramProtocol):

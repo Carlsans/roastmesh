@@ -11,6 +11,7 @@ from roastnet.models import (
     Milestone,
     RoastRecord,
     density_to_g_per_l,
+    plausible_temp_c,
     temp_to_celsius,
     weight_to_grams,
 )
@@ -60,15 +61,21 @@ def to_roast_record(
     # mixes units.
     mode = raw.get("mode")
     timex_s = list(raw.get("timex") or [])
-    et_c = [temp_to_celsius(v, mode) for v in (raw.get("temp1") or [])]
-    bt_c = [temp_to_celsius(v, mode) for v in (raw.get("temp2") or [])]
+    # plausible_temp_c rejects sensor-glitch sentinels (a real bug hit in
+    # practice: a Kaleido BT reading of 65535, the unsigned-16-bit "no
+    # reading" value, sitting as a single spurious sample in an otherwise
+    # normal descending curve) -- left in, it would also have corrupted
+    # roast_type below, which is classified from this curve's peak.
+    et_c = [plausible_temp_c(temp_to_celsius(v, mode)) for v in (raw.get("temp1") or [])]
+    bt_c = [plausible_temp_c(temp_to_celsius(v, mode)) for v in (raw.get("temp2") or [])]
     if not timex_s:
         warnings.append("no timex array present")
 
     raw_milestones = extract_milestones(raw, warnings)
     milestones = [
         Milestone(name=m.name, time_s=m.time_s,
-                  bt_c=temp_to_celsius(m.bt_c, mode), et_c=temp_to_celsius(m.et_c, mode))
+                  bt_c=plausible_temp_c(temp_to_celsius(m.bt_c, mode)),
+                  et_c=plausible_temp_c(temp_to_celsius(m.et_c, mode)))
         for m in raw_milestones
     ]
     phase_profile = compute_phase_profile(milestones)
@@ -89,7 +96,8 @@ def to_roast_record(
     # sense of (a roast peaking at 196C -- unambiguously "light" on any
     # standard chart -- showing "full city+" because of a note, with no
     # way to tell that from a real bug). See roast_level.py's docstring.
-    roast_type = classify_roast_level(max(bt_c) if bt_c else None)
+    real_bt_values = [v for v in bt_c if v is not None]
+    roast_type = classify_roast_level(max(real_bt_values) if real_bt_values else None)
 
     return RoastRecord(
         roast_id=RoastRecord.new_roast_id(),

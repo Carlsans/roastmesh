@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (opt-in) over the whole internet via the public BitTorrent DHT, no
 tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 212 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 261 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -28,6 +28,19 @@ Downloads the prebuilt binaries from the [latest release](https://github.com/Car
 installs them to `~/.local/bin` (no sudo, no system packages touched), and adds a roastnet entry
 to your applications menu so it's a normal double-clickable app afterward. Safe to re-run any
 time — re-running just upgrades in place.
+
+The interface is available in English and French, and defaults to whatever language your system
+is already set to. To pick one explicitly instead — handy for sharing an install link that opens
+straight into a given language — pass `--lang` after `--` (needed because the script is read from
+stdin, not run as a file):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | bash -s -- --lang fr
+```
+
+Only takes effect on a first install (it seeds `~/.local/share/roastnet/gui_config.json`); on an
+existing install, change the language from the app's Settings tab instead. Switch it there at any
+time, regardless of how you installed — it applies the next time you open roastnet.
 
 These binaries are built inside an Ubuntu 22.04 container specifically for portability (glibc is
 forward-compatible only, so building on an old base is what makes the same binary work on newer

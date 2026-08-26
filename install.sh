@@ -4,6 +4,14 @@
 # Run it with:
 #   curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | bash
 #
+# To also pick an interface language up front (instead of relying on your
+# OS locale, or picking one later in Settings), pass --lang. Because this
+# script arrives over a pipe (`curl | bash`), the script itself occupies
+# bash's stdin -- there's no plain argv slot, so arguments need `-s --`:
+#   curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | bash -s -- --lang fr
+# An env var works too, and needs no `-s --`:
+#   curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | ROASTNET_LANG=fr bash
+#
 # Downloads the prebuilt roastnet/roastnet-gui binaries from the latest
 # GitHub release, installs them to ~/.local/bin (no sudo, no system
 # packages touched), and adds a roastnet entry to your applications menu
@@ -15,6 +23,29 @@ REPO="Carlsans/roastnet"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+CONFIG_FILE="$HOME/.local/share/roastnet/gui_config.json"
+
+# Keep this in sync with roastnet.gui.i18n.LANGUAGES.
+SUPPORTED_LANGS="en fr"
+
+LANG_CHOICE="${ROASTNET_LANG:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --lang)   LANG_CHOICE="${2:-}"; shift 2 ;;
+        --lang=*) LANG_CHOICE="${1#*=}"; shift ;;
+        *)        shift ;;
+    esac
+done
+
+if [ -n "$LANG_CHOICE" ]; then
+    case " $SUPPORTED_LANGS " in
+        *" $LANG_CHOICE "*) ;;
+        *)
+            echo "Unknown language '$LANG_CHOICE' -- supported: $SUPPORTED_LANGS" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 echo "roastnet installer"
 echo
@@ -76,6 +107,23 @@ chmod +x "$APPS_DIR/roastnet.desktop"
 # best-effort refresh so the icon/menu entry shows up immediately in
 # desktop environments that cache this -- harmless if the tool isn't present
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+
+# Only seed a language when there's no config yet -- this script promises
+# re-running upgrades in place, and gui_config.json also holds the user's
+# chosen database path and watch folder, which a blind overwrite here would
+# reset. A config with only "language" set loads fine either way: roastnet
+# defaults every other field independently. Already have a config and asked
+# for a language anyway? Leave it alone and say so, rather than guess.
+if [ -n "$LANG_CHOICE" ]; then
+    if [ ! -e "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        printf '{\n  "language": "%s"\n}\n' "$LANG_CHOICE" > "$CONFIG_FILE"
+    else
+        echo
+        echo "Note: you already have a roastnet configuration, so --lang was not applied."
+        echo "Change the language in the app's Settings tab instead."
+    fi
+fi
 
 echo
 echo "Installed. roastnet should now appear in your applications menu."

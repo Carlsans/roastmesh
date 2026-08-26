@@ -119,7 +119,7 @@ print("OK")
     assert f"ROWS {len(results)}" in r.stdout, r.stdout
 
 
-def test_search_tab_columns_show_title_and_filename_not_id(tmp_path: Path) -> None:
+def test_search_tab_columns_show_title_and_roast_date_not_id(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     db_path = tmp_path / "gui.sqlite3"
@@ -150,9 +150,10 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "'roast_id'" not in r.stdout
     columns_line = [line for line in r.stdout.splitlines() if line.startswith("COLUMNS")][0]
-    assert "title" in columns_line and "filename" in columns_line
+    assert "title" in columns_line and "roast_date" in columns_line
+    assert "filename" not in columns_line
     values_line = [line for line in r.stdout.splitlines() if line.startswith("VALUES")][0]
-    assert "kaleido_1.alog" in values_line  # the real filename, not a content hash or an id
+    assert "2024-05-02" in values_line  # kaleido_1.alog's roastisodate
 
 
 def test_search_tab_results_sort_by_clicking_a_column_header(tmp_path: Path) -> None:
@@ -638,3 +639,56 @@ print("OK")
     assert "COUNT_AFTER_HIDE 0 result" in r.stdout, r.stdout
     assert "COUNT_WITH_SHOW_HIDDEN 1 result" in r.stdout, r.stdout
     assert "COUNT_AFTER_UNHIDE 1 result" in r.stdout, r.stdout
+
+
+def test_configured_language_applies_before_any_tab_is_built(tmp_path: Path) -> None:
+    """The language must be resolved from config and set (gui/i18n.py)
+    before RoastnetApp builds its notebook -- every tab label is baked in
+    at construction time, so setting the language any later would leave
+    the first-opened window in English regardless of Settings."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_dir = home / ".local" / "share" / "roastnet"
+    config_dir.mkdir(parents=True)
+    (config_dir / "gui_config.json").write_text('{"language": "fr"}')
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+from roastnet.gui import i18n
+app = RoastnetApp()
+app.update()
+nb = [c for c in app.winfo_children() if c.winfo_class() == "TNotebook"][0]
+print("CURRENT_LANGUAGE", i18n.current_language())
+print("TAB0_TEXT", nb.tab(0, "text"))
+print("RUN_BUTTON_TEXT", app.tabs[0].runbar.run_btn.cget("text"))
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "CURRENT_LANGUAGE fr" in r.stdout, r.stdout
+    assert "TAB0_TEXT Rechercher" in r.stdout, r.stdout
+    assert "RUN_BUTTON_TEXT Rechercher" in r.stdout, r.stdout
+
+
+def test_unconfigured_language_defaults_to_english(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+from roastnet.gui import i18n
+app = RoastnetApp()
+app.update()
+nb = [c for c in app.winfo_children() if c.winfo_class() == "TNotebook"][0]
+print("CURRENT_LANGUAGE", i18n.current_language())
+print("TAB0_TEXT", nb.tab(0, "text"))
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "CURRENT_LANGUAGE en" in r.stdout, r.stdout
+    assert "TAB0_TEXT Search" in r.stdout, r.stdout

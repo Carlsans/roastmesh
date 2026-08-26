@@ -39,3 +39,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "roastnet.index" = ["schema.sql"]
+"roastnet.gui" = ["locales/*.json"]

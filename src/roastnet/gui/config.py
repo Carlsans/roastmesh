@@ -13,6 +13,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from roastnet.gui.i18n import DEFAULT_LANGUAGE, LANGUAGES
 from roastnet.index.db import default_db_path
 from roastnet.watch_folder import default_watch_dir
 
@@ -26,6 +27,8 @@ class GuiConfig:
     db_path: str
     watch_dir: str
     wan_discovery_enabled: bool = False
+    temp_unit: str = "C"  # "C" or "F" -- see gui/units.py; display-only, never affects stored data
+    language: str = DEFAULT_LANGUAGE  # see gui/i18n.py; a stale/unknown value falls back, never crashes
 
 
 def default_config() -> GuiConfig:
@@ -33,6 +36,8 @@ def default_config() -> GuiConfig:
         db_path=str(default_db_path()),
         watch_dir=str(default_watch_dir()),
         wan_discovery_enabled=False,
+        temp_unit="C",
+        language=DEFAULT_LANGUAGE,
     )
 
 
@@ -49,6 +54,8 @@ def load_config() -> GuiConfig:
         db_path=data.get("db_path") or defaults.db_path,
         watch_dir=data.get("watch_dir") or defaults.watch_dir,
         wan_discovery_enabled=bool(data.get("wan_discovery_enabled", False)),
+        temp_unit=data.get("temp_unit") if data.get("temp_unit") in ("C", "F") else defaults.temp_unit,
+        language=data.get("language") if data.get("language") in LANGUAGES else defaults.language,
     )
 
 

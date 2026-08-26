@@ -22,13 +22,20 @@ import signal
 import subprocess
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+from roastnet.alog.curves import format_mmss
 from roastnet.gui import config as gui_config
+from roastnet.gui import i18n
 from roastnet.gui import single_instance
+from roastnet.gui import units
+from roastnet.gui.chart import RoastChart
+from roastnet.gui.i18n import t, tn
 from roastnet.gui.runner import Task, describe, roastnet_argv, stream_into
+from roastnet.models import weight_loss_pct
 from roastnet.gui.widgets import (
     BG,
     FG,
@@ -36,6 +43,7 @@ from roastnet.gui.widgets import (
     FONT_H2,
     FONT_MONO,
     MUTED,
+    UI_SCALE,
     Choice,
     Console,
     Field,
@@ -44,7 +52,10 @@ from roastnet.gui.widgets import (
     RunBar,
     explain,
     heading,
+    screen_geometry,
+    scrollable,
     section,
+    sp,
 )
 
 
@@ -88,7 +99,7 @@ def _run_opener(cmd: list[str]) -> str | None:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  env=_external_subprocess_env())
     except OSError as exc:
-        return f"could not run {cmd[0]}: {exc}"
+        return t("could not run {command}: {error}", command=cmd[0], error=exc)
     try:
         # Most openers (xdg-open, a real Artisan launch) either hand off
         # to a long-running app (still running after this) or return with
@@ -104,7 +115,7 @@ def _run_opener(cmd: list[str]) -> str | None:
         return None
     if proc.returncode != 0:
         output = (proc.stdout.read() if proc.stdout else "").strip()
-        return output or f"{cmd[0]} exited with code {proc.returncode}"
+        return output or t("{command} exited with code {code}", command=cmd[0], code=proc.returncode)
     return None
 
 
@@ -116,7 +127,7 @@ def _open_with_default_app(path: str) -> str | None:
             os.startfile(path)  # type: ignore[attr-defined]
             return None
         except OSError as exc:
-            return f"could not open: {exc}"
+            return t("could not open: {error}", error=exc)
     if sys.platform == "darwin":
         return _run_opener(["open", path])
     return _run_opener(["xdg-open", path])
@@ -248,6 +259,13 @@ def _copy_to_clipboard(widget: tk.Widget, text: str) -> None:
     widget.clipboard_append(text)
 
 
+def _exited_with_code(code: int) -> str:
+    """Shared wording for a subprocess that finished with a nonzero exit
+    code -- consolidated from four near-identical f-strings so there's one
+    catalog entry to translate instead of four."""
+    return t("exited with code {code}", code=code)
+
+
 class Tab(ttk.Frame):
     """Base tab: owns one background task, for cancellation on close."""
 
@@ -267,43 +285,48 @@ class SearchTab(Tab):
 
     def __init__(self, parent: tk.Widget, app: "RoastnetApp") -> None:
         super().__init__(parent, app)
-        heading(self, "Search", "Find roast profiles in your local index.")
-        explain(self, "Text (optional) is matched against bean/process notes and roast type. "
-                       "The filters below narrow further -- leave any blank to not filter on it. "
-                       "\"LAN only\" is on by default, so a stranger found through internet-wide "
-                       "discovery doesn't show up in results just for being nearby on the network.")
+        heading(self, t("Search"), t("Find roast profiles in your local index."))
+        explain(self, t("Text (optional) is matched against bean/process notes and roast type. "
+                         "The filters below narrow further -- leave any blank to not filter on it. "
+                         "\"LAN only\" is on by default, so a stranger found through internet-wide "
+                         "discovery doesn't show up in results just for being nearby on the network."))
 
-        self.query = Field(self, "Text", help_text="Free-text search, e.g. 'washed ethiopian'.")
-        self.machine = Field(self, "Machine", help_text="Exact machine_key, e.g. kaleido_m2.")
-        self.roast_type = Field(self, "Roast type", help_text="e.g. 'full city', 'vienna'.")
-        self.dtr_min = Field(self, "DTR min %", width=8)
-        self.dtr_max = Field(self, "DTR max %", width=8)
-        self.drop_after = Field(self, "Drop after (°C)", width=8)
-        self.second_crack = Choice(self, "After second crack?", ["any", "yes", "no"], default="any")
+        self.query = Field(self, t("Text"), help_text=t("Free-text search, e.g. 'washed ethiopian'."))
+        self.machine = Field(self, t("Machine"), help_text=t("Exact machine_key, e.g. kaleido_m2."))
+        self.roast_type = Field(self, t("Roast type"), help_text=t("e.g. 'full city', 'vienna'."))
+        self.dtr_min = Field(self, t("DTR min %"), width=8)
+        self.dtr_max = Field(self, t("DTR max %"), width=8)
+        self.drop_after = Field(self, t("Drop after (°C)"), width=8)
+        # Options are logic values compared in _build_args below, not
+        # display text -- Choice has no separate display/value split, so
+        # the dropdown itself stays in English ("any"/"yes"/"no") while the
+        # label above it is translated. A user typing a search filter
+        # dropdown is a smaller translation gap than breaking the filter.
+        self.second_crack = Choice(self, t("After second crack?"), ["any", "yes", "no"], default="any")
 
         self.lan_only = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            self, text="LAN only (hide results from internet-wide or manually-added peers)",
+            self, text=t("LAN only (hide results from internet-wide or manually-added peers)"),
             variable=self.lan_only,
         ).pack(anchor="w", padx=10, pady=(6, 2))
 
         self.own_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            self, text="Only my own roasts (hide everything synced from any peer)",
+            self, text=t("Only my own roasts (hide everything synced from any peer)"),
             variable=self.own_only,
         ).pack(anchor="w", padx=10, pady=(0, 2))
 
         self.show_hidden = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            self, text="Show hidden roasts too",
+            self, text=t("Show hidden roasts too"),
             variable=self.show_hidden,
         ).pack(anchor="w", padx=10, pady=(0, 2))
 
         self._output: list[str] = []
-        self.runbar = RunBar(self, "Search", self._on_run, self.cancel)
+        self.runbar = RunBar(self, t("Search"), self._on_run, self.cancel)
         self.table = ResultsTable(self)
         self.table.tree.bind("<Double-1>", self._on_open_row)
-        explain(self, "Double-click a result to see its full detail and open the original .alog file.")
+        explain(self, t("Double-click a result to see its full detail and open the original .alog file."))
 
     def _build_args(self) -> list[str]:
         args = ["search"]
@@ -339,24 +362,24 @@ class SearchTab(Tab):
             return
         argv = roastnet_argv("--db", self.app.db_path.get(), *self._build_args())
         self._output = []
-        self.table.set_error("running...")
-        self.runbar.set_running(True, "running...")
+        self.table.set_error(t("running..."))
+        self.runbar.set_running(True, t("running..."))
         self.task = Task(argv=argv)
         self.task.start()
         stream_into(self.task, self._output.append, self._on_finished, lambda ms, fn: self.after(ms, fn))
 
     def _on_finished(self, code: int) -> None:
-        self.runbar.set_running(False, "done" if code == 0 else f"exited with code {code}")
+        self.runbar.set_running(False, t("done") if code == 0 else _exited_with_code(code))
         text = "".join(self._output)
         if code != 0:
-            self.table.set_error(text.strip() or f"exited with code {code}")
+            self.table.set_error(text.strip() or _exited_with_code(code))
             return
         try:
             rows = json.loads(text)
         except json.JSONDecodeError:
-            self.table.set_error("could not parse results")
+            self.table.set_error(t("could not parse results"))
             return
-        self.table.set_rows(rows)
+        self.table.set_rows(rows, unit=self.app.temp_unit.get())
 
     def _on_open_row(self, event: tk.Event) -> None:
         roast_id = self.table.tree.identify_row(event.y)
@@ -403,11 +426,15 @@ class RoastDetailWindow(tk.Toplevel):
         self.hidden = hidden
         self.on_change = on_change
         self.configure(bg=BG)
+        self.geometry(screen_geometry(self, 1040, 820))
         beans_lines = (record.get("beans_text") or "").splitlines()
-        title = record.get("title") or (beans_lines[0] if beans_lines else "Roast detail")
+        title = record.get("title") or (beans_lines[0] if beans_lines else t("Roast detail"))
         self.title(title)
 
+        unit = app.temp_unit.get()
+
         heading(self, title)
+        RoastChart(self, record, unit=unit)
 
         info = ttk.Frame(self)
         info.pack(fill="x", padx=14, pady=(0, 6))
@@ -417,56 +444,71 @@ class RoastDetailWindow(tk.Toplevel):
             r.pack(fill="x", pady=1)
             tk.Label(r, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=18,
                      anchor="w").pack(side="left")
-            tk.Label(r, text=str(value) if value not in (None, "") else "?", font=FONT_MONO,
-                     bg=BG, fg=MUTED, anchor="w", wraplength=600, justify="left").pack(side="left")
+            tk.Label(r, text=str(value) if value not in (None, "") else t("?"), font=FONT_MONO,
+                     bg=BG, fg=MUTED, anchor="w", wraplength=sp(600), justify="left").pack(side="left")
 
-        row("Machine", f"{record.get('machine_key')} ({record.get('roaster_type_raw')})")
+        row(t("Machine"), f"{record.get('machine_key')} ({record.get('roaster_type_raw')})")
         roast_type_value = (
-            f"{record['roast_type']} (estimated from peak temperature -- "
-            "may not hold for every machine's probe)"
+            t("{roast_type} (estimated from peak temperature -- may not hold for every machine's probe)",
+              roast_type=record["roast_type"])
         ) if record.get("roast_type") else None
-        row("Roast type", roast_type_value)
-        row("Batch in / out", f"{record.get('batch_weight_in_g')}g / {record.get('batch_weight_out_g')}g")
-        row("Roast date", record.get("roast_date"))
+        row(t("Roast type"), roast_type_value)
+
+        batch_in = record.get("batch_weight_in_g")
+        batch_out = record.get("batch_weight_out_g")
+        batch_text = t("{in_g}g / {out_g}g", in_g=batch_in, out_g=batch_out)
+        loss_pct = weight_loss_pct(batch_in, batch_out)
+        if loss_pct is not None:
+            batch_text += "   " + t("Weight loss: {pct:.1f}%", pct=loss_pct)
+        row(t("Batch in / out"), batch_text)
+        row(t("Roast date"), record.get("roast_date"))
 
         milestones = record.get("milestones") or []
         if milestones:
-            tk.Label(self, text="Milestones", font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
+            tk.Label(self, text=t("Milestones"), font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
                 fill="x", padx=14, pady=(10, 2))
             for m in milestones:
-                row(m.get("name") or "?", f"t={m.get('time_s')}  BT={m.get('bt_c')}  ET={m.get('et_c')}")
+                time_text = format_mmss(m["time_s"]) if m.get("time_s") is not None else t("?")
+                bt = units.convert_temp(m.get("bt_c"), unit)
+                et = units.convert_temp(m.get("et_c"), unit)
+                bt_text = f"{bt:.1f}°{unit}" if bt is not None else t("?")
+                et_text = f"{et:.1f}°{unit}" if et is not None else t("?")
+                # BT/ET are universal roasting notation, left untranslated
+                # (same reasoning as gui/chart.py's legend).
+                row(m.get("name") or t("?"), t("t={time}  BT={bt}  ET={et}", time=time_text, bt=bt_text, et=et_text))
 
         notes = record.get("roasting_notes") or record.get("cupping_notes")
         if notes:
-            tk.Label(self, text="Notes", font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
+            tk.Label(self, text=t("Notes"), font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
                 fill="x", padx=14, pady=(10, 2))
             explain(self, notes)
 
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=14, pady=(12, 2))
         if raw_path:
-            ttk.Button(btn_row, text="Open original file",
+            ttk.Button(btn_row, text=t("Open original file"),
                        command=lambda: self._on_open_file(raw_path)).pack(side="left")
-            ttk.Button(btn_row, text="Copy path",
+            ttk.Button(btn_row, text=t("Copy path"),
                        command=lambda: _copy_to_clipboard(self, raw_path)).pack(side="left", padx=(6, 0))
         self.hide_button = ttk.Button(
-            btn_row, text=("Unhide" if hidden else "Hide"), command=self._on_toggle_hidden,
+            btn_row, text=(t("Unhide") if hidden else t("Hide")), command=self._on_toggle_hidden,
         )
         self.hide_button.pack(side="left", padx=(6, 0))
-        ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text=t("Close"), command=self.destroy).pack(side="right")
 
         if raw_path:
             tk.Label(self, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
-                     wraplength=840, justify="left").pack(fill="x", padx=14, pady=(4, 0))
+                     wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
 
         self.status_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.status_var, font=("TkDefaultFont", 9), fg=MUTED,
-                 bg=BG, anchor="w", wraplength=840, justify="left").pack(fill="x", padx=14, pady=(2, 12))
+                 bg=BG, anchor="w", wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(2, 12))
 
     def _on_open_file(self, path: str) -> None:
         error = _open_alog_file(path)
         self.status_var.set(
-            f"Couldn't open it: {error}. The file itself is at the path shown above." if error else ""
+            t("Couldn't open it: {error}. The file itself is at the path shown above.", error=error)
+            if error else ""
         )
 
     def _on_toggle_hidden(self) -> None:
@@ -480,11 +522,11 @@ class RoastDetailWindow(tk.Toplevel):
 
     def _on_hide_toggled(self, code: int, buf: list[str]) -> None:
         if code != 0:
-            self.status_var.set(f"Couldn't change hidden status: {''.join(buf).strip()}")
+            self.status_var.set(t("Couldn't change hidden status: {error}", error="".join(buf).strip()))
             return
         self.hidden = not self.hidden
-        self.hide_button.configure(text="Unhide" if self.hidden else "Hide")
-        self.status_var.set("Hidden from your own search results." if self.hidden else "Unhidden.")
+        self.hide_button.configure(text=t("Unhide") if self.hidden else t("Hide"))
+        self.status_var.set(t("Hidden from your own search results.") if self.hidden else t("Unhidden."))
         if self.on_change:
             self.on_change()
 
@@ -495,44 +537,44 @@ class PublishTab(Tab):
 
     def __init__(self, parent: tk.Widget, app: "RoastnetApp") -> None:
         super().__init__(parent, app)
-        heading(self, "Publish", "Add one of your own roasts to your signed feed.")
-        explain(self, "Publishing appends a signed entry to your local feed -- your identity is "
-                       "created silently the first time you publish, if you don't have one yet. "
-                       "A peer only receives it once they sync with you, which the Network tab "
-                       "now does on its own once you're serving.")
+        heading(self, t("Publish"), t("Add one of your own roasts to your signed feed."))
+        explain(self, t("Publishing appends a signed entry to your local feed -- your identity is "
+                         "created silently the first time you publish, if you don't have one yet. "
+                         "A peer only receives it once they sync with you, which the Network tab "
+                         "now does on its own once you're serving."))
 
         identity_row = ttk.Frame(self)
         identity_row.pack(fill="x", padx=14, pady=(0, 6))
-        tk.Label(identity_row, text="Feed address:", font=FONT_BOLD, bg=BG, fg=FG).pack(side="left")
-        self.identity_var = tk.StringVar(value="(loading...)")
+        tk.Label(identity_row, text=t("Feed address:"), font=FONT_BOLD, bg=BG, fg=FG).pack(side="left")
+        self.identity_var = tk.StringVar(value=t("(loading...)"))
         tk.Label(identity_row, textvariable=self.identity_var, font=FONT_MONO, bg=BG,
                  fg=MUTED).pack(side="left", padx=(6, 0))
 
-        folder_section = section(self, "Shared folder (recommended)")
-        tk.Label(folder_section, text="Drop .alog files here and they're published automatically, "
-                 "as long as the Network tab is serving -- no button to click per file:",
-                 font=("TkDefaultFont", 9), fg=MUTED, bg=BG, wraplength=840, justify="left",
+        folder_section = section(self, t("Shared folder (recommended)"))
+        tk.Label(folder_section, text=t("Drop .alog files here and they're published automatically, "
+                 "as long as the Network tab is serving -- no button to click per file:"),
+                 font=("TkDefaultFont", 9), fg=MUTED, bg=BG, wraplength=sp(840), justify="left",
                  anchor="w").pack(fill="x", padx=10, pady=(6, 2))
         folder_row = ttk.Frame(folder_section)
         folder_row.pack(fill="x", padx=10, pady=(0, 2))
         tk.Label(folder_row, textvariable=self.app.watch_dir, font=FONT_MONO, bg=BG, fg=FG).pack(
             side="left")
-        ttk.Button(folder_row, text="Open folder", command=self._open_watch_folder).pack(
+        ttk.Button(folder_row, text=t("Open folder"), command=self._open_watch_folder).pack(
             side="left", padx=(8, 0))
-        ttk.Button(folder_row, text="Copy path",
+        ttk.Button(folder_row, text=t("Copy path"),
                    command=lambda: _copy_to_clipboard(self, self.app.watch_dir.get())).pack(
             side="left", padx=(6, 0))
         self.folder_status_var = tk.StringVar(value="")
         tk.Label(folder_section, textvariable=self.folder_status_var, font=("TkDefaultFont", 9),
-                 fg=MUTED, bg=BG, anchor="w", wraplength=840, justify="left").pack(
+                 fg=MUTED, bg=BG, anchor="w", wraplength=sp(840), justify="left").pack(
             fill="x", padx=10, pady=(0, 8))
 
-        single_file_section = section(self, "Publish a single file")
-        self.path_field = Field(single_file_section, "File to publish", help_text="An Artisan .alog file.")
-        ttk.Button(single_file_section, text="Browse...", command=self._browse).pack(
+        single_file_section = section(self, t("Publish a single file"))
+        self.path_field = Field(single_file_section, t("File to publish"), help_text=t("An Artisan .alog file."))
+        ttk.Button(single_file_section, text=t("Browse..."), command=self._browse).pack(
             padx=10, pady=(0, 6), anchor="w")
 
-        self.runbar = RunBar(single_file_section, "Publish", self._on_run, self.cancel)
+        self.runbar = RunBar(single_file_section, t("Publish"), self._on_run, self.cancel)
         self.console = Console(single_file_section)
 
         self._load_identity()
@@ -542,14 +584,18 @@ class PublishTab(Tab):
         try:
             Path(path).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            self.folder_status_var.set(f"couldn't create {path}: {exc}")
+            self.folder_status_var.set(t("Couldn't create {path}: {error}", path=path, error=exc))
             return
         error = _open_with_default_app(path)
-        self.folder_status_var.set(f"couldn't open it: {error}. The folder itself is at: {path}" if error else "")
+        self.folder_status_var.set(
+            t("Couldn't open it: {error}. The folder itself is at: {path}", error=error, path=path)
+            if error else ""
+        )
 
     def _browse(self) -> None:
         path = filedialog.askopenfilename(
-            title="Choose a .alog file", filetypes=[("Artisan roast log", "*.alog"), ("All files", "*.*")],
+            title=t("Choose a .alog file"),
+            filetypes=[(t("Artisan roast log"), "*.alog"), (t("All files"), "*.*")],
         )
         if path:
             self.path_field.set(path)
@@ -562,7 +608,7 @@ class PublishTab(Tab):
 
     def _identity_loaded(self, buf: list[str]) -> None:
         lines = [line for line in "".join(buf).splitlines() if line.strip()]
-        self.identity_var.set(lines[-1] if lines else "(unknown)")
+        self.identity_var.set(lines[-1] if lines else t("(unknown)"))
 
     def _on_run(self) -> None:
         if self.task is not None and self.task.running:
@@ -570,18 +616,18 @@ class PublishTab(Tab):
         path = self.path_field.get()
         if not path:
             self.console.clear()
-            self.console.append("choose a .alog file first\n")
+            self.console.append(t("choose a .alog file first") + "\n")
             return
         argv = roastnet_argv("--db", self.app.db_path.get(), "feed", "publish", path)
         self.console.clear()
         self.console.set_command(describe(argv))
         self.task = Task(argv=argv)
-        self.runbar.set_running(True, "running...")
+        self.runbar.set_running(True, t("running..."))
         self.task.start()
         stream_into(self.task, self.console.append, self._on_finished, lambda ms, fn: self.after(ms, fn))
 
     def _on_finished(self, code: int) -> None:
-        self.runbar.set_running(False, "done" if code == 0 else f"exited with code {code}")
+        self.runbar.set_running(False, t("done") if code == 0 else _exited_with_code(code))
         if code == 0:
             self._load_identity()
 
@@ -601,33 +647,33 @@ class NetworkTab(Tab):
         self.sync_task: Task | None = None
         self._closed = False
 
-        heading(self, "Network", "Serve your feed to peers, and pull theirs.")
-        explain(self, "The network is on automatically while this app is running -- peers on your "
-                       "local network are found and synced with on their own, no clicking needed. "
-                       "Internet-wide discovery (Settings tab) finds peers beyond your LAN the same "
-                       "way, if you've turned it on. For a peer discovery won't reach, share the "
-                       "ticket shown below with them, or paste theirs under 'Sync with a peer'. "
-                       "Changes made in Settings apply the next time you Stop then Start serving.")
+        heading(self, t("Network"), t("Serve your feed to peers, and pull theirs."))
+        explain(self, t("The network is on automatically while this app is running -- peers on your "
+                         "local network are found and synced with on their own, no clicking needed. "
+                         "Internet-wide discovery (Settings tab) finds peers beyond your LAN the same "
+                         "way, if you've turned it on. For a peer discovery won't reach, share the "
+                         "ticket shown below with them, or paste theirs under 'Sync with a peer'. "
+                         "Changes made in Settings apply the next time you Stop then Start serving."))
 
-        serve_section = section(self, "Serve your feed")
-        tk.Label(serve_section, text="Your ticket:", font=FONT_BOLD, bg=BG, fg=FG).pack(
+        serve_section = section(self, t("Serve your feed"))
+        tk.Label(serve_section, text=t("Your ticket:"), font=FONT_BOLD, bg=BG, fg=FG).pack(
             anchor="w", padx=10, pady=(6, 0))
         ticket_row = ttk.Frame(serve_section)
         ticket_row.pack(fill="x", padx=10, pady=(0, 6))
         self.ticket_var = tk.StringVar(value="")
         self.ticket_entry = ttk.Entry(ticket_row, textvariable=self.ticket_var, state="readonly")
         self.ticket_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(ticket_row, text="Copy", command=self._copy_ticket).pack(side="left", padx=(6, 0))
-        self.serve_runbar = RunBar(serve_section, "Start serving", self._on_start_serve, self._on_stop_serve)
+        ttk.Button(ticket_row, text=t("Copy"), command=self._copy_ticket).pack(side="left", padx=(6, 0))
+        self.serve_runbar = RunBar(serve_section, t("Start serving"), self._on_start_serve, self._on_stop_serve)
         self.serve_console = Console(serve_section, height=4)
 
-        sync_section = section(self, "Sync with a peer")
-        self.peer_ticket_field = Field(sync_section, "Peer's ticket",
-                                        help_text="Paste the ticket they shared with you.")
-        self.sync_runbar = RunBar(sync_section, "Sync", self._on_sync, self._on_cancel_sync)
+        sync_section = section(self, t("Sync with a peer"))
+        self.peer_ticket_field = Field(sync_section, t("Peer's ticket"),
+                                        help_text=t("Paste the ticket they shared with you."))
+        self.sync_runbar = RunBar(sync_section, t("Sync"), self._on_sync, self._on_cancel_sync)
         self.sync_console = Console(sync_section, height=4)
 
-        peers_section = section(self, "Known peers")
+        peers_section = section(self, t("Known peers"))
         self.peers_table = PeerTable(peers_section)
 
         self._on_start_serve()
@@ -640,6 +686,19 @@ class NetworkTab(Tab):
         if self.sync_task is not None:
             self.sync_task.cancel()
 
+    # Every tick shells out to a whole new `roastnet peer list` process (see
+    # gui/runner.py's docstring for why the GUI shells out at all) -- cheap
+    # as a one-off, but measured at ~0.12s of CPU from source and ~0.30s
+    # under a packaged PyInstaller binary (onefile self-extraction on every
+    # launch) on a fast desktop. A real bug: at the previous 5s interval
+    # that's a genuinely continuous background load (~6-8% of a core on a
+    # packaged build) for a "Known peers" table nobody is watching in real
+    # time -- exactly the kind of small, constant, periodic CPU burst that
+    # can keep a laptop's fan cycling even while the app just sits open.
+    # 30s keeps the table reasonably live (LAN/WAN discovery still shows up
+    # within half a minute with zero clicks) at roughly 1/6th the cost.
+    _PEER_REFRESH_INTERVAL_MS = 30_000
+
     def _schedule_peer_refresh(self) -> None:
         # keeps "Known peers" (and thus visibility into LAN auto-discovery)
         # live without the user ever clicking anything -- self-reschedules
@@ -647,7 +706,7 @@ class NetworkTab(Tab):
         if self._closed:
             return
         self._refresh_peers()
-        self.after(5000, self._schedule_peer_refresh)
+        self.after(self._PEER_REFRESH_INTERVAL_MS, self._schedule_peer_refresh)
 
     def _copy_ticket(self) -> None:
         ticket = self.ticket_var.get()
@@ -667,24 +726,35 @@ class NetworkTab(Tab):
         self.serve_console.set_command(describe(argv))
         self.ticket_var.set("")
         self.serve_task = Task(argv=argv)
-        self.serve_runbar.set_running(True, "starting...")
+        self.serve_runbar.set_running(True, t("starting..."))
         self.serve_task.start()
+        # `node serve` runs for the app's whole lifetime now that serving
+        # auto-starts (unlike a short one-off search/publish/sync), so
+        # stream_into's default 120ms poll would fire roughly 30,000 times
+        # an hour just to check an almost-always-empty output queue --
+        # each firing is individually cheap, but that many small, constant
+        # wakeups is exactly the pattern that can keep a CPU from ever
+        # reaching a deeper idle state. A second's delay in an occasional
+        # "watch: published..." log line showing up is imperceptible.
         stream_into(self.serve_task, self._on_serve_output, self._on_serve_finished,
-                    lambda ms, fn: self.after(ms, fn))
+                    lambda ms, fn: self.after(ms, fn), interval_ms=1000)
 
     def _on_serve_output(self, text: str) -> None:
         self.serve_console.append(text)
         for line in text.splitlines():
+            # "ticket: " is the one text contract between the CLI and the
+            # GUI (net.py's serve() prints it, in English, always) -- never
+            # translate this literal, or the ticket box stays empty forever.
             if line.startswith("ticket: "):
                 self.ticket_var.set(line[len("ticket: "):].strip())
-                self.serve_runbar.set_running(True, "serving")
+                self.serve_runbar.set_running(True, t("serving"))
 
     def _on_stop_serve(self) -> None:
         if self.serve_task is not None:
             self.serve_task.cancel()
 
     def _on_serve_finished(self, code: int) -> None:
-        self.serve_runbar.set_running(False, "stopped" if code == 0 else f"stopped (exit {code})")
+        self.serve_runbar.set_running(False, t("stopped") if code == 0 else t("stopped (exit {code})", code=code))
         self.ticket_var.set("")
 
     def _on_sync(self) -> None:
@@ -693,13 +763,13 @@ class NetworkTab(Tab):
         ticket = self.peer_ticket_field.get()
         if not ticket:
             self.sync_console.clear()
-            self.sync_console.append("paste a peer's ticket first\n")
+            self.sync_console.append(t("paste a peer's ticket first") + "\n")
             return
         argv = roastnet_argv("--db", self.app.db_path.get(), "peer", "sync", ticket)
         self.sync_console.clear()
         self.sync_console.set_command(describe(argv))
         self.sync_task = Task(argv=argv)
-        self.sync_runbar.set_running(True, "syncing...")
+        self.sync_runbar.set_running(True, t("syncing..."))
         self.sync_task.start()
         stream_into(self.sync_task, self.sync_console.append, self._on_sync_finished,
                     lambda ms, fn: self.after(ms, fn))
@@ -709,7 +779,7 @@ class NetworkTab(Tab):
             self.sync_task.cancel()
 
     def _on_sync_finished(self, code: int) -> None:
-        self.sync_runbar.set_running(False, "done" if code == 0 else f"exited with code {code}")
+        self.sync_runbar.set_running(False, t("done") if code == 0 else _exited_with_code(code))
         self._refresh_peers()
 
     def _refresh_peers(self) -> None:
@@ -736,45 +806,78 @@ class SettingsTab(Tab):
 
     def __init__(self, parent: tk.Widget, app: "RoastnetApp") -> None:
         super().__init__(parent, app)
-        heading(self, "Settings", "Where things live, and how far discovery reaches.")
+        # Scrollable: this tab has grown a section at a time (watch folder,
+        # WAN discovery, temperature unit, now language) and, confirmed on
+        # a real screenshot, the bottom section is now clipped with no way
+        # to reach it even on a large display -- scrollable() (widgets.py)
+        # already existed for exactly this, just unused until now.
+        container = scrollable(self)
+        heading(container, t("Settings"), t("Where things live, and how far discovery reaches."))
 
-        db_section = section(self, "Database file")
-        explain(db_section, "Where your local search index lives. Search, Publish, and Network "
-                             "all use this. Existing tabs pick up a change the next time they run.")
-        self.db_field = Field(db_section, "Path", variable=self.app.db_path, width=60)
-        ttk.Button(db_section, text="Browse...", command=self._browse_db).pack(
+        db_section = section(container, t("Database file"))
+        explain(db_section, t("Where your local search index lives. Search, Publish, and Network "
+                               "all use this. Existing tabs pick up a change the next time they run."))
+        self.db_field = Field(db_section, t("Path"), variable=self.app.db_path, width=60)
+        ttk.Button(db_section, text=t("Browse..."), command=self._browse_db).pack(
             padx=10, pady=(0, 8), anchor="w")
 
-        watch_section = section(self, "Shared publish folder")
-        explain(watch_section, "Any .alog file dropped here is published automatically while "
-                                "the Network tab is serving -- see the Publish tab.")
-        self.watch_field = Field(watch_section, "Path", variable=self.app.watch_dir, width=60)
-        ttk.Button(watch_section, text="Browse...", command=self._browse_watch_dir).pack(
+        watch_section = section(container, t("Shared publish folder"))
+        explain(watch_section, t("Any .alog file dropped here is published automatically while "
+                                  "the Network tab is serving -- see the Publish tab."))
+        self.watch_field = Field(watch_section, t("Path"), variable=self.app.watch_dir, width=60)
+        ttk.Button(watch_section, text=t("Browse..."), command=self._browse_watch_dir).pack(
             padx=10, pady=(0, 8), anchor="w")
 
-        wan_section = section(self, "Internet-wide discovery")
+        wan_section = section(container, t("Internet-wide discovery"))
         explain(wan_section,
-                "Off by default. LAN discovery only ever broadcasts on your local network. "
-                "Turning this on also finds and syncs with roastnet peers anywhere on the "
-                "internet, the same way a BitTorrent client finds peers with no tracker of its "
-                "own: by announcing on the public BitTorrent DHT, a huge, already-running "
-                "public network -- no server of roastnet's own involved. The trade-off: your "
-                "public IP address (and the fact that it's running roastnet) becomes visible to "
-                "anyone else looking at that same swarm, which a LAN broadcast never exposes. "
-                "Restart serving (Network tab: Stop, then Start) after changing this.")
-        ttk.Checkbutton(wan_section, text="Find peers over the whole internet, not just my LAN",
+                t("Off by default. LAN discovery only ever broadcasts on your local network. "
+                  "Turning this on also finds and syncs with roastnet peers anywhere on the "
+                  "internet, the same way a BitTorrent client finds peers with no tracker of its "
+                  "own: by announcing on the public BitTorrent DHT, a huge, already-running "
+                  "public network -- no server of roastnet's own involved. The trade-off: your "
+                  "public IP address (and the fact that it's running roastnet) becomes visible to "
+                  "anyone else looking at that same swarm, which a LAN broadcast never exposes. "
+                  "Restart serving (Network tab: Stop, then Start) after changing this."))
+        ttk.Checkbutton(wan_section, text=t("Find peers over the whole internet, not just my LAN"),
                          variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
+
+        unit_section = section(container, t("Temperature unit"))
+        explain(unit_section,
+                t("Controls how temperatures are shown everywhere in the app -- search results, "
+                  "the roast detail chart, and its stats. Roasts are always parsed, stored, and "
+                  "searched in Celsius internally, no matter what's picked here -- this only "
+                  "changes what you see on screen. An open search or detail window picks up a "
+                  "change the next time it re-runs (a new search, reopening a roast)."))
+        unit_row = ttk.Frame(unit_section)
+        unit_row.pack(anchor="w", padx=10, pady=(0, 8))
+        ttk.Radiobutton(unit_row, text=t("Celsius (°C)"), value=units.CELSIUS,
+                        variable=self.app.temp_unit).pack(side="left")
+        ttk.Radiobutton(unit_row, text=t("Fahrenheit (°F)"), value=units.FAHRENHEIT,
+                        variable=self.app.temp_unit).pack(side="left", padx=(12, 0))
+
+        language_section = section(container, t("Language"))
+        explain(language_section,
+                t("Changes what every label, button, and help text in this app is shown in. "
+                  "Takes effect the next time you open roastnet -- an already-open window keeps "
+                  "its current language."))
+        language_row = ttk.Frame(language_section)
+        language_row.pack(anchor="w", padx=10, pady=(0, 8))
+        # Native names, never translated -- a user who picks the wrong
+        # language by mistake must still be able to read their way back.
+        for code, (native_name, _is_plural) in i18n.LANGUAGES.items():
+            ttk.Radiobutton(language_row, text=native_name, value=code,
+                            variable=self.app.language).pack(side="left", padx=(0, 12))
 
     def _browse_db(self) -> None:
         path = filedialog.asksaveasfilename(
-            title="Choose a database file", defaultextension=".sqlite3",
-            filetypes=[("SQLite database", "*.sqlite3"), ("All files", "*.*")],
+            title=t("Choose a database file"), defaultextension=".sqlite3",
+            filetypes=[(t("SQLite database"), "*.sqlite3"), (t("All files"), "*.*")],
         )
         if path:
             self.app.db_path.set(path)
 
     def _browse_watch_dir(self) -> None:
-        path = filedialog.askdirectory(title="Choose a folder to auto-publish from")
+        path = filedialog.askdirectory(title=t("Choose a folder to auto-publish from"))
         if path:
             self.app.watch_dir.set(path)
 
@@ -782,19 +885,48 @@ class SettingsTab(Tab):
 class RoastnetApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        # Every font in this app (and gui/chart.py's Canvas text) is
+        # specified in points, so this one call is what actually makes
+        # them all bigger together -- see UI_SCALE's docstring in
+        # widgets.py for why this can't just be auto-detected from the
+        # display's reported DPI. Must happen before any widget is
+        # created, or already-built widgets keep their original size.
+        try:
+            self.tk.call("tk", "scaling", self.tk.call("tk", "scaling") * UI_SCALE)
+        except tk.TclError:
+            pass
         self.title("roastnet")
-        self.geometry("900x680")
+        self.geometry(screen_geometry(self, 900, 680))
         self.configure(bg=BG)
         try:
-            ttk.Style(self).theme_use("clam")
+            style = ttk.Style(self)
+            style.theme_use("clam")
+            # "clam"'s Treeview row height is a fixed pixel value baked
+            # into the theme, not derived from the active font -- confirmed
+            # on a real 4K display: it stayed at 20px after the 3x
+            # font-scaling bump above (which needs ~55px of linespace),
+            # clipping almost every row's text down to unreadable
+            # fragments (only the outer edges of each glyph fit). Recompute
+            # it from the font actually in use, now that scaling is set.
+            row_font = tkfont.nametofont("TkDefaultFont")
+            style.configure("Treeview", rowheight=round(row_font.metrics("linespace") * 1.3))
         except tk.TclError:
             pass
 
         cfg = gui_config.load_config()
+        # Must happen before any tab is built below -- every widget label is
+        # baked in at construction time (see gui/i18n.py's module docstring
+        # for why a language switch applies on next launch rather than
+        # rebuilding live).
+        i18n.set_language(i18n.resolve_language(cfg.language))
+
         self.db_path = tk.StringVar(value=cfg.db_path)
         self.watch_dir = tk.StringVar(value=cfg.watch_dir)
         self.wan_discovery_enabled = tk.BooleanVar(value=cfg.wan_discovery_enabled)
-        for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled):
+        self.temp_unit = tk.StringVar(value=cfg.temp_unit)
+        self.language = tk.StringVar(value=i18n.current_language())
+        for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled,
+                    self.temp_unit, self.language):
             var.trace_add("write", lambda *_args: self._save_config())
 
         notebook = ttk.Notebook(self)
@@ -804,10 +936,10 @@ class RoastnetApp(tk.Tk):
         publish_tab = PublishTab(notebook, self)
         network_tab = NetworkTab(notebook, self)
         settings_tab = SettingsTab(notebook, self)
-        notebook.add(search_tab, text="Search")
-        notebook.add(publish_tab, text="Publish")
-        notebook.add(network_tab, text="Network")
-        notebook.add(settings_tab, text="Settings")
+        notebook.add(search_tab, text=t("Search"))
+        notebook.add(publish_tab, text=t("Publish"))
+        notebook.add(network_tab, text=t("Network"))
+        notebook.add(settings_tab, text=t("Settings"))
         self.tabs: list[Tab] = [search_tab, publish_tab, network_tab, settings_tab]
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -816,6 +948,8 @@ class RoastnetApp(tk.Tk):
         gui_config.save_config(gui_config.GuiConfig(
             db_path=self.db_path.get(), watch_dir=self.watch_dir.get(),
             wan_discovery_enabled=self.wan_discovery_enabled.get(),
+            temp_unit=self.temp_unit.get(),
+            language=self.language.get(),
         ))
 
     def _on_close(self) -> None:

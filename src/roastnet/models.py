@@ -37,6 +37,37 @@ def temp_to_celsius(value: float | None, mode: str | None) -> float | None:
     return value
 
 
+# Comfortably wider than any real roast (which never gets within 100C of
+# either bound) -- this only ever catches sensor garbage, not a genuine,
+# if unusual, reading.
+_MIN_PLAUSIBLE_TEMP_C = -50.0
+_MAX_PLAUSIBLE_TEMP_C = 400.0
+
+
+def plausible_temp_c(value: float | None) -> float | None:
+    """None if `value` (already Celsius) is outside any physically
+    plausible roast temperature -- a real bug hit in practice: a Kaleido
+    BT reading of 65535, the classic unsigned-16-bit "no reading" sentinel,
+    landing as a single spurious sample in an otherwise normal descending
+    sequence, which corrupted both the plotted curve and (since roast_type
+    is classified from the curve's peak) the roast's own type. Apply this
+    to every BT/ET/extra-channel reading built from raw .alog data, not
+    just to values about to be charted -- the same sentinel corrupts
+    anything downstream that touches the raw curve."""
+    if value is None:
+        return None
+    return value if _MIN_PLAUSIBLE_TEMP_C <= value <= _MAX_PLAUSIBLE_TEMP_C else None
+
+
+def weight_loss_pct(batch_in_g: float | None, batch_out_g: float | None) -> float | None:
+    """Percentage of green weight lost to roasting (moisture + chaff).
+    None if either weight is missing, or if batch_in_g is 0 (would divide
+    by zero, and a real batch can't weigh nothing going in)."""
+    if not batch_in_g or batch_out_g is None:
+        return None
+    return (batch_in_g - batch_out_g) / batch_in_g * 100.0
+
+
 def density_to_g_per_l(value: float | None, weight_unit: str | None,
                         count: float | None, volume_unit: str | None) -> float | None:
     """.alog's `density`/`density_roasted` fields are [value, weight_unit,
@@ -88,10 +119,12 @@ class RoastRecord:
     roast_epoch: int | None
     roast_type: str | None  # e.g. "full city" -- always from peak bean temperature, see roast_level.py
 
-    # raw curves (kept for display/export; not persisted as first-class columns)
+    # raw curves (kept for display/export; not persisted as first-class columns).
+    # bt_c/et_c can contain None at an index whose raw reading failed
+    # plausible_temp_c() -- a sensor glitch, not a real gap in time.
     timex_s: list[float]
-    bt_c: list[float]
-    et_c: list[float]
+    bt_c: list[float | None]
+    et_c: list[float | None]
 
     # decoded milestones + normalized representation
     milestones: list[Milestone]

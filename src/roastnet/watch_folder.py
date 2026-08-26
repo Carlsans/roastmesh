@@ -36,6 +36,7 @@ def default_watch_dir() -> Path:
 
 def publish_new_files(
     feed_dir: Path, identity: Identity, watch_dir: Path, *, db_path: Path | None = None,
+    skip_cache: dict[Path, tuple[float, int]] | None = None,
 ) -> list[FeedEntry]:
     """Publish every `.alog` file directly under `watch_dir` that isn't
     already in the feed (by content hash), in filename order. Safe to call
@@ -44,7 +45,19 @@ def publish_new_files(
     If `db_path` is given, each newly-published file is also added to the
     local search index as one of "your own roasts" (is_user_log=True) --
     without this, publishing and search are disconnected: a file could be
-    shared with every peer yet never show up in your own search results."""
+    shared with every peer yet never show up in your own search results.
+
+    `skip_cache`, if given, is a caller-owned {path: (mtime, size)} dict
+    this function both reads and updates: a file whose mtime+size still
+    match its last-recorded fingerprint is skipped without reading or
+    hashing its content at all. This is what makes calling this on a timer
+    (net.py's _watch_publish_loop) cheap regardless of corpus size -- a
+    real bug hit in practice: re-hashing every file in the folder on every
+    tick, forever, scales with total file count and bytes for no reason
+    once a file is already known to be published, and was measured as a
+    real (if secondary, on a modest folder) contributor to sustained idle
+    CPU use. Omit it (the default) for a one-shot call, which always
+    checks everything -- that's what every existing caller/test expects."""
     watch_dir = Path(watch_dir)
     if not watch_dir.is_dir():
         return []
@@ -54,13 +67,21 @@ def publish_new_files(
     for path in sorted(watch_dir.glob("*.alog")):
         if not path.is_file():
             continue
+        stat = path.stat()
+        fingerprint = (stat.st_mtime, stat.st_size)
+        if skip_cache is not None and skip_cache.get(path) == fingerprint:
+            continue
         raw_bytes = path.read_bytes()
         content_sha256 = hashlib.sha256(raw_bytes).hexdigest()
         if content_sha256 in existing_hashes:
+            if skip_cache is not None:
+                skip_cache[path] = fingerprint
             continue
         entry = append_entry(feed_dir, identity, path, timestamp=datetime.now(timezone.utc).isoformat())
         existing_hashes.add(content_sha256)
         published.append(entry)
+        if skip_cache is not None:
+            skip_cache[path] = fingerprint
         if db_path is not None:
             conn = connect(db_path)
             try:
