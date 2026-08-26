@@ -25,6 +25,17 @@ def find_roast_id_by_source(conn: sqlite3.Connection, source_id: str) -> str | N
     return row["roast_id"] if row else None
 
 
+def find_all_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every currently-known source (raw_path, source_type, source_ref)
+    plus its roast's is_user_log -- everything ingest.refresh_known_sources
+    needs to re-ingest each one without accidentally changing what peer
+    (if any) it came from."""
+    return conn.execute(
+        """SELECT s.raw_path, s.source_type, s.source_ref, r.is_user_log
+           FROM sources s JOIN roasts r ON r.source_id = s.source_id"""
+    ).fetchall()
+
+
 def set_hidden(conn: sqlite3.Connection, roast_id: str, hidden: bool) -> bool:
     """Hide (or unhide) one roast from this machine's own search results.
 
@@ -67,19 +78,31 @@ def insert_source(
 
 
 def insert_roast(conn: sqlite3.Connection, record: RoastRecord, source_id: str) -> None:
+    # `hidden` is deliberately never in this column list and never comes
+    # from `record` -- there's no ingest-time concept of "hidden", only
+    # set_hidden(). INSERT OR REPLACE deletes-then-reinserts the row, so
+    # any column left out of the statement would silently reset to its
+    # schema default (0, unhidden) on every re-ingest -- confirmed as a
+    # real bug this would have caused: refreshing an already-hidden
+    # roast's derived fields (see ingest.py's self-healing re-ingest)
+    # would have silently un-hidden it. The subquery carries the existing
+    # value forward (0 for a genuinely new roast_id, since the subquery
+    # then finds no row).
     conn.execute(
         """INSERT OR REPLACE INTO roasts
            (roast_id, source_id, roast_uuid, roaster_type_raw, machine_key, mechanism_family,
             batch_weight_in_g, batch_weight_out_g, density_g_per_l, title, beans_text, roast_date,
-            roast_epoch, roast_type, roasting_notes, cupping_notes, is_user_log,
+            roast_epoch, roast_type, roasting_notes, cupping_notes, is_user_log, hidden,
             parse_warnings_json, raw_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   COALESCE((SELECT hidden FROM roasts WHERE roast_id = ?), 0), ?, ?)""",
         (
             record.roast_id, source_id, record.roast_uuid, record.roaster_type_raw,
             record.machine_key, record.mechanism_family, record.batch_weight_in_g,
             record.batch_weight_out_g, record.density_g_per_l, record.title, record.beans_text,
             record.roast_date, record.roast_epoch, record.roast_type, record.roasting_notes,
             record.cupping_notes, int(record.is_user_log),
+            record.roast_id,
             json.dumps(record.parse_warnings), json.dumps(record.to_dict()),
         ),
     )

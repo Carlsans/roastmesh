@@ -316,3 +316,56 @@ def test_show_json_includes_hidden_status(tmp_path: Path) -> None:
     after = json.loads(runner.invoke(main, ["--db", str(db_path), "show", roast_id, "--json"]).output)
     assert after["hidden"] is True
     assert "hidden: yes" in runner.invoke(main, ["--db", str(db_path), "show", roast_id]).output
+
+
+def test_refresh_updates_stale_entries_and_is_a_fast_noop_second_time(tmp_path: Path) -> None:
+    import roastnet
+
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+
+    from roastnet.index.db import connect
+    conn = connect(db_path)
+    conn.execute("UPDATE roasts SET title = NULL")  # simulate a pre-title-field entry
+    conn.commit()
+    conn.close()
+
+    first = runner.invoke(main, ["--db", str(db_path), "refresh"])
+    assert first.exit_code == 0, first.output
+    assert f"refreshed 1 roast(s) for v{roastnet.__version__}" in first.output
+
+    conn = connect(db_path)
+    title = conn.execute("SELECT title FROM roasts").fetchone()["title"]
+    conn.close()
+    assert title is not None
+
+    second = runner.invoke(main, ["--db", str(db_path), "refresh"])
+    assert second.exit_code == 0, second.output
+    assert "already up to date" in second.output
+
+
+def test_refresh_force_reruns_even_when_already_up_to_date(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    runner.invoke(main, ["--db", str(db_path), "refresh"])
+
+    forced = runner.invoke(main, ["--db", str(db_path), "refresh", "--force"])
+    assert forced.exit_code == 0, forced.output
+    assert "refreshed 1 roast(s)" in forced.output
+
+
+def test_refresh_preserves_hidden_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    roast_id = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "search", "--json"]).output
+    )[0]["roast_id"]
+    runner.invoke(main, ["--db", str(db_path), "hide", roast_id])
+
+    runner.invoke(main, ["--db", str(db_path), "refresh", "--force"])
+
+    payload = json.loads(runner.invoke(main, ["--db", str(db_path), "show", roast_id, "--json"]).output)
+    assert payload["hidden"] is True

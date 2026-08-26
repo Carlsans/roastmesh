@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS note_tags (
     PRIMARY KEY (roast_id, tag)
 );
 
+-- Small key/value bookkeeping about the index itself, not any one roast --
+-- currently just "what roastnet version last refreshed every known
+-- source's derived fields" (index/ingest.py's refresh_known_sources),
+-- so that only runs once per version instead of on every launch.
+CREATE TABLE IF NOT EXISTS index_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 -- Free-text search over the fields .alog has no structured equivalent for
 -- (origin, process, etc. only ever show up as prose in beans_text/notes).
 -- Own-copy (not "content=" external-content mode) so inserts/deletes follow

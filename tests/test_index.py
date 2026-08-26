@@ -4,7 +4,7 @@ import pytest
 
 from roastnet.index import repository as repo
 from roastnet.index.db import connect
-from roastnet.index.ingest import ingest_file, ingest_path
+from roastnet.index.ingest import ingest_file, ingest_path, refresh_known_sources
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -143,6 +143,21 @@ def test_set_hidden_excludes_from_search_by_default_and_include_hidden_reveals_i
     assert len(repo.search_roasts(conn)) == 1
 
 
+def test_reingesting_a_hidden_roast_does_not_unhide_it(conn) -> None:
+    """A real bug caught before it shipped: INSERT OR REPLACE resets any
+    column not in its statement to the schema default, and `hidden` was
+    never in insert_roast's column list -- so re-ingesting an already-
+    hidden roast (exactly what a version-triggered refresh does) would
+    have silently un-hidden it."""
+    path = FIXTURES_DIR / "kaleido_1.alog"
+    result = ingest_file(conn, path)
+    repo.set_hidden(conn, result.record.roast_id, True)
+
+    ingest_file(conn, path)  # hits the self-healing "existing" branch
+
+    assert repo.find_hidden(conn, result.record.roast_id) is True
+
+
 def test_set_hidden_returns_false_for_an_unknown_roast_id(conn) -> None:
     assert repo.set_hidden(conn, "not-a-real-id", True) is False
 
@@ -156,3 +171,43 @@ def test_load_full_record_round_trips(conn) -> None:
     full = repo.load_full_record(conn, result.record.roast_id)
     assert full is not None
     assert full["machine_key"] == result.record.machine_key
+
+
+def test_refresh_known_sources_updates_a_field_without_reingesting_manually(conn, monkeypatch) -> None:
+    """The actual "stale entries" scenario: a title extracted by a newer
+    parser must show up for a roast ingested before that field existed,
+    without the caller needing to know which file to re-ingest -- refresh
+    just walks everything the index already knows about."""
+    ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog")
+    # simulate "ingested by an older parser that didn't have `title` yet"
+    conn.execute("UPDATE roasts SET title = NULL")
+    conn.commit()
+    assert repo.search_roasts(conn)[0].title is None
+
+    results = refresh_known_sources(conn)
+
+    assert len(results) == 1
+    assert results[0].error is None
+    assert repo.search_roasts(conn)[0].title is not None
+
+
+def test_refresh_known_sources_preserves_own_roast_tagging(conn) -> None:
+    ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog", is_user_log=True)
+    ingest_file(conn, FIXTURES_DIR / "hottop_1.alog", is_user_log=False)
+
+    refresh_known_sources(conn)
+
+    own = repo.search_roasts(conn, own_only=True)
+    assert len(own) == 1
+    assert own[0].source_ref.endswith("kaleido_1.alog")
+
+
+def test_refresh_known_sources_skips_a_raw_path_that_no_longer_exists(conn, tmp_path: Path) -> None:
+    moved = tmp_path / "will_disappear.alog"
+    moved.write_bytes((FIXTURES_DIR / "kaleido_1.alog").read_bytes())
+    ingest_file(conn, moved)
+    moved.unlink()
+
+    results = refresh_known_sources(conn)
+
+    assert results == []  # skipped, not reported as an error

@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (opt-in) over the whole internet via the public BitTorrent DHT, no
 tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 195 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 207 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -183,6 +183,12 @@ this can't retroactively un-share it from a peer):
 roastnet --db ~/roastnet.sqlite3 hide <roast_id>      # roast_id may be a prefix
 roastnet --db ~/roastnet.sqlite3 unhide <roast_id>
 ```
+
+If an entry looks stale after updating roastnet (an old roast type, a missing title) -- this
+fixes itself automatically the next time `node serve` starts (which the GUI always does), by
+re-ingesting everything already known once per version, without wiping anything. Run it directly
+with `roastnet refresh` (safe and near-instant to run repeatedly -- it skips if already done for
+the running version); `--force` re-runs it anyway.
 
 **Publish one of your own roasts** (creates your Ed25519 identity silently on first use):
 ```bash

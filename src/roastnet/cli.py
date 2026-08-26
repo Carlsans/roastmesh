@@ -8,14 +8,15 @@ from pathlib import Path
 
 import click
 
+import roastnet
 from roastnet import net
 from roastnet.bootstrap import BOOTSTRAP_TICKETS
 from roastnet.feed import append_entry, default_feed_dir, default_peer_feeds_root, verify_feed
 from roastnet.gateway import make_server
 from roastnet.identity import load_or_create_identity
 from roastnet.index import repository as repo
-from roastnet.index.db import connect
-from roastnet.index.ingest import ingest_feed, ingest_file, ingest_path
+from roastnet.index.db import connect, get_meta, set_meta
+from roastnet.index.ingest import ingest_feed, ingest_file, ingest_path, refresh_known_sources
 from roastnet.peers import Peer, default_peers_path, load_peers, node_id_from_ticket, prune_stale, save_peers, upsert_peer
 from roastnet.watch_folder import default_watch_dir
 
@@ -71,7 +72,13 @@ def reindex(ctx: click.Context, path: Path) -> None:
     """Wipe the index and rebuild it from every .alog file in PATH.
 
     The index is a pure function of the corpus, so this is always safe to
-    run again -- it never needs to be kept in sync incrementally.
+    run again -- it never needs to be kept in sync incrementally. Wiping
+    does lose local-only annotations that live only in the index, not any
+    .alog file, though: hidden status and "my own roasts" tagging (pass
+    --user-log to `ingest`/`feed ingest` afterwards to restore the
+    latter). `refresh` is the non-destructive alternative when that
+    matters -- it re-ingests everything already known in place instead of
+    starting over from a directory.
     """
     db_path = Path(ctx.obj["db_path"])
     if db_path.exists():
@@ -83,6 +90,36 @@ def reindex(ctx: click.Context, path: Path) -> None:
     for result in results:
         if result.error:
             click.echo(f"error: {result.error}", err=True)
+
+
+@main.command()
+@click.option("--force", is_flag=True, help="Refresh even if already up to date for this version.")
+@click.pass_context
+def refresh(ctx: click.Context, force: bool) -> None:
+    """Re-ingest every already-known file to pick up parser/classification
+    improvements for roasts indexed by an older version of roastnet --
+    without wiping anything (unlike `reindex`, this can't lose hidden
+    status or "my own roasts" tagging, since it only touches rows that
+    already exist).
+
+    Cheap and safe to run unconditionally (it's what `node serve` does
+    automatically on startup): skips instantly if this index was already
+    refreshed for the currently-running version, unless --force.
+    """
+    conn = connect(ctx.obj["db_path"])
+    current = roastnet.__version__
+    if not force and get_meta(conn, "refreshed_by_version") == current:
+        click.echo(f"already up to date for v{current}")
+        return
+    results = refresh_known_sources(conn)
+    refreshed = sum(1 for r in results if r.error is None)
+    failed = sum(1 for r in results if r.error)
+    click.echo(f"refreshed {refreshed} roast(s) for v{current}"
+               + (f", {failed} error(s)" if failed else ""))
+    for result in results:
+        if result.error:
+            click.echo(f"error: {result.error}", err=True)
+    set_meta(conn, "refreshed_by_version", current)
 
 
 def _filter_lan_only(rows: list, peers_file: Path) -> list:

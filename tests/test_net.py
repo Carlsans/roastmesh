@@ -421,3 +421,47 @@ async def test_serve_auto_ingests_watch_folder_files_as_the_users_own_roasts(tmp
         assert indexed_as_own, "dropped file was never indexed as one of the user's own roasts"
     finally:
         await _stop_server(task)
+
+
+async def test_serve_refreshes_stale_entries_on_startup(tmp_path: Path) -> None:
+    """The actual "stale entries after an update" scenario a user hit:
+    an already-ingested roast's title, extracted only by a newer version
+    of the parser, must show up automatically the next time the app is
+    opened -- without a manual reindex, and without the user needing to
+    know anything happened."""
+    from roastnet.index.db import connect
+
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    db_path = tmp_path / "index.sqlite3"
+    _publish(feed_dir, identity, FIXTURES[:1])
+
+    conn = connect(db_path)
+    from roastnet.index.ingest import ingest_feed
+    ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex, is_user_log=True)
+    conn.execute("UPDATE roasts SET title = NULL")  # simulate "indexed by an older version"
+    conn.commit()
+    conn.close()
+
+    ready: asyncio.Future = asyncio.get_event_loop().create_future()
+    task = asyncio.create_task(net.serve(
+        identity, feed_dir, tmp_path / "peers.json", relay=False,
+        ready_callback=ready.set_result, enable_lan_discovery=False, db_path=db_path,
+    ))
+    try:
+        await asyncio.wait_for(ready, timeout=10)
+
+        refreshed = False
+        for _ in range(50):
+            await asyncio.sleep(0.2)
+            conn = connect(db_path)
+            try:
+                title = conn.execute("SELECT title FROM roasts").fetchone()["title"]
+            finally:
+                conn.close()
+            if title is not None:
+                refreshed = True
+                break
+        assert refreshed, "title was never refreshed on serve() startup"
+    finally:
+        await _stop_server(task)

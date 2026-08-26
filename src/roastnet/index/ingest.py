@@ -109,6 +109,32 @@ def ingest_path(conn: sqlite3.Connection, path: Path, **kwargs) -> list[IngestRe
     return [ingest_file(conn, path, **kwargs)]
 
 
+def refresh_known_sources(conn: sqlite3.Connection) -> list[IngestResult]:
+    """Re-ingest every file this index already knows about, refreshing
+    derived fields (title, roast_type, etc.) from a fresh parse -- for
+    anything indexed by an older version of the parser, whose improvements
+    otherwise never apply to already-known content (see ingest_file's
+    "existing" branch). Unlike `reindex`, this never wipes anything: each
+    row keeps its roast_id, is_user_log (read back from the current row,
+    so a re-ingest can't accidentally erase "my own roasts" tagging), and
+    hidden status (insert_roast preserves that one on its own).
+
+    A source whose raw_path no longer exists on disk (a peer's feed entry
+    that's been pruned away, e.g.) is skipped rather than reported as an
+    error -- that's an expected, harmless state, not a problem to surface.
+    """
+    results = []
+    for row in repo.find_all_sources(conn):
+        path = Path(row["raw_path"])
+        if not path.is_file():
+            continue
+        results.append(ingest_file(
+            conn, path, source_type=row["source_type"], source_ref=row["source_ref"],
+            is_user_log=bool(row["is_user_log"]),
+        ))
+    return results
+
+
 def ingest_feed(
     conn: sqlite3.Connection,
     feed_dir: Path,

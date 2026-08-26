@@ -57,3 +57,13 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(schema_sql)
     _apply_added_columns(conn)
     conn.commit()
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM index_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()

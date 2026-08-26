@@ -191,6 +191,35 @@ async def _auto_sync_discovered_peer(
             conn.close()
 
 
+async def _refresh_index_if_needed(db_path: Path) -> None:
+    """A one-shot, version-gated refresh of everything the index already
+    knows about, run once at the start of every `serve()` -- see
+    cli.py's `refresh` command for the full reasoning. Runs in a thread
+    (it's synchronous DB/file work) so it never blocks the endpoint from
+    binding or peers from connecting while it runs; on a large corpus
+    that could take a moment, but it's a no-op after the first run for a
+    given version, since index_meta records that it already happened."""
+    import roastnet
+    from roastnet.index.db import get_meta, set_meta
+    from roastnet.index.ingest import refresh_known_sources
+
+    def _work() -> None:
+        conn = connect(db_path)
+        try:
+            current = roastnet.__version__
+            if get_meta(conn, "refreshed_by_version") == current:
+                return
+            print(f"refresh: updating search index for v{current}...", flush=True)
+            results = refresh_known_sources(conn)
+            refreshed = sum(1 for r in results if r.error is None)
+            print(f"refresh: refreshed {refreshed} roast(s) for v{current}", flush=True)
+            set_meta(conn, "refreshed_by_version", current)
+        finally:
+            conn.close()
+
+    await asyncio.to_thread(_work)
+
+
 async def _watch_publish_loop(
     feed_dir: Path, identity: Identity, watch_dir: Path, interval_s: float, db_path: Path | None,
 ) -> None:
@@ -251,6 +280,14 @@ async def serve(
     automatically appended to this feed (watch_folder.publish_new_files) --
     "sharing" a roast becomes "drop the file in the folder", no publish
     command needed, for as long as this node is serving.
+
+    If `db_path` is given, this also runs a one-time, version-gated
+    refresh of every already-known roast's derived fields on startup (see
+    cli.py's `refresh` command) -- so updating roastnet and reopening it
+    is enough to fix entries that look stale (an old roast_type, a
+    missing title) because they were indexed by an older version, without
+    a manual reindex and without losing hidden status or "my own roasts"
+    tagging the way wiping the database would.
     """
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
     ticket = str(iroh.EndpointTicket.from_addr(ep.addr()))
@@ -268,6 +305,9 @@ async def serve(
     resolved_peer_feeds_root = peer_feeds_root or default_peer_feeds_root()
 
     background_tasks: list[asyncio.Task] = []
+    if db_path is not None:
+        background_tasks.append(asyncio.create_task(_refresh_index_if_needed(db_path)))
+
     if enable_lan_discovery:
         async def _on_lan_discovered(peer_pubkey_hex: str, peer_ticket: str) -> None:
             await _auto_sync_discovered_peer(
