@@ -49,7 +49,7 @@ async def _start_fake_dht(peers_to_report: list[tuple[str, int]]) -> tuple[async
     return transport, port
 
 
-async def test_two_nodes_find_each_other_via_a_fake_dht_and_exchange_hellos() -> None:
+async def test_two_nodes_find_each_other_via_a_fake_dht_and_exchange_hellos(tmp_path) -> None:
     # Node B's fake DHT tells it about node A's real WAN-discovery port,
     # and vice versa -- exactly what the real public DHT would do once both
     # sides have announced, just without waiting on it.
@@ -70,10 +70,12 @@ async def test_two_nodes_find_each_other_via_a_fake_dht_and_exchange_hellos() ->
     task_a = asyncio.create_task(run_wan_discovery(
         "aa" * 32, "ticket-a", on_a, port=port_a, lookup_interval_s=0.2, hello_resync_s=1.0,
         bootstrap_nodes=[("127.0.0.1", fake_port_for_a)],
+        node_cache_path=tmp_path / "nodes_a.json",
     ))
     task_b = asyncio.create_task(run_wan_discovery(
         "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=0.2, hello_resync_s=1.0,
         bootstrap_nodes=[("127.0.0.1", fake_port_for_b)],
+        node_cache_path=tmp_path / "nodes_b.json",
     ))
     try:
         for _ in range(50):
@@ -94,7 +96,7 @@ async def test_two_nodes_find_each_other_via_a_fake_dht_and_exchange_hellos() ->
         fake_dht_for_b.close()
 
 
-async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the_sender() -> None:
+async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the_sender(tmp_path) -> None:
     # Node B's fake DHT knows about A, but A's fake DHT reports nobody --
     # A still finds out about B once B's hello arrives, because B's hello
     # handler immediately hellos back to the sender's actual address.
@@ -114,10 +116,12 @@ async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the
     task_a = asyncio.create_task(run_wan_discovery(
         "aa" * 32, "ticket-a", on_a, port=port_a, lookup_interval_s=0.2, hello_resync_s=1.0,
         bootstrap_nodes=[("127.0.0.1", fake_port_for_a)],
+        node_cache_path=tmp_path / "nodes_a.json",
     ))
     task_b = asyncio.create_task(run_wan_discovery(
         "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=0.2, hello_resync_s=1.0,
         bootstrap_nodes=[("127.0.0.1", fake_port_for_b)],
+        node_cache_path=tmp_path / "nodes_b.json",
     ))
     try:
         for _ in range(50):

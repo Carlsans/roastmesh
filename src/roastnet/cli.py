@@ -386,6 +386,10 @@ def node() -> None:
               help="Find other roastnet nodes over the whole internet, via the public "
                    "BitTorrent DHT (opt-in: unlike LAN discovery, this makes your public "
                    "IP address visible to anyone else looking at the same DHT swarm).")
+@click.option("--wan-port", default=None, type=int,
+              help="UDP port for internet-wide discovery (default: 41890). Only needs "
+                   "changing to run two nodes on one machine, or if something else "
+                   "already holds that port.")
 @click.option("--publish-watch-dir", default=None, type=click.Path(path_type=Path),
               help="Folder to auto-publish any .alog files dropped into it "
                    "(default: ~/RoastNetShare).")
@@ -395,7 +399,7 @@ def node() -> None:
 def node_serve(
     ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
     no_relay: bool, no_lan_discovery: bool, wan_discovery: bool,
-    publish_watch_dir: Path | None, no_publish_watch: bool,
+    wan_port: int | None, publish_watch_dir: Path | None, no_publish_watch: bool,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
@@ -420,7 +424,90 @@ def node_serve(
         ident, feed_dir, peers_file, relay=not no_relay,
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
         enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
+        **({"wan_discovery_port": wan_port} if wan_port else {}),
     ))
+
+
+@node.command("doctor")
+@click.option("--announce/--no-announce", default=False, show_default=True,
+              help="Also publish this node to the DHT swarm while diagnosing.")
+def node_doctor(announce: bool) -> None:
+    """Diagnose internet-wide (DHT) peer discovery, step by step.
+
+    Internet discovery is the one part of roastnet that can fail completely
+    while looking like it is running: the lookup happens in a background task,
+    a failed round leaves no trace, and "no peers" is indistinguishable from
+    "announced into the void". This prints what actually happened -- which
+    bootstrap routers answered, how close to the swarm the lookup converged,
+    how many nodes accepted the announcement -- so a report of "it doesn't
+    work" comes with evidence instead of a shrug.
+    """
+    import hashlib
+
+    from roastnet.dht import DhtClient, LookupStats, load_node_cache, save_node_cache
+    from roastnet.wan_discovery import (
+        DEFAULT_DHT_BOOTSTRAP,
+        SWARM_INFO_HASH,
+        _resolve,
+        default_node_cache_path,
+    )
+
+    async def run() -> None:
+        ident, _created = load_or_create_identity()
+        click.echo(f"this node: {ident.public_key_hex}")
+
+        cache_path = default_node_cache_path()
+        cache = load_node_cache(cache_path)
+        click.echo(f"node cache: {len(cache)} known-live DHT node(s) at {cache_path}")
+
+        click.echo("\nbootstrap routers:")
+        resolved = await _resolve(DEFAULT_DHT_BOOTSTRAP)
+        resolved_set = set(resolved)
+        client = await DhtClient.bind(port=0, own_id=hashlib.sha1(bytes.fromhex(ident.public_key_hex)).digest())
+        try:
+            reachable = 0
+            for (host, port), addr in zip(DEFAULT_DHT_BOOTSTRAP, resolved):
+                if addr not in resolved_set:
+                    continue
+                reply = await client.ping(addr, timeout=4.0)
+                click.echo(f"  {host:26} {addr[0]:>15}  {'ok' if reply else 'no reply'}")
+                reachable += 1 if reply else 0
+            unresolved = len(DEFAULT_DHT_BOOTSTRAP) - len(resolved)
+            if unresolved:
+                click.echo(f"  ({unresolved} did not resolve)")
+            if not reachable and not cache:
+                click.echo("\nno bootstrap router answered and no cached nodes -- "
+                           "the DHT is unreachable from this network.")
+                return
+
+            click.echo("\nswarm lookup:")
+            seeds = list(dict.fromkeys([*resolved, *cache]))
+            stats = LookupStats()
+            peers = await client.discover_and_announce_peers(
+                SWARM_INFO_HASH, seeds, seed_ids=dict(cache), announce=announce, stats=stats,
+            )
+            cache.update(dict(stats.live_nodes))
+            save_node_cache(cache_path, cache)
+
+            click.echo(f"  {stats.summary()}")
+            if stats.closest_bits is not None and stats.closest_bits > 140:
+                click.echo("  WARNING: the lookup never got near the swarm -- it is not converging.")
+            if announce and stats.announced == 0:
+                click.echo("  WARNING: no node accepted the announcement, so nobody can find this node.")
+            if peers:
+                click.echo(f"\n  {len(peers)} address(es) advertised on the roastnet swarm:")
+                for addr in sorted(peers):
+                    click.echo(f"    {addr[0]}:{addr[1]}")
+                click.echo("  (some may be unrelated DHT spam; each still has to pass the "
+                           "roastnet handshake before it counts as a peer)")
+            else:
+                click.echo("\n  no roastnet peers currently advertised. If another node is "
+                           "serving with --wan-discovery right now, re-run in a minute -- "
+                           "announcements take a round to propagate.")
+        finally:
+            client.close()
+
+    asyncio.run(run())
 
 
 @main.group()

@@ -38,20 +38,33 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 
-from roastnet.dht import Addr, DhtClient
+from roastnet.dht import Addr, DhtClient, LookupStats, load_node_cache, save_node_cache
 from roastnet.hello import decode_hello, encode_hello
 
 WAN_PORT = 41890
 DHT_LOOKUP_INTERVAL_S = 120.0
-HELLO_RESYNC_S = 300.0  # minimum time between (re-)helloing the same address/peer
+HELLO_RESYNC_S = 60.0  # minimum time between (re-)helloing the same address/peer
+HELLO_RETRIES = (0.0, 2.0, 6.0)  # see _hello_with_retries
 
 SWARM_INFO_HASH = hashlib.sha1(b"roastnet-swarm-v1").digest()
 
+# Measured live, not copied from a tutorial: of the traditionally-cited
+# routers, only transmissionbt and libtorrent still answer. BitTorrent Inc's
+# `router.bittorrent.com` and `router.utorrent.com` resolve but never reply,
+# and `router.bitcomet.com` no longer resolves at all. They are kept (last,
+# cheap when dead) only in case they come back; the two live ones plus the
+# persisted node cache are what actually bootstrap a lookup.
 DEFAULT_DHT_BOOTSTRAP: list[Addr] = [
-    ("router.bittorrent.com", 6881),
     ("dht.transmissionbt.com", 6881),
+    ("dht.libtorrent.org", 25401),
+    ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
 ]
+
+
+def default_node_cache_path():
+    from pathlib import Path
+    return Path.home() / ".local" / "share" / "roastnet" / "dht_nodes.json"
 
 
 async def _resolve(bootstrap_nodes: list[Addr]) -> list[Addr]:
@@ -80,6 +93,8 @@ async def run_wan_discovery(
     hello_resync_s: float = HELLO_RESYNC_S,
     bootstrap_nodes: list[Addr] | None = None,
     info_hash: bytes = SWARM_INFO_HASH,
+    node_cache_path=None,
+    on_round: Callable[[object], None] | None = None,
 ) -> None:
     """Announce on the public DHT and react to other roastnet nodes found
     there, until cancelled. `on_peer_discovered(pubkey, ticket)` is
@@ -88,20 +103,60 @@ async def run_wan_discovery(
 
     `bootstrap_nodes`/`port`/interval params are overridable so tests can
     point this at a fake in-process DHT instead of the real public one.
+    `on_round` receives each round's LookupStats (used by the logs and by
+    `roastnet net doctor`) -- without it a failing round is invisible.
     """
     bootstrap_nodes = bootstrap_nodes if bootstrap_nodes is not None else DEFAULT_DHT_BOOTSTRAP
+    cache_path = node_cache_path if node_cache_path is not None else default_node_cache_path()
     own_id = hashlib.sha1(bytes.fromhex(own_pubkey_hex)).digest()
     client = await DhtClient.bind(port=port, own_id=own_id)
+    node_cache = load_node_cache(cache_path)
 
     last_helloed: dict[Addr, float] = {}
     last_seen_pubkey: dict[str, float] = {}
 
-    def _maybe_hello(addr: Addr) -> None:
+    def _maybe_hello(addr: Addr, *, retry: bool = True) -> None:
         now = time.monotonic()
         if now - last_helloed.get(addr, 0.0) < hello_resync_s:
             return
         last_helloed[addr] = now
-        client.send_datagram(encode_hello(own_pubkey_hex, own_ticket), addr)
+        if retry:
+            asyncio.create_task(_hello_with_retries(addr))
+            return
+        try:
+            client.send_datagram(encode_hello(own_pubkey_hex, own_ticket), addr)
+        except OSError:
+            pass
+
+    async def _hello_with_retries(addr: Addr) -> None:
+        """Send the first hello more than once.
+
+        The rendezvous datagram goes to an address this node has never
+        contacted, so a restricted-cone NAT drops it until the peer's own
+        outbound hello opens the pinhole -- which is precisely why both sides
+        sending, repeatedly, is what makes the punch land. Previously a single
+        lost packet meant five minutes of silence, because the send was
+        recorded before it was even attempted.
+
+        Retries stop the moment that address answers. Only *unsolicited* first
+        contact retries: a reply is sent once (see `retry=False` below),
+        because a peer we just heard from has demonstrably got a path to us,
+        and answering a retransmission with another retransmission turns one
+        lost packet into an exponential hello storm -- which it did, firing
+        five duplicate discoveries (and so five redundant syncs) for a single
+        peer before this was split apart."""
+        payload = encode_hello(own_pubkey_hex, own_ticket)
+        for delay in HELLO_RETRIES:
+            if delay:
+                await asyncio.sleep(delay)
+            if addr in _acked:
+                return
+            try:
+                client.send_datagram(payload, addr)
+            except OSError:
+                return
+
+    _acked: set[Addr] = set()
 
     def _on_foreign(data: bytes, addr) -> None:
         decoded = decode_hello(data)
@@ -110,11 +165,12 @@ async def run_wan_discovery(
         pubkey, ticket = decoded
         if pubkey == own_pubkey_hex:
             return
+        _acked.add(addr)  # heard from them -- no need to keep retransmitting
         # Reciprocate immediately: whoever reached us first might not yet
         # know about us (their own DHT lookup may not have found our
         # address yet even though theirs found ours) -- a direct hello
         # back closes the loop without waiting for their next lookup round.
-        _maybe_hello(addr)
+        _maybe_hello(addr, retry=False)
         now = time.monotonic()
         if now - last_seen_pubkey.get(pubkey, 0.0) < hello_resync_s:
             return
@@ -125,11 +181,24 @@ async def run_wan_discovery(
 
     try:
         while True:
+            stats = LookupStats()
             try:
                 resolved = await _resolve(bootstrap_nodes)
-                addrs = await client.discover_and_announce_peers(info_hash, resolved) if resolved else set()
-            except Exception:  # noqa: BLE001 -- a bad DHT round shouldn't kill serve()
+                seeds = list(dict.fromkeys([*resolved, *node_cache]))
+                addrs = await client.discover_and_announce_peers(
+                    info_hash, seeds, seed_ids=dict(node_cache), stats=stats,
+                ) if seeds else set()
+            except Exception as exc:  # noqa: BLE001 -- a bad DHT round shouldn't kill serve()
+                # Previously swallowed silently, which is how a permanently
+                # broken feature stayed invisible through several releases.
+                print(f"wan: DHT round failed: {exc!r}", flush=True)
                 addrs = set()
+            else:
+                node_cache.update(dict(stats.live_nodes))
+                save_node_cache(cache_path, node_cache)
+                print(f"wan: {stats.summary()}", flush=True)
+            if on_round is not None:
+                on_round(stats)
             for addr in addrs:
                 _maybe_hello(addr)
             await asyncio.sleep(lookup_interval_s)

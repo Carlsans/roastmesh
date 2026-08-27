@@ -374,7 +374,21 @@ async def sync_with_peer(
     addr = ticket.endpoint_addr()
     ep = await bind_endpoint(identity, relay=relay)
     try:
-        conn = await ep.connect(addr, ALPN)
+        try:
+            conn = await ep.connect(addr, ALPN)
+        except Exception:
+            # A ticket pins the addresses a peer had when it minted the ticket,
+            # and those go stale on its next restart or IP change -- but its
+            # identity never does. `preset_n0` (bind_endpoint) publishes every
+            # endpoint's current address to iroh's discovery service keyed by
+            # that identity, so a node id alone is enough to find it again.
+            # Verified end to end: dialling with relay_url=None and no direct
+            # addresses connected in ~2s and completed a real feed exchange.
+            # This is what makes a peer, once discovered, stay reachable.
+            peer_id = addr.id()
+            if not str(peer_id):
+                raise
+            conn = await ep.connect(iroh.EndpointAddr(peer_id, None, []), ALPN)
         peer_pubkey_hex = str(conn.remote_id())
 
         mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex

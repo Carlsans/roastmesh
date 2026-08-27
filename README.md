@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (on by default in the GUI, opt-in from the CLI) over the whole internet
 via the public BitTorrent DHT, no tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 261 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 278 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -170,10 +170,22 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
   one fixed made-up identifier shared by every roastnet node everywhere, the same way every user
   of one specific torrent is a peer of every other user of that torrent. No tracker or bootstrap
   server of roastnet's own to run or configure; it piggybacks entirely on infrastructure that
-  already exists (bootstrapped via the same well-known routers real BitTorrent clients use:
-  `router.bittorrent.com` and a couple of others). Once found, a peer goes through exactly the
-  same handshake, signature verification, and quota checks as a LAN-discovered or manually-pasted
-  one — discovery only ever produces a "try this address," never trust.
+  already exists, entering the network through the same well-known routers real BitTorrent
+  clients use. Once found, a peer goes through exactly the same handshake, signature
+  verification, and quota checks as a LAN-discovered or manually-pasted one — discovery only ever
+  produces a "try this address," never trust.
+
+  Finding the swarm is an *iterative* lookup: peers for an identifier are held only by the
+  handful of DHT nodes numerically closest to it, so each round asks the closest nodes known so
+  far and repeats until it can get no closer, then publishes to exactly those. Nodes that answer
+  are remembered in `~/.local/share/roastnet/dht_nodes.json`, which matters more than it sounds —
+  most of the historically-cited bootstrap routers no longer answer at all, so after the first
+  successful round a node stops depending on them. Expect the first lookup after a fresh install
+  to be the weakest one.
+
+  **If it isn't working, ask it why**: `roastnet node doctor` reports which routers answered, how
+  close the lookup got, and how many nodes accepted the announcement, instead of leaving you to
+  guess.
 
   **The trade-off, worth knowing**: a LAN broadcast never leaves your local network, but
   announcing on the public DHT makes your node's public IP address (and the fact that it's
@@ -183,11 +195,18 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
   defaults off, since a script's behavior shouldn't change based on this without being asked
   explicitly for it.
 
-  Like the LAN case, this needs a UDP path in and out — some strict NATs (rare for typical home
-  routers, more common on some mobile/corporate networks) won't let the initial handshake through
-  either direction; a node behind one of those just won't be found this way, but LAN discovery,
-  manual tickets, and Iroh's own relay/hole-punch fallback (for the connection itself, once a
-  ticket's in hand) are all unaffected.
+  **The honest limitation**: the introduction packet has to arrive from a peer your router has
+  never seen you contact, so it depends on your NAT's filtering. Typical home routers let it
+  through, especially since both sides send at once (that simultaneous exchange is what opens the
+  path). Symmetric NAT and carrier-grade NAT — common on mobile tethering and some corporate and
+  ISP networks — will not, and no amount of DHT correctness changes that. A node behind one of
+  those simply won't be met this way.
+
+  That limit is one-time rather than permanent, though: it only affects the *introduction*. Once
+  two nodes have met by any route — internet discovery, the LAN, or a pasted ticket — each
+  remembers the other's public key, which never changes, and Iroh can re-establish the connection
+  from the key alone (through its relays and hole-punching) even after both machines have
+  restarted on new addresses. Meeting once is the hard part; staying in touch isn't.
 
 ## Usage (command line)
 
@@ -336,6 +355,21 @@ pytest -v
 
 Some GUI tests need a display; they auto-skip if none is available (`$DISPLAY` unset and no
 `Xvfb` installed) rather than failing.
+
+**Proving internet discovery actually works** — one test publishes a random identifier to the
+real public BitTorrent DHT and then requires a second, independent lookup to find it. That is the
+end-to-end claim, checked against other people's BEP 5 implementations rather than a mock, so it
+is the thing to run when internet sharing is suspect:
+
+```bash
+ROASTNET_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
+```
+
+It's opt-in because it takes ~80 seconds and shares the public DHT's per-IP rate limits with
+anything else on the machine (including this suite's own GUI tests, which start real serving
+nodes) — run back-to-back with those it can fail for reasons unrelated to the code. The
+equivalent property is covered offline and in a second by `tests/test_kademlia.py`, which runs a
+real in-process DHT swarm, including a check that the *previous*, broken lookup fails it.
 
 ## Known limitations
 

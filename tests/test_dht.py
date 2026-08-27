@@ -6,6 +6,7 @@ there's no route to it, so the suite still passes fully offline.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import socket
 
 import pytest
@@ -70,13 +71,26 @@ def _real_dht_reachable() -> bool:
         sock.close()
 
 
-pytestmark_network = pytest.mark.skipif(
-    not _real_dht_reachable(), reason="no route to the public BitTorrent DHT from here",
-)
+_reachable_cache: list[bool] = []
 
 
-@pytestmark_network
-async def test_ping_the_real_public_dht() -> None:
+@pytest.fixture
+def real_dht() -> None:
+    """Skip unless the public DHT is actually reachable, probed lazily and at
+    most once per session.
+
+    A `skipif(...)` mark would evaluate its condition at *import* time, which
+    is what this used to do: every `pytest` run of this repo -- including fully
+    offline ones, and ones touching no networking at all -- fired a UDP packet
+    at the public internet during collection and could stall for seconds before
+    the first test ran."""
+    if not _reachable_cache:
+        _reachable_cache.append(_real_dht_reachable())
+    if not _reachable_cache[0]:
+        pytest.skip("no route to the public BitTorrent DHT from here")
+
+
+async def test_ping_the_real_public_dht(real_dht) -> None:
     client = await DhtClient.bind(port=0, own_id=b"q" * 20)
     try:
         ip = socket.gethostbyname("dht.transmissionbt.com")
@@ -87,8 +101,7 @@ async def test_ping_the_real_public_dht() -> None:
         client.close()
 
 
-@pytestmark_network
-async def test_get_peers_against_the_real_public_dht_for_a_made_up_infohash() -> None:
+async def test_get_peers_against_the_real_public_dht_for_a_made_up_infohash(real_dht) -> None:
     # Nobody is announcing this exact info-hash, so this just proves the
     # request/response/token/nodes-parsing path works end to end against a
     # real, independent implementation of the protocol -- not that any
@@ -106,3 +119,82 @@ async def test_get_peers_against_the_real_public_dht_for_a_made_up_infohash() ->
         assert b"nodes" in reply or b"values" in reply
     finally:
         client.close()
+
+
+@pytest.fixture
+def live_dht_optin(real_dht) -> None:
+    """Opt-in via `ROASTNET_LIVE_DHT=1`, because this one is different in kind
+    from the rest of the suite.
+
+    It takes ~100 seconds, and it competes for the same per-IP rate limits as
+    everything else on the machine -- including this suite's own GUI tests,
+    which start real `node serve --wan-discovery` processes. Run right after
+    those, the public DHT throttles us and the test fails for reasons that have
+    nothing to do with the code. Left on by default it would be exactly the
+    kind of test people learn to ignore, which is how the original bug survived
+    in the first place. So: explicit, and documented as the way to *prove*
+    internet discovery works.
+
+        ROASTNET_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
+    """
+    import os
+
+    if os.environ.get("ROASTNET_LIVE_DHT") != "1":
+        pytest.skip("set ROASTNET_LIVE_DHT=1 to run the live announce/lookup round trip")
+
+
+async def test_announce_then_find_it_again_on_the_real_public_dht(live_dht_optin) -> None:
+    """The decisive test, and the one whose absence let broken internet
+    discovery ship: announce a random info-hash, then look it up from a
+    *separate* socket and require the announced address to come back.
+
+    This is what "internet discovery works" actually means, and it is checked
+    against real third-party BEP 5 implementations rather than a fixture of our
+    own design. It is deliberately strict about *which* address it accepts --
+    public DHT nodes return sybil/spam `values` for arbitrary info-hashes
+    (observed: three unrelated IPs all carrying the querying socket's own port),
+    so merely asserting "some peers came back" passes while discovery is
+    completely broken. A random info-hash keeps runs from colliding.
+    """
+    import os
+
+    from roastnet.dht import LookupStats
+    from roastnet.wan_discovery import DEFAULT_DHT_BOOTSTRAP, _resolve
+
+    info_hash = hashlib.sha1(os.urandom(20)).digest()
+    cache: dict = {}
+
+    async def run(client: DhtClient, *, announce: bool) -> tuple[set, LookupStats]:
+        seeds = list(dict.fromkeys([*(await _resolve(DEFAULT_DHT_BOOTSTRAP)), *cache]))
+        stats = LookupStats()
+        peers = await client.discover_and_announce_peers(
+            info_hash, seeds, seed_ids=dict(cache), announce=announce, stats=stats,
+        )
+        cache.update(dict(stats.live_nodes))  # warm the next lookup, as serve() does
+        return peers, stats
+
+    announcer = await DhtClient.bind(port=0, own_id=hashlib.sha1(b"announcer").digest())
+    seeker = await DhtClient.bind(port=0, own_id=hashlib.sha1(b"seeker").digest())
+    try:
+        _peers, first = await run(announcer, announce=True)
+        if first.replied == 0:
+            pytest.skip("public DHT did not answer at all right now")
+        # Twice: the first pass mostly serves to warm the node cache, so the
+        # second starts near the target instead of at a distant router.
+        _peers, announced_stats = await run(announcer, announce=True)
+        if announced_stats.announced == 0:
+            pytest.skip("no storing node accepted an announce right now")
+
+        found, seek_stats = await run(seeker, announce=False)
+        my_ip = socket.gethostbyname(socket.gethostname())
+        announced_port = announcer._transport.get_extra_info("sockname")[1]
+        mine = [addr for addr in found if addr[1] == announced_port and addr[0] != my_ip]
+        assert mine, (
+            "announce was not retrievable by an independent lookup.\n"
+            f"  announce: {announced_stats.summary()}\n"
+            f"  lookup:   {seek_stats.summary()}\n"
+            f"  returned: {sorted(found)} (entries not on port {announced_port} are DHT spam)"
+        )
+    finally:
+        announcer.close()
+        seeker.close()

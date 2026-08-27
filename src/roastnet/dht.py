@@ -1,7 +1,9 @@
 """A minimal BitTorrent Mainline DHT (BEP 5) client -- just enough to
 `get_peers`/`announce_peer` against the real, already-running, public
-BitTorrent DHT (bootstrapped via the same well-known routers real
-BitTorrent clients use: router.bittorrent.com and friends).
+BitTorrent DHT (entered via the same well-known routers real BitTorrent
+clients use -- though of the traditionally-cited ones only
+dht.transmissionbt.com and dht.libtorrent.org still answer; see
+wan_discovery.DEFAULT_DHT_BOOTSTRAP).
 
 Why piggyback on BitTorrent's DHT rather than run our own: it already
 exists, is already huge and reliable, and needs zero infrastructure of
@@ -15,8 +17,11 @@ instead of file discovery -- confirmed working against the real public DHT
 own dev sandbox during development).
 
 Deliberately NOT a full DHT node: we only ever originate get_peers/
-announce_peer/find_node queries (never route other people's lookups, never
-maintain a persistent routing table/k-buckets). We do answer incoming
+announce_peer/find_node queries, and never route other people's lookups.
+What we do keep is a flat cache of nodes that answered (`load_node_cache`),
+not real k-buckets -- enough to start the next lookup near the target
+instead of at a bootstrap router, which matters because most of the
+well-known routers are dead or rate-limited. We do answer incoming
 `ping`, both because it's trivial and because it makes us a slightly
 better-behaved participant in someone else's routing table. Anything else
 addressed to us is silently ignored -- acceptable for a lightweight client
@@ -33,11 +38,100 @@ go through.
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import struct
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 
 Addr = tuple[str, int]
+
+# Kademlia parameters. `K` is the replication factor: a value announced for a
+# target is stored on the K nodes whose IDs are XOR-closest to it, so a lookup
+# that does not reach those K nodes finds nothing, no matter how many other
+# nodes it asks. `ALPHA` is how many queries are kept in flight per round.
+# Both are the values BEP 5 / the Kademlia paper specify.
+K = 8
+# Kademlia's paper value for ALPHA is 3. We use more because a large share of
+# public DHT nodes simply never answer (measured live: 25/34 was a *good*
+# round, and cold lookups routinely see half the batch time out), and a round
+# spent on three dead nodes is a wasted round. Widening the batch is what makes
+# convergence reliable rather than luck-of-the-draw.
+ALPHA = 6
+MAX_ROUNDS = 24
+
+_UNREACHABLY_FAR = 1 << 200  # sorts after any real 160-bit XOR distance
+
+
+def load_node_cache(path) -> dict[Addr, bytes]:
+    """Live DHT nodes learned by previous lookups, as {(ip, port): node_id}.
+
+    Not an optimisation -- a correctness requirement. Only two of the
+    well-known bootstrap routers still answer at all (measured: BitTorrent
+    Inc's `router.bittorrent.com` and `router.utorrent.com` resolve but never
+    reply), and the survivors rate-limit per source IP, so two cold lookups
+    run back to back from one machine can leave the second with almost no
+    seeds. Reproduced exactly that: a lookup starved to 4 queried nodes and
+    stopped 2^158 from the target. Warm nodes make a lookup independent of
+    whether a router feels like answering today."""
+    try:
+        raw = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cache: dict[Addr, bytes] = {}
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            node_id = bytes.fromhex(item["id"])
+            if len(node_id) == 20:
+                cache[(str(item["ip"]), int(item["port"]))] = node_id
+        except (KeyError, TypeError, ValueError):
+            continue
+    return cache
+
+
+def save_node_cache(path, nodes: dict[Addr, bytes], *, limit: int = 400) -> None:
+    """Best-effort persist; never raises into the discovery loop."""
+    items = [{"ip": ip, "port": port, "id": node_id.hex()}
+             for (ip, port), node_id in list(nodes.items())[:limit]]
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(items))
+    except OSError:
+        pass
+
+
+def distance(a: bytes, b: bytes) -> int:
+    """Kademlia's XOR metric over two 20-byte IDs. This is the whole basis of
+    the DHT: "closer" means smaller XOR, and a target's values live on the
+    nodes closest to it by this measure -- not on whichever nodes happen to
+    answer first."""
+    return int.from_bytes(a, "big") ^ int.from_bytes(b, "big")
+
+
+@dataclass
+class LookupStats:
+    """Why a lookup did or didn't find anything -- surfaced by
+    `roastnet net doctor` and the discovery logs. Without this the failure
+    mode is invisible: an announce that reaches no storing node and a lookup
+    that converges nowhere both just look like "0 peers"."""
+
+    rounds: int = 0
+    queried: int = 0
+    replied: int = 0
+    announced: int = 0
+    no_token: int = 0
+    peers_found: int = 0
+    closest_bits: int | None = None  # log2 of the closest XOR distance reached
+    seeds_used: int = 0
+    live_nodes: list[tuple[Addr, bytes]] = field(default_factory=list)
+
+    def summary(self) -> str:
+        closest = "none" if self.closest_bits is None else f"2^{self.closest_bits}"
+        return (f"{self.rounds} rounds, {self.replied}/{self.queried} replied, "
+                f"closest {closest}, announced to {self.announced} "
+                f"({self.no_token} gave no token), {self.peers_found} peer(s)")
 
 
 def bencode(obj) -> bytes:
@@ -229,42 +323,123 @@ class DhtClient:
 
     async def discover_and_announce_peers(
         self, info_hash: bytes, bootstrap_nodes: list[Addr], *,
-        max_extra_hops: int = 16, timeout: float = 4.0,
+        k: int = K, alpha: int = ALPHA, max_rounds: int = MAX_ROUNDS,
+        timeout: float = 4.0, announce: bool = True,
+        seed_ids: dict[Addr, bytes] | None = None,
+        stats: LookupStats | None = None,
     ) -> set[Addr]:
-        """Shallow iterative lookup: query the bootstrap routers directly,
-        follow up to `max_extra_hops` of the closer nodes they point back
-        at, and announce ourselves (using each node's own token, as BEP 5
-        requires) to every node that actually answered. Not a full
-        Kademlia walk -- for a swarm the size roastnet's likely to have,
-        the fixed bootstrap routers plus one hop out reach enough of the
-        DHT to be useful, without the bookkeeping of a persistent routing
-        table."""
-        found: set[Addr] = set()
+        """A real iterative Kademlia lookup: repeatedly query the closest
+        not-yet-queried nodes we know of until nothing unqueried can beat the
+        `k` closest that answered, then announce to exactly those `k`.
+
+        This has to converge, and the reason is the whole point of the DHT:
+        BEP 5 stores a target's peers *only* on the k nodes XOR-closest to
+        it. Bootstrap routers are ~2^159 away from any given target (and
+        two of the three well-known ones no longer answer at all), so a
+        lookup that stops one hop from them queries nodes that hold nothing
+        and announces to nodes nobody will ever ask -- which is exactly the
+        bug this replaces. Reaching the right neighbourhood takes on the
+        order of log(network size) distance-sorted rounds, not one.
+
+        Set `announce=False` for a read-only lookup (used by the live
+        round-trip test, and by `net doctor` so diagnosing doesn't publish).
+        """
+        stats = stats if stats is not None else LookupStats()
+        target = int.from_bytes(info_hash, "big")
+
+        # Cached seeds arrive with their IDs already known, so they rank by
+        # real distance from round one -- the walk starts near the target
+        # instead of ~2^159 away at a router.
+        node_ids: dict[Addr, bytes] = dict(seed_ids or {})
+        tokens: dict[Addr, bytes] = {}
         queried: set[Addr] = set()
-        extra_candidates: list[Addr] = []
+        # Nodes that actually answered. Convergence must be judged on these
+        # alone: a cached node's ID is known before it is contacted, so
+        # counting merely-known nodes let a stale cache satisfy the "k closest
+        # have been queried" test on the very first round and abandon the
+        # lookup 2^158 from the target without ever trying a live router.
+        responded: set[Addr] = set()
+        shortlist: set[Addr] = set(bootstrap_nodes) | set(node_ids)
+        found: set[Addr] = set()
+        stats.seeds_used = len(shortlist)
 
-        async def _visit(addr: Addr) -> None:
-            queried.add(addr)
-            resp = await self.get_peers(addr, info_hash, timeout=timeout)
-            if resp is None:
-                return
-            for raw in resp.get(b"values") or []:
-                found.update(decode_compact_peers(raw))
-            nodes_blob = resp.get(b"nodes")
-            if nodes_blob:
-                for _node_id, node_addr in decode_compact_nodes(nodes_blob):
-                    if node_addr not in queried and len(extra_candidates) < max_extra_hops:
-                        extra_candidates.append(node_addr)
-            token = resp.get(b"token")
-            if token is not None:
-                await self.announce_peer(addr, info_hash, token, timeout=timeout)
+        def rank(addr: Addr) -> int:
+            node_id = node_ids.get(addr)
+            # A seed we've never heard from has no ID yet, so no distance --
+            # it still gets queried (round one has nothing else), but it must
+            # never displace a node whose real distance we know.
+            return _UNREACHABLY_FAR if node_id is None else int.from_bytes(node_id, "big") ^ target
 
-        for addr in bootstrap_nodes:
-            if addr not in queried:
-                await _visit(addr)
-        for addr in extra_candidates:
-            if addr not in queried:
-                await _visit(addr)
+        for _round in range(max_rounds):
+            unqueried = [a for a in sorted(shortlist, key=rank) if a not in queried]
+            if not unqueried:
+                break
+            batch = unqueried[:alpha]
+            stats.rounds += 1
+            replies = await asyncio.gather(
+                *(self.get_peers(addr, info_hash, timeout=timeout) for addr in batch),
+                return_exceptions=True,
+            )
+            for addr, resp in zip(batch, replies):
+                queried.add(addr)
+                stats.queried += 1
+                if not isinstance(resp, dict):
+                    continue  # timeout, error reply, or a raised exception
+                stats.replied += 1
+                responded.add(addr)
+                node_id = resp.get(b"id")
+                if isinstance(node_id, bytes) and len(node_id) == 20:
+                    node_ids[addr] = node_id
+                token = resp.get(b"token")
+                if isinstance(token, bytes):
+                    tokens[addr] = token
+                for raw in resp.get(b"values") or []:
+                    found.update(decode_compact_peers(raw))
+                for peer_id, peer_addr in decode_compact_nodes(resp.get(b"nodes") or b""):
+                    node_ids.setdefault(peer_addr, peer_id)
+                    shortlist.add(peer_addr)
+
+            # Textbook Kademlia termination: stop once the k closest nodes we
+            # know of have all been queried. Anything laxer (an "it stopped
+            # improving" heuristic) exits early on a lossy network and leaves
+            # the walk far from the target -- measured at 2^77 and 2^154 on
+            # runs that should have reached ~2^15.
+            # Standard Kademlia termination, judged only on nodes that
+            # answered: stop when nothing still unqueried could beat our k-th
+            # best responder. (Responders are queried by definition, so that
+            # half of the usual phrasing is implicit.)
+            answered = sorted(responded, key=rank)
+            if answered:
+                kth = rank(answered[min(k, len(answered)) - 1])
+                if not any(rank(a) < kth for a in shortlist if a not in queried):
+                    break
+
+        # The k closest are the only nodes worth announcing to, and a token is
+        # only valid from the node that issued it -- so any of the k closest we
+        # haven't actually asked yet must be asked now, or the announce is
+        # skipped for want of a token. (Observed: "7 of 8 gave no token",
+        # because the final round discovered closer nodes it never queried.)
+        # Announce to the k closest nodes that actually *answered*. Ranking
+        # merely-known nodes here was a quiet killer: `nodes` blobs are full of
+        # stale entries, so the k closest known were mostly dead, produced no
+        # token, and the announce silently reached nobody -- measured as
+        # "announced to 0 (7 gave no token)" on a lookup that had otherwise
+        # converged perfectly to 2^38. A token is only obtainable from a node
+        # that replied, so those are the only candidates that were ever real.
+        closest = sorted(responded, key=rank)[:k]
+        if closest:
+            stats.closest_bits = max(rank(closest[0]).bit_length() - 1, 0)
+        stats.live_nodes = [(a, node_ids[a]) for a in closest if a in node_ids]
+
+        if announce:
+            for addr in closest:
+                token = tokens.get(addr)
+                if token is None:
+                    stats.no_token += 1
+                    continue
+                if await self.announce_peer(addr, info_hash, token, timeout=timeout) is not None:
+                    stats.announced += 1
 
         found.discard(("0.0.0.0", 0))
+        stats.peers_found = len(found)
         return found
