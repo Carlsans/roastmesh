@@ -46,6 +46,7 @@ def _report_ingest_results(results) -> None:
 
 
 @click.group()
+@click.version_option(roastnet.__version__, "-V", "--version", prog_name="roastnet")
 @click.option("--db", default=DEFAULT_DB, show_default=True, help="Path to the SQLite index.")
 @click.pass_context
 def main(ctx: click.Context, db: str) -> None:

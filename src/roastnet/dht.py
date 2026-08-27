@@ -404,15 +404,26 @@ class DhtClient:
             # improving" heuristic) exits early on a lossy network and leaves
             # the walk far from the target -- measured at 2^77 and 2^154 on
             # runs that should have reached ~2^15.
-            # Standard Kademlia termination, judged only on nodes that
-            # answered: stop when nothing still unqueried could beat our k-th
-            # best responder. (Responders are queried by definition, so that
-            # half of the usual phrasing is implicit.)
-            answered = sorted(responded, key=rank)
-            if answered:
-                kth = rank(answered[min(k, len(answered)) - 1])
-                if not any(rank(a) < kth for a in shortlist if a not in queried):
-                    break
+            # Standard Kademlia termination -- stop once the k closest nodes
+            # worth considering have all been queried -- with dead nodes
+            # evicted from that set. Both halves are load-bearing, and each
+            # was learned by watching a real lookup fail:
+            #
+            #  * Counting nodes that never answered let a stale cache satisfy
+            #    the test on round one and abandon the walk 2^158 away,
+            #    because the cached entries were closest and all silent.
+            #  * Requiring each round to find something *closer* killed cold
+            #    lookups instantly, because bootstrap routers return nodes
+            #    farther from the target than the routers themselves (measured:
+            #    a router at 2^156 handing back eight nodes at 2^158). Progress
+            #    through the network is not monotonic; you have to walk the
+            #    frontier outward before it turns inward.
+            dead = queried - responded
+            frontier = sorted(
+                (a for a in shortlist if a in node_ids and a not in dead), key=rank,
+            )[:k]
+            if frontier and all(a in queried for a in frontier):
+                break
 
         # The k closest are the only nodes worth announcing to, and a token is
         # only valid from the node that issued it -- so any of the k closest we
