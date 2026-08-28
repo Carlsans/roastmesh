@@ -294,6 +294,23 @@ async def serve(
     tagging the way wiping the database would.
     """
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
+    if relay:
+        # Wait for a home relay before minting the ticket. Immediately after
+        # bind, `ep.addr()` knows only local interfaces -- measured here:
+        #
+        #   t=0s  addrs=[10.17.204.35, 172.17.0.1, ..., 192.168.0.222]   (no relay)
+        #   t=3s  relay=https://use1-1.relay.n0.iroh.link./  addrs=[..., <public ip>]
+        #
+        # Minting at t=0 published a ticket containing nothing but VPN, Docker
+        # and LAN addresses: unroutable from anywhere else, so a peer that
+        # received it over the wire had no path to dial back. That is invisible
+        # locally (same-machine dials succeed on those very addresses) and only
+        # bites real internet peers.
+        try:
+            await asyncio.wait_for(ep.online(), timeout=15)
+        except Exception:  # noqa: BLE001 -- no relay is a degraded state, not a fatal one
+            print("serve: no relay yet; the ticket may only be reachable on this network",
+                  flush=True)
     ticket = str(iroh.EndpointTicket.from_addr(ep.addr()))
     if ready_callback:
         ready_callback(ticket)
