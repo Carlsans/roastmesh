@@ -5,6 +5,8 @@ import shutil
 from pathlib import Path
 
 import iroh
+import sys
+
 import pytest
 
 from roastnet import net
@@ -289,6 +291,11 @@ async def test_sync_quota_allows_more_once_cap_room_frees_up_across_syncs(tmp_pa
         await _stop_server(server_task)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="needs two beacons on one host; Windows does not loop limited broadcasts back "
+           "locally, so LAN discovery between two Windows machines stays unverified here",
+)
 async def test_lan_discovery_auto_syncs_without_a_manual_sync_call(tmp_path: Path) -> None:
     """The actual proof of the feature: two serve() instances with LAN
     discovery on find each other and node B ends up with node A's entries

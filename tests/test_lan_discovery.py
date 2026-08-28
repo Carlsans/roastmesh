@@ -1,5 +1,7 @@
 import asyncio
 
+import sys
+
 import pytest
 
 from roastnet.lan_discovery import run_beacon
@@ -9,6 +11,25 @@ from roastnet.lan_discovery import run_beacon
 TEST_PORT = 41999
 
 
+# Two beacons on one host is a Linux/macOS-only arrangement. There, a
+# 255.255.255.255 broadcast loops back to every other socket bound to that
+# port on the same machine, which is what lets these tests run both sides in
+# one process. Windows does not loop limited broadcasts back to other local
+# sockets, so the beacons never see each other and the exchange these tests
+# assert cannot happen there.
+#
+# Skipped rather than reworked, and the gap stated plainly: this means LAN
+# discovery *between two Windows machines* is *unverified*. It is not known to
+# be broken -- the broadcast does leave the host, and the wire format is
+# platform-independent -- but nothing here proves it works, and the honest
+# place to prove it is two real machines, not a rewritten fixture.
+_needs_broadcast_loopback = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows does not loop limited broadcasts back to other sockets on the same host",
+)
+
+
+@_needs_broadcast_loopback
 async def test_two_beacons_discover_each_other() -> None:
     discovered_by_a: list[tuple[str, str]] = []
     discovered_by_b: list[tuple[str, str]] = []
