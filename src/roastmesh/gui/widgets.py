@@ -9,6 +9,7 @@ in roastlab's GUI produces tabular output, so it had no equivalent.
 from __future__ import annotations
 
 import os
+import sys
 import tkinter as tk
 from collections.abc import Callable
 from tkinter import ttk
@@ -131,6 +132,28 @@ def screen_geometry(widget: tk.Widget, width_px: int, height_px: int) -> str:
     max_w = int(widget.winfo_screenwidth() * 0.9)
     max_h = int(widget.winfo_screenheight() * 0.9)
     return f"{min(sp(width_px), max_w)}x{min(sp(height_px), max_h)}"
+
+
+def maximize(window) -> bool:
+    """Open `window` maximized on Windows. Returns whether it took effect.
+
+    Windows only, deliberately. Tk's "zoomed" state is well defined there,
+    whereas on Linux it depends on the window manager -- several ignore it,
+    some report success and do nothing -- and the sized-and-centred default
+    is what the X11 side has been used and tuned against all along. Changing
+    that for everyone to fix Windows would be trading a known-good behaviour
+    for an untested one.
+
+    Never fatal: a window that opens at its normal size is a cosmetic
+    disappointment, not a reason to fail to start.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        window.state("zoomed")
+        return True
+    except tk.TclError:
+        return False
 
 
 def heading(parent: tk.Widget, text: str, sub: str = "") -> ttk.Frame:

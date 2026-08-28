@@ -116,62 +116,68 @@ print("OK")
     assert "UI_SCALE 2.0" in r.stdout, r.stdout
 
 
-def test_relaunch_with_scale_persists_and_restarts_with_the_new_scale(tmp_path: Path) -> None:
-    # Exercises the real os.execv self-relaunch in RoastmeshApp._relaunch_with_scale
-    # end to end: not just that it writes the right config, but that the
-    # actual re-exec completes and the app comes back up with the new
-    # scale applied. This depends on single_instance's listening socket
-    # NOT surviving execv (confirmed separately -- Python sockets are
-    # non-inheritable by default, PEP 446) -- if that ever stopped being
-    # true, the relaunched process would wrongly think another instance
-    # is already running and this test would hang/fail rather than pass
-    # silently. A real script file, not `-c` (unlike _run_headless, which
-    # deliberately fakes sys.argv) -- execv needs a real argv[0] path to
-    # re-invoke itself with.
+def test_relaunch_for_scale_brings_the_app_back_up(tmp_path: Path) -> None:
+    """Changing the interface scale must actually restart the app -- through
+    main(), which is where the restart really happens.
+
+    This goes via main() rather than calling _relaunch_with_scale on a bare
+    app, because everything that broke on Windows lived in the parts a bare
+    app skips. The restart used to be performed from inside the Tk callback:
+    sys.exit() there raises SystemExit through the Tcl stack, where Tkinter
+    reports a traceback instead of exiting, so the window was destroyed, the
+    process stayed alive, and the replacement it had just spawned quit again
+    immediately because the single-instance guard found the old one still
+    holding the port. POSIX hid all of it -- execv replaces the process, so
+    there is no callback to return to and no overlap.
+
+    The proof is that the second instance gets far enough to write the file:
+    if the guard turns it away, nothing is written.
+    """
     home = tmp_path / "home"
     home.mkdir()
+    marker = tmp_path / "relaunched.txt"
+    port = 41977
     script = tmp_path / "relaunch_probe.py"
     script.write_text(f"""
-import os
+import os, sys
 os.environ["HOME"] = {str(home)!r}
 from roastmesh.gui import config as gui_config
 from roastmesh.gui import widgets
-from roastmesh.gui.app import RoastmeshApp
+from roastmesh.gui import app as appmod
 
-cfg = gui_config.load_config()
-app = RoastmeshApp()
-app.update()
-if cfg.ui_scale == 2.5:
-    print("AFTER_SCALE", widgets.UI_SCALE)
-    print("AFTER_TABS", len(app.tabs))
-    app._on_close()
-    print("OK")
-else:
-    # Nothing printed here survives -- os.execv discards this process's
-    # buffered (non-tty, so not line-buffered) stdout before any of it
-    # reaches the pipe pytest is capturing from. Confirmed the hard way:
-    # a "BEFORE_SCALE" print placed right here never showed up in
-    # r.stdout below despite the relaunch itself working correctly.
-    app._relaunch_with_scale(2.5)
+MARKER = {str(marker)!r}
+_orig = appmod.RoastmeshApp.__init__
+
+def _patched(self):
+    _orig(self)
+    if gui_config.load_config().ui_scale == 2.5:
+        with open(MARKER, "w", encoding="utf-8") as fh:
+            fh.write(f"scale={{widgets.UI_SCALE}} tabs={{len(self.tabs)}}")
+        self.after(200, self._on_close)
+    else:
+        self.after(700, lambda: self._relaunch_with_scale(2.5))
+
+appmod.RoastmeshApp.__init__ = _patched
+appmod.main(single_instance_port={port})
 """)
     cmd = [sys.executable, str(script)]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        # This system's xvfb-run defaults to a 640x480 virtual screen --
-        # confirmed as the root cause of a real intermittent failure: the
-        # search results Treeview's requested size (~850x400) didn't fit
-        # inside the app's own default 900x680 window once packed under a
-        # tab bar/heading at that resolution, leaving it unmapped
-        # (winfo_ismapped() == 0) so Treeview.bbox() returned nothing for
-        # an otherwise perfectly real, populated row. 1920x1080 comfortably
-        # fits this app's window at any of its resolution-based UI scales
-        # (gui/widgets.py's detect_ui_scale) -- a laptop-sized screen is
-        # exactly the scenario this whole feature is about, not a corner
-        # case to shrink away.
         cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    assert "OK" in r.stdout, r.stderr
-    assert "AFTER_SCALE 2.5" in r.stdout, r.stdout
-    assert "AFTER_TABS 4" in r.stdout, r.stdout
+    subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+
+    # The relaunched instance is a separate process on Windows, so it can
+    # outlive the one we waited on -- poll rather than assume it has finished.
+    for _ in range(60):
+        if marker.exists():
+            break
+        time.sleep(0.5)
+
+    assert marker.exists(), (
+        "the relaunched instance never started -- on Windows this is the "
+        "single-instance guard seeing the old process still holding the port"
+    )
+    assert "scale=2.5" in marker.read_text(encoding="utf-8")
+    assert "tabs=4" in marker.read_text(encoding="utf-8")
 
     saved = json.loads((home / ".local" / "share" / "roastmesh" / "gui_config.json").read_text())
     assert saved["ui_scale"] == 2.5

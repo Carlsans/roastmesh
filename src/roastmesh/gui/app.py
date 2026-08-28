@@ -430,6 +430,9 @@ class RoastDetailWindow(tk.Toplevel):
         self.on_change = on_change
         self.configure(bg=BG)
         self.geometry(screen_geometry(self, 1040, 820))
+        # Same on Windows: the chart is the point of this window, and it reads
+        # far better with the whole screen than in a 1040px box.
+        widgets.maximize(self)
         beans_lines = (record.get("beans_text") or "").splitlines()
         title = record.get("title") or (beans_lines[0] if beans_lines else t("Roast detail"))
         self.title(title)
@@ -923,6 +926,11 @@ class RoastmeshApp(tk.Tk):
             pass
         self.title("roastmesh")
         self.geometry(screen_geometry(self, 900, 680))
+        # Maximized on Windows (no-op elsewhere): the geometry above is a
+        # sensible size, but Windows users expect a desktop app to open filling
+        # the screen, and the search results table has more columns than a
+        # 900px window shows comfortably.
+        widgets.maximize(self)
         self.configure(bg=BG)
         try:
             style = ttk.Style(self)
@@ -1038,18 +1046,17 @@ class RoastmeshApp(tk.Tk):
             new_scale = max(widgets.MIN_UI_SCALE, min(widgets.MAX_UI_SCALE, new_scale))
         self._ui_scale_override = new_scale
         self._save_config()
+        # Only *request* the restart here. Actually doing it from inside a Tk
+        # callback is what made this crash on Windows: `sys.exit()` raises
+        # SystemExit through the Tcl call stack, where Tkinter catches it and
+        # reports a traceback instead of exiting -- so the window was already
+        # destroyed, the process stayed alive, and the replacement it had just
+        # spawned immediately quit again because the single-instance guard saw
+        # the old process still holding the port. POSIX never showed this: execv
+        # replaces the process outright, so there is no callback to return to
+        # and no overlap. main() performs the restart after mainloop() ends.
+        self._relaunch_requested = True
         self._on_close()
-        # os.execv replaces the process on POSIX. Windows has no real execv --
-        # CPython emulates it by spawning and exiting, which changes the PID
-        # and detaches the new process from whatever launched it. Spawning
-        # explicitly and exiting is the same thing, minus the pretence.
-        if sys.platform == "win32":
-            subprocess.Popen(
-                [sys.executable, *sys.argv[1:]],
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-            )
-            sys.exit(0)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _save_config(self) -> None:
         gui_config.save_config(gui_config.GuiConfig(
@@ -1101,7 +1108,8 @@ def main(*, single_instance_port: int = single_instance.PORT) -> None:
     # the Tk main thread, via app.after, same pattern gui/runner.py's
     # stream_into uses for task output) is what actually raises the
     # window.
-    single_instance.start_focus_listener(lambda: focus_requests.put(None), port=single_instance_port)
+    listener = single_instance.start_focus_listener(
+        lambda: focus_requests.put(None), port=single_instance_port)
 
     def _poll_focus_requests() -> None:
         try:
@@ -1116,6 +1124,29 @@ def main(*, single_instance_port: int = single_instance.PORT) -> None:
 
     _poll_focus_requests()
     app.mainloop()
+
+    if getattr(app, "_relaunch_requested", False):
+        # Restart to apply a new interface scale (see _relaunch_with_scale).
+        # Done here, after mainloop has ended, rather than from the callback
+        # that requested it.
+        #
+        # Releasing the single-instance port first is essential on Windows:
+        # there the replacement runs *alongside* this process for a moment,
+        # and its startup probe would find this one still listening and exit
+        # immediately -- the app would simply disappear on Ctrl+scroll. POSIX
+        # never hit this because execv replaces the process in place.
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        if sys.platform == "win32":
+            subprocess.Popen(
+                [sys.executable, *sys.argv[1:]],
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            return
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
