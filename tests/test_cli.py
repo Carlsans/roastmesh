@@ -222,7 +222,11 @@ def test_show_reports_no_match_for_an_unknown_id(tmp_path: Path) -> None:
     assert "no roast found" in result.output
 
 
-def test_search_lan_only_is_the_default_and_hides_non_lan_peers(tmp_path: Path) -> None:
+def test_search_shows_all_peers_by_default_and_lan_only_narrows_it(tmp_path: Path) -> None:
+    """Finding roasts from anywhere is the point of the network, so a plain
+    `search` must include peers discovered over the internet DHT -- a user
+    should not have to know a flag exists to see them. `--lan-only` is the
+    opt-in that narrows results back to the local network."""
     from datetime import datetime, timezone
 
     from roastnet.index.db import connect
@@ -250,13 +254,13 @@ def test_search_lan_only_is_the_default_and_hides_non_lan_peers(tmp_path: Path) 
     default_rows = json.loads(runner.invoke(
         main, ["--db", str(db_path), "search", "--peers-file", str(peers_file), "--json"]
     ).output)
-    assert len(default_rows) == 1
-    assert default_rows[0]["source_ref"].startswith(lan_pubkey)
+    assert {row["source_ref"].split(":")[0] for row in default_rows} == {lan_pubkey, wan_pubkey}
 
-    all_rows = json.loads(runner.invoke(
-        main, ["--db", str(db_path), "search", "--all-peers", "--peers-file", str(peers_file), "--json"]
+    lan_rows = json.loads(runner.invoke(
+        main, ["--db", str(db_path), "search", "--lan-only", "--peers-file", str(peers_file), "--json"]
     ).output)
-    assert {row["source_ref"].split(":")[0] for row in all_rows} == {lan_pubkey, wan_pubkey}
+    assert len(lan_rows) == 1
+    assert lan_rows[0]["source_ref"].startswith(lan_pubkey)
 
 
 def test_search_lan_only_keeps_own_local_roasts_regardless(tmp_path: Path) -> None:

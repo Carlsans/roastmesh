@@ -223,9 +223,10 @@ roastnet --db ~/roastnet.sqlite3 ingest path/to/some.alog     # or a directory o
 roastnet --db ~/roastnet.sqlite3 search washed ethiopian --machine kaleido_m2 --dtr-min 15
 roastnet --db ~/roastnet.sqlite3 show <roast_id>               # roast_id may be a prefix
 ```
-`search` only shows your own roasts and peers found via LAN discovery by default -- pass
-`--all-peers` to also include internet-discovered, manually-added, or gossiped-about peers,
-`--own-only` to show only your own, or `--show-hidden` to also include roasts you've hidden.
+`search` covers everything you have by default -- your own roasts plus every peer's, however that
+peer was discovered (LAN, the internet-wide DHT, a pasted ticket, or gossip). Narrow it with
+`--lan-only` to just your own roasts and peers on your local network, `--own-only` to only your
+own, or add `--show-hidden` to also include roasts you've hidden.
 
 **Hide a roast from your own search results** (local only -- see the GUI bullet above for why
 this can't retroactively un-share it from a peer):

@@ -153,9 +153,12 @@ def _filter_lan_only(rows: list, peers_file: Path) -> list:
 @click.option("--drop-after", "drop_bt_min", type=float, help="Minimum DROP bean temp (C).")
 @click.option("--after-second-crack/--not-after-second-crack", "after_second_crack",
               default=None, help="Only roasts dropped at or after SC_START.")
-@click.option("--lan-only/--all-peers", default=True, show_default=True,
-              help="Only show results from your own roasts and peers found on your local "
-                   "network -- not the internet-wide DHT, a manually-added peer, or gossip.")
+@click.option("--lan-only/--all-peers", default=False, show_default=True,
+              help="--lan-only restricts results to your own roasts and peers found on your "
+                   "local network, hiding anything from the internet-wide DHT, a manually-added "
+                   "peer, or gossip. The default is --all-peers: finding roasts from anywhere "
+                   "is the point of the network, and a peer's entries are signature-verified "
+                   "however they were discovered.")
 @click.option("--peers-file", default=None, type=click.Path(path_type=Path),
               help="Peer list to check provenance against for --lan-only "
                    "(default: ~/.local/share/roastnet/peers.json).")

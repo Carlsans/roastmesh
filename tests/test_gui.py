@@ -318,8 +318,10 @@ print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
     assert "DEFAULT_CHECKED False" in r.stdout, r.stdout
-    assert "--all-peers" in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
-    assert "--all-peers" not in [line for line in r.stdout.splitlines() if line.startswith("CHECKED_ARGS")][0]
+    # The CLI now defaults to --all-peers, so the GUI passes the *restricting*
+    # flag: nothing by default, --lan-only only when the box is ticked.
+    assert "--lan-only" not in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
+    assert "--lan-only" in [line for line in r.stdout.splitlines() if line.startswith("CHECKED_ARGS")][0]
 
 
 def test_search_tab_own_only_checkbox_is_unchecked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:

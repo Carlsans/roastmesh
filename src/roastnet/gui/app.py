@@ -348,8 +348,11 @@ class SearchTab(Tab):
             args.append("--after-second-crack")
         elif choice == "no":
             args.append("--not-after-second-crack")
-        if not self.lan_only.get():
-            args.append("--all-peers")
+        # Pass the *restricting* flag explicitly. The CLI now defaults to
+        # --all-peers, so sending nothing when this box is ticked would
+        # silently turn the checkbox into a no-op.
+        if self.lan_only.get():
+            args.append("--lan-only")
         if self.own_only.get():
             args.append("--own-only")
         if self.show_hidden.get():
