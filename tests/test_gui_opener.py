@@ -51,6 +51,17 @@ from roastnet.gui.app import (
 )
 
 
+# Artisan launcher discovery is Linux/macOS-shaped: PATH lookup for a bare
+# `artisan`, Flatpak exports, Snap wrappers, /Applications. On Windows Artisan
+# installs under Program Files and registers itself in the registry instead, so
+# _find_artisan_launcher returns None there and these fixtures cannot apply.
+# Skipped rather than loosened: a Windows launcher path is real work that has
+# not been done, and a passing test would imply otherwise.
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX Artisan launcher discovery; no Windows equivalent yet",
+)
+
+
 def test_run_opener_reports_success_for_a_command_that_exits_zero() -> None:
     assert _run_opener(["true"]) is None
 
@@ -122,6 +133,7 @@ def test_open_alog_file_prefers_a_real_artisan_install_over_the_os_default(monke
 # org.artisan_scope.artisan) exports its PATH wrapper under that full app
 # id, not under "artisan" -- shutil.which("artisan") silently misses it.
 
+@_posix_only
 def test_find_artisan_launcher_prefers_a_plain_path_binary_and_skips_staging(monkeypatch, tmp_path) -> None:
     fake = tmp_path / "artisan"
     fake.write_text("#!/bin/sh\nexit 0\n")
@@ -130,6 +142,7 @@ def test_find_artisan_launcher_prefers_a_plain_path_binary_and_skips_staging(mon
     assert _find_artisan_launcher("/tmp/roast.alog") == ([str(fake)], False)
 
 
+@_posix_only
 def test_find_artisan_launcher_finds_the_flatpak_exported_wrapper_and_flags_staging(monkeypatch, tmp_path) -> None:
     fake = tmp_path / "org.artisan_scope.artisan"
     fake.write_text("#!/bin/sh\nexit 0\n")
@@ -138,6 +151,7 @@ def test_find_artisan_launcher_finds_the_flatpak_exported_wrapper_and_flags_stag
     assert _find_artisan_launcher("/tmp/roast.alog") == ([str(fake)], True)
 
 
+@_posix_only
 def test_find_artisan_launcher_falls_back_to_flatpak_run_by_app_id(monkeypatch, tmp_path) -> None:
     # No artisan binary and no exported wrapper on PATH -- only the
     # `flatpak` command itself, which is enough: `flatpak run` finds an
@@ -199,6 +213,7 @@ def test_find_artisan_launcher_flags_staging_for_a_snap_style_path(monkeypatch) 
 # launched Artisan fine but it then failed to read the file at all (a
 # real IOError, seen on a real machine).
 
+@_posix_only
 def test_stage_for_artisan_copies_into_documents(monkeypatch, tmp_path) -> None:
     fake_home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(fake_home))

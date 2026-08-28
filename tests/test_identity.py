@@ -1,4 +1,7 @@
+import sys
 from pathlib import Path
+
+import pytest
 
 from roastnet.identity import (
     generate_identity,
@@ -50,6 +53,12 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
     assert verify(identity.public_key_hex, b"x", loaded.sign(b"x")) is True
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX file modes. Windows chmod honours only the read-only bit, so 0o600 "
+           "cannot be asserted -- the key is protected there by the per-user ACL on "
+           "%APPDATA% instead, which is weaker and worth knowing about.",
+)
 def test_save_identity_sets_restrictive_permissions(tmp_path: Path) -> None:
     path = tmp_path / "identity.json"
     save_identity(generate_identity(), path)

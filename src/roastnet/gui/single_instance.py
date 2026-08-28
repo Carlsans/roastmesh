@@ -50,7 +50,17 @@ def start_focus_listener(on_focus_requested: Callable[[], None], *, port: int = 
     Returns the listening socket (keep a reference for the process's
     lifetime; nothing needs to explicitly close it)."""
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        # Windows only, and the opposite of SO_REUSEADDR rather than a variant
+        # of it. On Windows SO_REUSEADDR means "let me take a port another
+        # process already holds", so it defeats the very thing this guard
+        # exists to detect: a second instance would bind successfully and two
+        # nodes would run with one identity against one database. Confirmed by
+        # the Windows test run, where the second bind returned a socket
+        # instead of None.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)  # type: ignore[attr-defined]
+    else:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listener.bind((_HOST, port))
         listener.listen(4)

@@ -85,7 +85,16 @@ def reindex(ctx: click.Context, path: Path) -> None:
     if db_path.exists():
         db_path.unlink()
     conn = connect(db_path)
-    results = ingest_path(conn, path)
+    try:
+        results = ingest_path(conn, path)
+    finally:
+        # Closed explicitly, unlike the other commands here, because this is
+        # the one that *deletes* the database. Windows takes mandatory file
+        # locks, so a connection left open by an earlier reindex in the same
+        # process makes the next one's unlink() fail with "the process cannot
+        # access the file because it is being used by another process".
+        # Elsewhere the handle is released at process exit, which is fine.
+        conn.close()
     failed = sum(1 for r in results if r.error)
     click.echo(f"reindexed {len(results) - failed} roast(s) from {path}")
     for result in results:
