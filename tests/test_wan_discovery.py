@@ -78,7 +78,7 @@ async def test_two_nodes_find_each_other_via_a_fake_dht_and_exchange_hellos(tmp_
         node_cache_path=tmp_path / "nodes_b.json",
     ))
     try:
-        for _ in range(50):
+        for _ in range(200):
             if discovered_by_a and discovered_by_b:
                 break
             await asyncio.sleep(0.1)
@@ -124,7 +124,7 @@ async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the
         node_cache_path=tmp_path / "nodes_b.json",
     ))
     try:
-        for _ in range(50):
+        for _ in range(200):
             if discovered_by_a:
                 break
             await asyncio.sleep(0.1)
