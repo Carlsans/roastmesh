@@ -1,6 +1,6 @@
 [project]
 name = "roastmesh"
-version = "0.5.1"
+version = "0.5.2"
 description = "Local parser, metadata extractor, and search index for Artisan .alog roast profiles -- the standalone building block for a P2P roast-profile sharing network."
 requires-python = ">=3.10"
 dependencies = [
