@@ -139,3 +139,29 @@ async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the
                 pass
         fake_dht_for_a.close()
         fake_dht_for_b.close()
+
+
+async def test_resolve_returns_only_ipv4_addresses() -> None:
+    """The DHT stack is IPv4-only -- BEP 5 compact addresses are 4 bytes and
+    DhtClient binds an IPv4 socket -- so resolution must ask for A records
+    explicitly.
+
+    Without `family=AF_INET`, `getaddrinfo` returns AAAA first on any
+    IPv6-preferring host and result [0] is then an IPv6 address handed to an
+    IPv4 socket: every query vanishes and the node never reaches the DHT at
+    all. Reproduced on a real dual-stack machine, where roastnet reported the
+    DHT unreachable while a raw IPv4 probe to the same router answered
+    instantly.
+    """
+    import ipaddress
+
+    from roastnet.wan_discovery import _resolve
+
+    resolved = await _resolve([("dht.transmissionbt.com", 6881),
+                               ("dht.libtorrent.org", 25401)])
+    if not resolved:
+        pytest.skip("no DNS available to resolve the bootstrap routers")
+    for ip, _port in resolved:
+        assert isinstance(ipaddress.ip_address(ip), ipaddress.IPv4Address), (
+            f"{ip} is not IPv4 -- an IPv4 socket cannot reach it"
+        )

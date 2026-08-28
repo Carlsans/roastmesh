@@ -68,18 +68,35 @@ def default_node_cache_path():
 
 
 async def _resolve(bootstrap_nodes: list[Addr]) -> list[Addr]:
-    """DNS-resolve the bootstrap hostnames once per lookup round -- their
-    IPs aren't guaranteed stable, and resolving fresh each time is cheap
-    next to the lookup itself. A host that fails to resolve (offline DNS,
-    transient failure) is skipped rather than aborting the whole round."""
+    """DNS-resolve the bootstrap hostnames to **IPv4** once per lookup round.
+
+    `family=AF_INET` is not optional. BEP 5's compact address format is
+    IPv4-only (4-byte addresses, `socket.inet_aton`), and DhtClient binds an
+    IPv4 socket -- but `getaddrinfo` with no family returns AAAA records first
+    on any IPv6-preferring host, and taking result [0] then hands an IPv6
+    address to an IPv4 socket. Every query silently goes nowhere.
+
+    Found on a real dual-stack host: `node doctor` there resolved
+    dht.transmissionbt.com to 2001:41d0:203:4cca:5:: and reported "the DHT is
+    unreachable from this network", while a raw IPv4 UDP probe to the very
+    same router from the very same machine got an immediate reply. Nothing was
+    blocked; roastnet was dialling the wrong address family. IPv6 is common on
+    consumer ISPs, so this failed completely for an unknown share of users
+    while looking exactly like a firewall problem.
+
+    A host that fails to resolve (no A record, offline DNS, transient failure)
+    is skipped rather than aborting the whole round.
+    """
     loop = asyncio.get_running_loop()
     resolved = []
     for host, port in bootstrap_nodes:
         try:
-            ip = (await loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM))[0][4][0]
+            infos = await loop.getaddrinfo(host, port, family=socket.AF_INET,
+                                            type=socket.SOCK_DGRAM)
         except OSError:
             continue
-        resolved.append((ip, port))
+        if infos:
+            resolved.append((infos[0][4][0], port))
     return resolved
 
 
