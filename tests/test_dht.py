@@ -11,7 +11,7 @@ import socket
 
 import pytest
 
-from roastnet.dht import (
+from roastmesh.dht import (
     DhtClient,
     bdecode,
     bencode,
@@ -123,7 +123,7 @@ async def test_get_peers_against_the_real_public_dht_for_a_made_up_infohash(real
 
 @pytest.fixture
 def live_dht_optin(real_dht) -> None:
-    """Opt-in via `ROASTNET_LIVE_DHT=1`, because this one is different in kind
+    """Opt-in via `ROASTMESH_LIVE_DHT=1`, because this one is different in kind
     from the rest of the suite.
 
     It takes ~100 seconds, and it competes for the same per-IP rate limits as
@@ -135,12 +135,12 @@ def live_dht_optin(real_dht) -> None:
     in the first place. So: explicit, and documented as the way to *prove*
     internet discovery works.
 
-        ROASTNET_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
+        ROASTMESH_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
     """
     import os
 
-    if os.environ.get("ROASTNET_LIVE_DHT") != "1":
-        pytest.skip("set ROASTNET_LIVE_DHT=1 to run the live announce/lookup round trip")
+    if os.environ.get("ROASTMESH_LIVE_DHT") != "1":
+        pytest.skip("set ROASTMESH_LIVE_DHT=1 to run the live announce/lookup round trip")
 
 
 async def test_announce_then_find_it_again_on_the_real_public_dht(live_dht_optin) -> None:
@@ -158,8 +158,8 @@ async def test_announce_then_find_it_again_on_the_real_public_dht(live_dht_optin
     """
     import os
 
-    from roastnet.dht import LookupStats
-    from roastnet.wan_discovery import DEFAULT_DHT_BOOTSTRAP, _resolve
+    from roastmesh.dht import LookupStats
+    from roastmesh.wan_discovery import DEFAULT_DHT_BOOTSTRAP, _resolve
 
     info_hash = hashlib.sha1(os.urandom(20)).digest()
     cache: dict = {}

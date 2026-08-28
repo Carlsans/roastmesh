@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build portable roastnet/roastnet-gui binaries inside Ubuntu 22.04 (see
+# Build portable roastmesh/roastmesh-gui binaries inside Ubuntu 22.04 (see
 # Dockerfile.build for why that base specifically). This is what actually
 # produces the binaries meant to be distributed/attached to a release --
 # packaging/build.sh (no Docker) is fine for quick local iteration on
@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-docker build -f packaging/Dockerfile.build -t roastnet-builder .
+docker build -f packaging/Dockerfile.build -t roastmesh-builder .
 
 mkdir -p dist
 rm -rf build-docker-scratch
@@ -19,10 +19,10 @@ docker run --rm \
     -e HOME=/tmp \
     -v "$(pwd)/dist:/app/dist" \
     -v "$(pwd)/build-docker-scratch:/app/build" \
-    roastnet-builder
+    roastmesh-builder
 
 rm -rf build-docker-scratch
 
 echo
 echo "built (Ubuntu 22.04 base, portable to newer systems):"
-ls -lh dist/roastnet dist/roastnet-gui
+ls -lh dist/roastmesh dist/roastmesh-gui

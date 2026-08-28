@@ -25,10 +25,10 @@ import pytest
 
 pytest.importorskip("tkinter")
 
-from roastnet.feed import read_entries
-from roastnet.gui.runner import Task
-from roastnet.index.db import connect
-from roastnet.index.ingest import ingest_path
+from roastmesh.feed import read_entries
+from roastmesh.gui.runner import Task
+from roastmesh.index.db import connect
+from roastmesh.index.ingest import ingest_path
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -74,15 +74,15 @@ def _run_headless(body: str, timeout: int = 30) -> subprocess.CompletedProcess:
 def test_all_tabs_construct_and_can_be_selected(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    # Isolated HOME: constructing RoastnetApp auto-starts a real `node
+    # Isolated HOME: constructing RoastmeshApp auto-starts a real `node
     # serve` (Network tab is always-on) and reads/writes gui/config.py's
     # settings file -- without this it would touch the real user's actual
-    # ~/.local/share/roastnet and create a real ~/RoastNetShare folder.
+    # ~/.local/share/roastmesh and create a real ~/RoastMeshShare folder.
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 nb = [c for c in app.winfo_children() if c.winfo_class() == "TNotebook"][0]
 for i in range(len(app.tabs)):
@@ -98,15 +98,15 @@ print("OK")
 
 def test_ui_scale_env_var_overrides_a_persisted_config_value(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    (home / ".local" / "share" / "roastnet").mkdir(parents=True)
-    (home / ".local" / "share" / "roastnet" / "gui_config.json").write_text('{"ui_scale": 1.6}')
+    (home / ".local" / "share" / "roastmesh").mkdir(parents=True)
+    (home / ".local" / "share" / "roastmesh" / "gui_config.json").write_text('{"ui_scale": 1.6}')
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-os.environ["ROASTNET_UI_SCALE"] = "2.0"
-from roastnet.gui import widgets
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+os.environ["ROASTMESH_UI_SCALE"] = "2.0"
+from roastmesh.gui import widgets
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 print("UI_SCALE", widgets.UI_SCALE)
 app._on_close()
@@ -117,7 +117,7 @@ print("OK")
 
 
 def test_relaunch_with_scale_persists_and_restarts_with_the_new_scale(tmp_path: Path) -> None:
-    # Exercises the real os.execv self-relaunch in RoastnetApp._relaunch_with_scale
+    # Exercises the real os.execv self-relaunch in RoastmeshApp._relaunch_with_scale
     # end to end: not just that it writes the right config, but that the
     # actual re-exec completes and the app comes back up with the new
     # scale applied. This depends on single_instance's listening socket
@@ -134,12 +134,12 @@ def test_relaunch_with_scale_persists_and_restarts_with_the_new_scale(tmp_path: 
     script.write_text(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui import config as gui_config
-from roastnet.gui import widgets
-from roastnet.gui.app import RoastnetApp
+from roastmesh.gui import config as gui_config
+from roastmesh.gui import widgets
+from roastmesh.gui.app import RoastmeshApp
 
 cfg = gui_config.load_config()
-app = RoastnetApp()
+app = RoastmeshApp()
 app.update()
 if cfg.ui_scale == 2.5:
     print("AFTER_SCALE", widgets.UI_SCALE)
@@ -173,7 +173,7 @@ else:
     assert "AFTER_SCALE 2.5" in r.stdout, r.stdout
     assert "AFTER_TABS 4" in r.stdout, r.stdout
 
-    saved = json.loads((home / ".local" / "share" / "roastnet" / "gui_config.json").read_text())
+    saved = json.loads((home / ".local" / "share" / "roastmesh" / "gui_config.json").read_text())
     assert saved["ui_scale"] == 2.5
 
 
@@ -189,8 +189,8 @@ def test_search_tab_runs_a_real_search_and_populates_the_table(tmp_path: Path) -
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
 tab = app.tabs[0]
@@ -223,8 +223,8 @@ def test_search_tab_columns_show_title_and_roast_date_not_id(tmp_path: Path) -> 
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
 tab = app.tabs[0]
@@ -260,8 +260,8 @@ def test_search_tab_results_sort_by_clicking_a_column_header(tmp_path: Path) -> 
     r = _run_headless(f"""
 import os, time
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
 tab = app.tabs[0]
@@ -305,8 +305,8 @@ def test_search_tab_lan_only_checkbox_is_unchecked_by_default_and_toggles_the_fl
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 tab = app.tabs[0]
 print("DEFAULT_CHECKED", tab.lan_only.get())
@@ -330,8 +330,8 @@ def test_search_tab_own_only_checkbox_is_unchecked_by_default_and_toggles_the_fl
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 tab = app.tabs[0]
 print("DEFAULT_CHECKED", tab.own_only.get())
@@ -355,8 +355,8 @@ def test_publish_tab_publishes_a_real_entry(tmp_path: Path) -> None:
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 tab = app.tabs[1]
 for _ in range(100):
@@ -381,7 +381,7 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "published entry 0" in r.stdout, r.stdout
 
-    feed_dir = home / ".local" / "share" / "roastnet" / "feed"
+    feed_dir = home / ".local" / "share" / "roastmesh" / "feed"
     entries = read_entries(feed_dir)
     assert len(entries) == 1
     assert entries[0].content_sha256
@@ -392,7 +392,7 @@ def test_copy_to_clipboard_puts_the_text_on_the_real_clipboard() -> None:
     # desktop has anything registered to auto-open a file/folder with.
     r = _run_headless("""
 import tkinter as tk
-from roastnet.gui.app import _copy_to_clipboard
+from roastmesh.gui.app import _copy_to_clipboard
 root = tk.Tk()
 root.withdraw()
 _copy_to_clipboard(root, '/tmp/some/path/roast.alog')
@@ -425,8 +425,8 @@ def test_network_tab_start_stop_serving_produces_and_clears_a_ticket(tmp_path: P
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 tab = app.tabs[2]
 # serving starts automatically on tab construction -- no _on_start_serve()
@@ -463,16 +463,16 @@ print("OK")
 
 
 def _start_server_process(env: dict, feed_fixture: Path) -> tuple[subprocess.Popen, str]:
-    """Publish one entry and start a real `roastnet node serve` for a test
+    """Publish one entry and start a real `roastmesh node serve` for a test
     to sync against. Reads stdout in a background thread into a queue with
     a bounded wait, rather than a plain blocking readline() loop, so a
     server that never prints a ticket fails the test cleanly instead of
     hanging it."""
     subprocess.run(
-        [sys.executable, "-m", "roastnet.cli", "feed", "publish", str(feed_fixture)],
+        [sys.executable, "-m", "roastmesh.cli", "feed", "publish", str(feed_fixture)],
         # cwd=env["HOME"]: `feed publish` now also ingests into --db, which
         # defaults to a cwd-relative path -- without pinning cwd here, that
-        # lands as a stray roastnet.sqlite3 in whatever directory pytest
+        # lands as a stray roastmesh.sqlite3 in whatever directory pytest
         # itself was invoked from, not this test's isolated tmp_path.
         env=env, cwd=env["HOME"], check=True, capture_output=True, text=True, timeout=30,
     )
@@ -483,7 +483,7 @@ def _start_server_process(env: dict, feed_fixture: Path) -> tuple[subprocess.Pop
         # the real network this sandbox is connected to -- this test is
         # about manual sync through the GUI, not LAN discovery (that has
         # its own dedicated test in test_net.py).
-        [sys.executable, "-m", "roastnet.cli", "node", "serve", "--no-lan-discovery"],
+        [sys.executable, "-m", "roastmesh.cli", "node", "serve", "--no-lan-discovery"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     ticket_queue: queue.Queue[str] = queue.Queue()
@@ -512,8 +512,8 @@ def test_network_tab_syncs_with_a_real_peer_end_to_end(tmp_path: Path) -> None:
         r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(client_home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
 tab = app.tabs[2]
@@ -552,7 +552,7 @@ print("OK")
 
 def _gui_launch_argv(port: int) -> list[str]:
     body = (
-        "from roastnet.gui.app import main\n"
+        "from roastmesh.gui.app import main\n"
         f"main(single_instance_port={port})\n"
     )
     cmd = [sys.executable, "-c", body]
@@ -582,7 +582,7 @@ def test_second_launch_focuses_the_first_instead_of_opening_a_second_window(tmp_
     try:
         # wait for the first instance to actually bind its focus listener,
         # not just for the process to start (Tk/Xvfb startup isn't instant)
-        from roastnet.gui import single_instance
+        from roastmesh.gui import single_instance
         bound = False
         for _ in range(100):
             if single_instance.another_instance_is_running(port=port, timeout=0.2):
@@ -628,7 +628,7 @@ def test_sigterm_cleans_up_the_background_node_serve_process(tmp_path: Path) -> 
 
     proc = subprocess.Popen(_gui_launch_argv(port), env=env)
     try:
-        from roastnet.gui import single_instance
+        from roastmesh.gui import single_instance
         bound = False
         for _ in range(100):
             if single_instance.another_instance_is_running(port=port, timeout=0.2):
@@ -675,8 +675,8 @@ def test_hide_button_removes_the_roast_and_unhide_restores_it(tmp_path: Path) ->
     r = _run_headless(f"""
 import os, time
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
 tab = app.tabs[0]
@@ -749,21 +749,21 @@ print("OK")
 
 def test_configured_language_applies_before_any_tab_is_built(tmp_path: Path) -> None:
     """The language must be resolved from config and set (gui/i18n.py)
-    before RoastnetApp builds its notebook -- every tab label is baked in
+    before RoastmeshApp builds its notebook -- every tab label is baked in
     at construction time, so setting the language any later would leave
     the first-opened window in English regardless of Settings."""
     home = tmp_path / "home"
     home.mkdir()
-    config_dir = home / ".local" / "share" / "roastnet"
+    config_dir = home / ".local" / "share" / "roastmesh"
     config_dir.mkdir(parents=True)
     (config_dir / "gui_config.json").write_text('{"language": "fr"}')
 
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-from roastnet.gui import i18n
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+from roastmesh.gui import i18n
+app = RoastmeshApp()
 app.update()
 nb = [c for c in app.winfo_children() if c.winfo_class() == "TNotebook"][0]
 print("CURRENT_LANGUAGE", i18n.current_language())
@@ -785,9 +785,9 @@ def test_unconfigured_language_defaults_to_english(tmp_path: Path) -> None:
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-from roastnet.gui import i18n
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+from roastmesh.gui import i18n
+app = RoastmeshApp()
 app.update()
 nb = [c for c in app.winfo_children() if c.winfo_class() == "TNotebook"][0]
 print("CURRENT_LANGUAGE", i18n.current_language())
@@ -811,14 +811,14 @@ def test_toggling_internet_discovery_restarts_serving_with_the_new_flag(tmp_path
     and isn't.
     """
     home = tmp_path / "home"
-    (home / ".local" / "share" / "roastnet").mkdir(parents=True)
-    (home / ".local" / "share" / "roastnet" / "gui_config.json").write_text(
+    (home / ".local" / "share" / "roastmesh").mkdir(parents=True)
+    (home / ".local" / "share" / "roastmesh" / "gui_config.json").write_text(
         '{"wan_discovery_enabled": false}')
     r = _run_headless(f"""
 import os, time
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 net_tab = app.network_tab
 print("BEFORE", "--wan-discovery" in net_tab.serve_task.argv)
@@ -854,8 +854,8 @@ def test_scale_keyboard_shortcuts_are_bound_at_startup(tmp_path: Path) -> None:
     r = _run_headless(f"""
 import os
 os.environ["HOME"] = {str(home)!r}
-from roastnet.gui.app import RoastnetApp
-app = RoastnetApp()
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
 app.update()
 for seq in ("<Control-MouseWheel>", "<Control-Button-4>", "<Control-Button-5>",
             "<Control-plus>", "<Control-minus>", "<Control-0>"):

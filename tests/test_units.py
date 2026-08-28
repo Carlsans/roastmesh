@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from roastnet.gui.units import CELSIUS, FAHRENHEIT, convert_temp
+from roastmesh.gui.units import CELSIUS, FAHRENHEIT, convert_temp
 
 
 def test_convert_temp_celsius_passthrough() -> None:

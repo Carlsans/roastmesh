@@ -3,9 +3,9 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from roastnet.feed import read_entries
-from roastnet.identity import generate_identity
-from roastnet.watch_folder import publish_new_files
+from roastmesh.feed import read_entries
+from roastmesh.identity import generate_identity
+from roastmesh.watch_folder import publish_new_files
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:2]

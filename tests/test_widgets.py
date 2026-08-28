@@ -14,8 +14,8 @@ import pytest
 
 pytest.importorskip("tkinter")
 
-from roastnet.gui import widgets
-from roastnet.gui.widgets import ResultsTable
+from roastmesh.gui import widgets
+from roastmesh.gui.widgets import ResultsTable
 
 
 class _FakeScreen:
@@ -40,7 +40,7 @@ def test_detect_ui_scale_buckets_by_screen_width() -> None:
 
 
 def test_resolve_ui_scale_precedence(monkeypatch) -> None:
-    monkeypatch.delenv("ROASTNET_UI_SCALE", raising=False)
+    monkeypatch.delenv("ROASTMESH_UI_SCALE", raising=False)
     screen = _FakeScreen(1920)  # would detect to 1.0 on its own
 
     # configured (persisted) overrides detection
@@ -50,11 +50,11 @@ def test_resolve_ui_scale_precedence(monkeypatch) -> None:
     assert widgets.resolve_ui_scale(screen, 0) == 1.0
 
     # env var overrides everything, including an explicit configured value
-    monkeypatch.setenv("ROASTNET_UI_SCALE", "2.5")
+    monkeypatch.setenv("ROASTMESH_UI_SCALE", "2.5")
     assert widgets.resolve_ui_scale(screen, 2.0) == 2.5
 
     # a garbage env value falls through rather than sticking
-    monkeypatch.setenv("ROASTNET_UI_SCALE", "not-a-number")
+    monkeypatch.setenv("ROASTMESH_UI_SCALE", "not-a-number")
     assert widgets.resolve_ui_scale(screen, 2.0) == 2.0
 
 
@@ -109,7 +109,7 @@ _needs_display = pytest.mark.skipif(not _has_display(), reason="no X display and
 def test_set_rows_shows_roast_date_and_converts_drop_temp_to_selected_unit() -> None:
     import tkinter as tk
 
-    from roastnet.gui.units import FAHRENHEIT
+    from roastmesh.gui.units import FAHRENHEIT
 
     root = tk.Tk()
     try:
@@ -135,7 +135,7 @@ def test_set_rows_shows_roast_date_and_converts_drop_temp_to_selected_unit() -> 
 def test_sorting_preserves_the_unit_aware_drop_column_header() -> None:
     import tkinter as tk
 
-    from roastnet.gui.units import FAHRENHEIT
+    from roastmesh.gui.units import FAHRENHEIT
 
     root = tk.Tk()
     try:

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from roastnet.peers import Peer, load_peers, prune_stale, save_peers, upsert_peer
+from roastmesh.peers import Peer, load_peers, prune_stale, save_peers, upsert_peer
 
 # A syntactically valid Iroh ticket isn't needed for most of these tests --
 # node_id_from_ticket() falls back to the raw ticket string when parsing

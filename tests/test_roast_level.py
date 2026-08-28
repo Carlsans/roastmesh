@@ -7,7 +7,7 @@ source; see machine.ROAST_LEVEL_BANDS_C's own comment for the reasoning.
 """
 from __future__ import annotations
 
-from roastnet.alog.roast_level import classify_roast_level
+from roastmesh.alog.roast_level import classify_roast_level
 
 
 def test_classify_roast_level_returns_none_when_drop_temp_is_none() -> None:
@@ -63,7 +63,7 @@ def test_classify_roast_level_italian_spanish() -> None:
 
 
 def test_classify_roast_level_bands_are_contiguous_and_ascending() -> None:
-    from roastnet.alog.machine import ROAST_LEVEL_BANDS_C
+    from roastmesh.alog.machine import ROAST_LEVEL_BANDS_C
 
     thresholds = [band[0] for band in ROAST_LEVEL_BANDS_C]
     assert thresholds == sorted(thresholds)

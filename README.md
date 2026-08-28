@@ -1,4 +1,4 @@
-# roastnet
+# roastmesh
 
 A peer-to-peer directory of Artisan (`.alog`) roast profiles: publish your own, discover and
 search everyone else's, no server and no accounts. Full design rationale lives in
@@ -8,24 +8,30 @@ All 7 steps of that document's build order are implemented: local parsing/search
 feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a desktop GUI,
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (on by default in the GUI, opt-in from the CLI) over the whole internet
-via the public BitTorrent DHT, no tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 280 tests, all passing.
+via the public BitTorrent DHT, no tracker or bootstrap node of roastmesh's own required — see
+[Peer discovery](#peer-discovery-lan-and-internet) below. 285 tests, all passing.
 
-The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
+The desktop app (`roastmesh-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
-required. The command line (`roastnet`) does everything the GUI does and more (it's what the GUI
+required. The command line (`roastmesh`) does everything the GUI does and more (it's what the GUI
 itself runs under the hood), and is there for scripting or if you just prefer a terminal.
 
 ## Install
 
+> **Renamed from roastnet in v0.5.0.** If you already had roastnet installed, just install
+> roastmesh over it — your identity, your published feed and your search index stay exactly where
+> they are and keep working, and the installer removes the old program files. Nothing needs
+> exporting or re-importing, and peers still recognise you: your key is unchanged.
+
+
 ### Linux — one command
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Carlsans/roastmesh/master/install.sh | bash
 ```
 
-Downloads the prebuilt binaries from the [latest release](https://github.com/Carlsans/roastnet/releases/latest),
-installs them to `~/.local/bin` (no sudo, no system packages touched), and adds a roastnet entry
+Downloads the prebuilt binaries from the [latest release](https://github.com/Carlsans/roastmesh/releases/latest),
+installs them to `~/.local/bin` (no sudo, no system packages touched), and adds a roastmesh entry
 to your applications menu so it's a normal double-clickable app afterward. Safe to re-run any
 time — re-running just upgrades in place.
 
@@ -35,12 +41,12 @@ straight into a given language — pass `--lang` after `--` (needed because the 
 stdin, not run as a file):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Carlsans/roastnet/master/install.sh | bash -s -- --lang fr
+curl -fsSL https://raw.githubusercontent.com/Carlsans/roastmesh/master/install.sh | bash -s -- --lang fr
 ```
 
-Only takes effect on a first install (it seeds `~/.local/share/roastnet/gui_config.json`); on an
+Only takes effect on a first install (it seeds `~/.local/share/roastmesh/gui_config.json`); on an
 existing install, change the language from the app's Settings tab instead. Switch it there at any
-time, regardless of how you installed — it applies the next time you open roastnet.
+time, regardless of how you installed — it applies the next time you open roastmesh.
 
 These binaries are built inside an Ubuntu 22.04 container specifically for portability (glibc is
 forward-compatible only, so building on an old base is what makes the same binary work on newer
@@ -52,19 +58,19 @@ below for those.
 
 ### Windows — one installer
 
-Download **`roastnet-setup-x86_64.exe`** from the
-[latest release](https://github.com/Carlsans/roastnet/releases/latest) and run it. It installs to
+Download **`roastmesh-setup-x86_64.exe`** from the
+[latest release](https://github.com/Carlsans/roastmesh/releases/latest) and run it. It installs to
 your user profile (no administrator prompt), adds a Start Menu entry, and can be removed from
 Add/Remove Programs. Windows 10 or 11, 64-bit.
 
-**Tick "Private networks" when Windows asks.** Shortly after you first open roastnet, Windows
+**Tick "Private networks" when Windows asks.** Shortly after you first open roastmesh, Windows
 Firewall asks whether to allow it on a network. **Private networks must be ticked** — otherwise
-Windows blocks the beacon roastnet uses to find other machines on your home or studio network,
+Windows blocks the beacon roastmesh uses to find other machines on your home or studio network,
 and it will quietly find nobody there with nothing to suggest a firewall is why. Sharing over the
 internet doesn't depend on this, only local-network discovery does.
 
 Missed the prompt? Fix it under **Windows Security → Firewall & network protection → Allow an app
-through firewall**, find roastnet, and make sure the Private column is ticked.
+through firewall**, find roastmesh, and make sure the Private column is ticked.
 
 **Windows will warn you the first time.** The installer is not code-signed — a certificate is an
 annual expense this project doesn't carry — so SmartScreen shows *"Windows protected your PC"*.
@@ -101,8 +107,8 @@ Install:
 pip install -e ".[dev]"
 ```
 
-This gives you the `roastnet` and `roastnet-gui` commands inside the venv (or run them without
-activating via `.venv/bin/roastnet` / `.venv\Scripts\roastnet.exe`).
+This gives you the `roastmesh` and `roastmesh-gui` commands inside the venv (or run them without
+activating via `.venv/bin/roastmesh` / `.venv\Scripts\roastmesh.exe`).
 
 **GUI on Linux**: `tkinter` isn't always bundled with Python by the system package manager.
 - Arch: `sudo pacman -S tk`
@@ -116,15 +122,15 @@ nothing extra needed there. If you installed Python via Homebrew on macOS instea
 ## Quick start (GUI)
 
 Launch it:
-- Installed via the one-command installer above? Click "roastnet" in your applications menu.
-- From source (activated venv): `roastnet-gui`
-- Ran a prebuilt binary yourself without the installer: `./roastnet-gui` — keep it next to
-  `./roastnet`, it shells out to it.
+- Installed via the one-command installer above? Click "roastmesh" in your applications menu.
+- From source (activated venv): `roastmesh-gui`
+- Ran a prebuilt binary yourself without the installer: `./roastmesh-gui` — keep it next to
+  `./roastmesh`, it shells out to it.
 
 Every label, button, and the roast chart scale together based on your screen's resolution (a
 laptop screen and a 4K monitor get noticeably different, appropriate sizes automatically) — adjust
 it yourself with Ctrl+scroll or Ctrl+plus/Ctrl+minus, and Ctrl+0 to go back to auto-detect
-(Settings tab shows the current percentage). Restarts roastnet to apply, the same brief interruption
+(Settings tab shows the current percentage). Restarts roastmesh to apply, the same brief interruption
 (and fresh ticket, if Network was serving) as Stop-then-Start already causes.
 
 Four tabs, left to right:
@@ -146,7 +152,7 @@ Four tabs, left to right:
   this machine shows itself. Hide is reversible (**Unhide**, or "Show hidden roasts too" to find
   it again).
 - **Publish** — the recommended way is the **shared folder** shown at the top (default
-  `~/RoastNetShare`, changeable in Settings): drop `.alog` files in there and they're published
+  `~/RoastMeshShare`, changeable in Settings): drop `.alog` files in there and they're published
   automatically, no button to click, as long as Network is serving. "Publish a single file"
   below it is the original one-off flow, for a file you don't want to leave in that folder. Your
   feed's address (public key) shows at the top; your identity is created silently the first time
@@ -159,7 +165,7 @@ Four tabs, left to right:
     "Stop" if you deliberately want to go offline; "Start serving" resumes (with a fresh ticket
     — it encodes your current network address, not just your identity, so it's expected to
     change run to run).
-  - **Automatic LAN discovery**: on by default. Any other roastnet node on the same local
+  - **Automatic LAN discovery**: on by default. Any other roastmesh node on the same local
     network is found and synced with on its own, continuously, with zero clicks on either side
     — open the app on two machines on the same LAN and they just find each other.
   - **Automatic internet-wide discovery**: on by default, turned off in Settings if you'd rather
@@ -183,17 +189,17 @@ under it, so nothing here is hidden from you.
 Two independent, both opt-out-able, layers on top of manual ticket-pasting:
 
 - **LAN discovery** (on by default): a small UDP broadcast on your local network (port `41888`)
-  — any roastnet node nearby announces itself and reacts to others' announcements. Never leaves
-  the local network. **On Windows this needs the firewall to allow roastnet on private networks**
+  — any roastmesh node nearby announces itself and reacts to others' announcements. Never leaves
+  the local network. **On Windows this needs the firewall to allow roastmesh on private networks**
   (see [Install](#windows--one-installer)); if that box wasn't ticked, LAN discovery finds nothing
   and gives no indication why.
 - **Internet-wide discovery** (on by default in the GUI's Settings tab; off by default from the
   CLI, where it's an explicit opt-in `--wan-discovery` flag): the same idea,
-  extended to the whole internet, as easy to join as a BitTorrent swarm. Every opted-in roastnet
+  extended to the whole internet, as easy to join as a BitTorrent swarm. Every opted-in roastmesh
   node announces itself on the real, already-running, public **BitTorrent Mainline DHT** — under
-  one fixed made-up identifier shared by every roastnet node everywhere, the same way every user
+  one fixed made-up identifier shared by every roastmesh node everywhere, the same way every user
   of one specific torrent is a peer of every other user of that torrent. No tracker or bootstrap
-  server of roastnet's own to run or configure; it piggybacks entirely on infrastructure that
+  server of roastmesh's own to run or configure; it piggybacks entirely on infrastructure that
   already exists, entering the network through the same well-known routers real BitTorrent
   clients use. Once found, a peer goes through exactly the same handshake, signature
   verification, and quota checks as a LAN-discovered or manually-pasted one — discovery only ever
@@ -202,18 +208,18 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
   Finding the swarm is an *iterative* lookup: peers for an identifier are held only by the
   handful of DHT nodes numerically closest to it, so each round asks the closest nodes known so
   far and repeats until it can get no closer, then publishes to exactly those. Nodes that answer
-  are remembered in `~/.local/share/roastnet/dht_nodes.json`, which matters more than it sounds —
+  are remembered in `~/.local/share/roastmesh/dht_nodes.json`, which matters more than it sounds —
   most of the historically-cited bootstrap routers no longer answer at all, so after the first
   successful round a node stops depending on them. Expect the first lookup after a fresh install
   to be the weakest one.
 
-  **If it isn't working, ask it why**: `roastnet node doctor` reports which routers answered, how
+  **If it isn't working, ask it why**: `roastmesh node doctor` reports which routers answered, how
   close the lookup got, and how many nodes accepted the announcement, instead of leaving you to
   guess.
 
   **The trade-off, worth knowing**: a LAN broadcast never leaves your local network, but
   announcing on the public DHT makes your node's public IP address (and the fact that it's
-  running roastnet) visible to anyone else looking at that same swarm — a materially bigger
+  running roastmesh) visible to anyone else looking at that same swarm — a materially bigger
   exposure. The GUI defaults this on alongside LAN discovery, since finding peers is the point of
   the app; uncheck it in Settings if you'd rather stay LAN-only. The CLI's `--wan-discovery` flag
   defaults off, since a script's behavior shouldn't change based on this without being asked
@@ -235,17 +241,17 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
 ## Usage (command line)
 
 Everything the GUI does, it does by running these same commands — useful for scripting, or if
-you just prefer a terminal. Assumes either `roastnet` is on your `PATH` (activated venv) or
-you're running `./roastnet` / `.venv/bin/roastnet` directly — same commands either way. `--db`
-on the top-level command picks the SQLite index file (default `roastnet.sqlite3` in the current
+you just prefer a terminal. Assumes either `roastmesh` is on your `PATH` (activated venv) or
+you're running `./roastmesh` / `.venv/bin/roastmesh` directly — same commands either way. `--db`
+on the top-level command picks the SQLite index file (default `roastmesh.sqlite3` in the current
 directory); pass an explicit path if you want it somewhere stable regardless of what directory
 you happen to run commands from.
 
 **Search your local index, and look at one result in full:**
 ```bash
-roastnet --db ~/roastnet.sqlite3 ingest path/to/some.alog     # or a directory of .alog files
-roastnet --db ~/roastnet.sqlite3 search washed ethiopian --machine kaleido_m2 --dtr-min 15
-roastnet --db ~/roastnet.sqlite3 show <roast_id>               # roast_id may be a prefix
+roastmesh --db ~/roastmesh.sqlite3 ingest path/to/some.alog     # or a directory of .alog files
+roastmesh --db ~/roastmesh.sqlite3 search washed ethiopian --machine kaleido_m2 --dtr-min 15
+roastmesh --db ~/roastmesh.sqlite3 show <roast_id>               # roast_id may be a prefix
 ```
 `search` covers everything you have by default -- your own roasts plus every peer's, however that
 peer was discovered (LAN, the internet-wide DHT, a pasted ticket, or gossip). Narrow it with
@@ -255,33 +261,33 @@ own, or add `--show-hidden` to also include roasts you've hidden.
 **Hide a roast from your own search results** (local only -- see the GUI bullet above for why
 this can't retroactively un-share it from a peer):
 ```bash
-roastnet --db ~/roastnet.sqlite3 hide <roast_id>      # roast_id may be a prefix
-roastnet --db ~/roastnet.sqlite3 unhide <roast_id>
+roastmesh --db ~/roastmesh.sqlite3 hide <roast_id>      # roast_id may be a prefix
+roastmesh --db ~/roastmesh.sqlite3 unhide <roast_id>
 ```
 
-If an entry looks stale after updating roastnet (an old roast type, a missing title) -- this
+If an entry looks stale after updating roastmesh (an old roast type, a missing title) -- this
 fixes itself automatically the next time `node serve` starts (which the GUI always does), by
 re-ingesting everything already known once per version, without wiping anything. Run it directly
-with `roastnet refresh` (safe and near-instant to run repeatedly -- it skips if already done for
+with `roastmesh refresh` (safe and near-instant to run repeatedly -- it skips if already done for
 the running version); `--force` re-runs it anyway.
 
 **Publish one of your own roasts** (creates your Ed25519 identity silently on first use):
 ```bash
-roastnet feed publish path/to/your-roast.alog
-roastnet identity export      # back up your secret key -- there is no recovery if it's lost
+roastmesh feed publish path/to/your-roast.alog
+roastmesh identity export      # back up your secret key -- there is no recovery if it's lost
 ```
 Or drop `.alog` files into a folder and let a running `node serve` publish them for you --
 see the watch-folder flag below.
 
 **Run a node** so others can sync with you, and **sync with someone else's node**:
 ```bash
-roastnet node serve                      # prints your ticket -- share it with peers
-roastnet --db ~/roastnet.sqlite3 peer sync <their-ticket>    # pulls their feed + peer list
-roastnet peer list
+roastmesh node serve                      # prints your ticket -- share it with peers
+roastmesh --db ~/roastmesh.sqlite3 peer sync <their-ticket>    # pulls their feed + peer list
+roastmesh peer list
 ```
 `node serve` also, by default: finds and syncs with other nodes on your local network
 (`--no-lan-discovery` to turn off), and auto-publishes any `.alog` file dropped into
-`~/RoastNetShare` (`--publish-watch-dir` to change the folder, `--no-publish-watch` to turn
+`~/RoastMeshShare` (`--publish-watch-dir` to change the folder, `--no-publish-watch` to turn
 off). Add `--wan-discovery` to also find peers over the whole internet via the public BitTorrent
 DHT -- off by default; see [Peer discovery](#peer-discovery-lan-and-internet) above for the
 trade-off before turning it on.
@@ -289,10 +295,10 @@ trade-off before turning it on.
 **Read-only web view** of your local index, browsable from any browser on the machine (or your
 LAN, with `--host`):
 ```bash
-roastnet gateway serve --db ~/roastnet.sqlite3       # http://127.0.0.1:8420
+roastmesh gateway serve --db ~/roastmesh.sqlite3       # http://127.0.0.1:8420
 ```
 
-Run `roastnet --help` or `roastnet <command> --help` for the full option list on anything above.
+Run `roastmesh --help` or `roastmesh <command> --help` for the full option list on anything above.
 
 ## Testing peer-to-peer sync across two machines on your LAN
 
@@ -304,11 +310,11 @@ step differs per OS.
 **If both machines are on the same local network** (true for almost anyone testing this at
 home): there's nothing to click for the networking part at all.
 
-**1. On Machine A** — launch `roastnet-gui`, go to the **Publish** tab, choose a `.alog` file,
+**1. On Machine A** — launch `roastmesh-gui`, go to the **Publish** tab, choose a `.alog` file,
 click Publish. Leave the app running (the **Network** tab is already serving — that started the
 moment the app opened).
 
-**2. On Machine B** — launch `roastnet-gui`. Within a few seconds it finds Machine A on its own
+**2. On Machine B** — launch `roastmesh-gui`. Within a few seconds it finds Machine A on its own
 (Network tab → Known peers) and automatically pulls its content — no ticket, no clicking Sync.
 Switch to the **Search** tab and run a blank search — you should see the roast you published on
 Machine A.
@@ -325,12 +331,12 @@ The CLI equivalent, if you'd rather script it or watch it from a terminal (LAN d
 by default here too — pass `--no-lan-discovery` to `node serve` to turn it off):
 ```bash
 # Machine A
-roastnet feed publish path/to/some-roast.alog
-roastnet --db ~/roastnet.sqlite3 node serve
+roastmesh feed publish path/to/some-roast.alog
+roastmesh --db ~/roastmesh.sqlite3 node serve
 # Machine B -- nothing else needed if on the same LAN; it'll auto-discover and
 # auto-sync within a few seconds. To sync across networks instead, manually:
-roastnet --db ~/roastnet.sqlite3 peer sync '<paste the ticket Machine A printed>'
-roastnet --db ~/roastnet.sqlite3 search
+roastmesh --db ~/roastmesh.sqlite3 peer sync '<paste the ticket Machine A printed>'
+roastmesh --db ~/roastmesh.sqlite3 search
 ```
 
 **If it doesn't connect:**
@@ -343,7 +349,7 @@ roastnet --db ~/roastnet.sqlite3 search
   outbound UDP 6881 to the public DHT bootstrap routers) all need to get through. If you have
   `ufw`/`firewalld`/Windows Firewall/etc. active, try temporarily disabling it on both machines
   to confirm that's the cause before figuring out a permanent rule.
-- `roastnet node serve` (CLI only — not exposed as a GUI option yet) accepts `--no-relay`, which
+- `roastmesh node serve` (CLI only — not exposed as a GUI option yet) accepts `--no-relay`, which
   restricts it to direct connections only, no fallback to Iroh's relay infrastructure. This is
   what this project's own automated tests use for same-process testing; for two *separate*
   machines it's untested by me specifically, but worth trying if the default mode doesn't
@@ -354,10 +360,10 @@ roastnet --db ~/roastnet.sqlite3 search
 
 ## Packaging
 
-Two ways to produce `dist/roastnet` + `dist/roastnet-gui`:
+Two ways to produce `dist/roastmesh` + `dist/roastmesh-gui`:
 
 - **`packaging/build-docker.sh`** — the one that actually produces distributable binaries (this
-  is what built the ones attached to the [releases](https://github.com/Carlsans/roastnet/releases)).
+  is what built the ones attached to the [releases](https://github.com/Carlsans/roastmesh/releases)).
   Builds inside an Ubuntu 22.04 Docker container for portability across newer distros (see
   `packaging/Dockerfile.build`'s comments for why the build machine's glibc matters). Requires
   Docker; needs nothing else installed on the host.
@@ -393,7 +399,7 @@ end-to-end claim, checked against other people's BEP 5 implementations rather th
 is the thing to run when internet sharing is suspect:
 
 ```bash
-ROASTNET_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
+ROASTMESH_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
 ```
 
 It's opt-in because it takes ~80 seconds and shares the public DHT's per-IP rate limits with
@@ -404,9 +410,9 @@ real in-process DHT swarm, including a check that the *previous*, broken lookup 
 
 ## Known limitations
 
-- No real bootstrap nodes exist yet (`roastnet peer bootstrap` is a documented no-op until a
-  maintainer runs an always-on node and its ticket gets added to `src/roastnet/bootstrap.py`) —
-  in the meantime, use `roastnet peer add <ticket>` (manual, from a friend), or turn on
+- No real bootstrap nodes exist yet (`roastmesh peer bootstrap` is a documented no-op until a
+  maintainer runs an always-on node and its ticket gets added to `src/roastmesh/bootstrap.py`) —
+  in the meantime, use `roastmesh peer add <ticket>` (manual, from a friend), or turn on
   internet-wide discovery (Settings tab / `--wan-discovery`), which finds other opted-in nodes
   without needing a bootstrap node at all.
 - `peer sync` only replicates the feed of the peer you directly connect to, not a relay of

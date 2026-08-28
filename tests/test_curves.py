@@ -1,14 +1,14 @@
 """alog/curves.py: pure chart-derivation logic (charge offset, phase
 segments, RoR, slider/extra-channel decoding). No display needed -- these
 operate on plain dicts/lists, the exact shape RoastChart receives via
-RoastRecord.to_dict() / `roastnet show --json`."""
+RoastRecord.to_dict() / `roastmesh show --json`."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
-from roastnet.alog.curves import (
+from roastmesh.alog.curves import (
     charge_offset_s,
     compute_ror,
     format_mmss,
@@ -17,8 +17,8 @@ from roastnet.alog.curves import (
     slider_series,
     value_at,
 )
-from roastnet.alog.parser import SourceMeta, parse_alog
-from roastnet.alog.record import to_roast_record
+from roastmesh.alog.parser import SourceMeta, parse_alog
+from roastmesh.alog.record import to_roast_record
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SOURCE = SourceMeta(source_type="local", source_ref="test")

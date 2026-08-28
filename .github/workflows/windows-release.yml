@@ -41,7 +41,7 @@ jobs:
         run: pytest -q
 
       - name: Build the binaries
-        run: pyinstaller packaging/roastnet.spec --clean --noconfirm
+        run: pyinstaller packaging/roastmesh.spec --clean --noconfirm
 
       - name: Smoke-test the binaries
         # Mirrors packaging/test-docker.sh: prove the CLI runs (which exercises
@@ -49,11 +49,11 @@ jobs:
         # survives startup rather than exiting immediately.
         shell: pwsh
         run: |
-          .\dist\roastnet.exe --version
-          .\dist\roastnet.exe identity show
-          $gui = Start-Process -FilePath .\dist\roastnet-gui.exe -PassThru
+          .\dist\roastmesh.exe --version
+          .\dist\roastmesh.exe identity show
+          $gui = Start-Process -FilePath .\dist\roastmesh-gui.exe -PassThru
           Start-Sleep -Seconds 10
-          if ($gui.HasExited) { throw "roastnet-gui.exe exited early (code $($gui.ExitCode))" }
+          if ($gui.HasExited) { throw "roastmesh-gui.exe exited early (code $($gui.ExitCode))" }
           Write-Host "GUI still running after 10s -- OK"
           Stop-Process -Id $gui.Id -Force
 
@@ -63,7 +63,7 @@ jobs:
         # silently; this is what would catch a regression in that fix.
         shell: pwsh
         continue-on-error: true      # a runner's egress may block the DHT; informational
-        run: .\dist\roastnet.exe node doctor
+        run: .\dist\roastmesh.exe node doctor
 
       - name: Build the installer
         shell: pwsh
@@ -87,7 +87,7 @@ jobs:
             $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           }
           Write-Host "using $nsis"
-          & $nsis "/DVERSION=$version" packaging\roastnet.nsi
+          & $nsis "/DVERSION=$version" packaging\roastmesh.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
 
       - name: Test the installer end to end
@@ -96,35 +96,35 @@ jobs:
         # from source and silently fell back to English when packaged.
         shell: pwsh
         run: |
-          .\dist\roastnet-setup-x86_64.exe /S
+          .\dist\roastmesh-setup-x86_64.exe /S
           Start-Sleep -Seconds 10
-          $dir = "$env:LOCALAPPDATA\Programs\roastnet"
-          foreach ($f in @("roastnet.exe", "roastnet-gui.exe", "uninstall.exe")) {
+          $dir = "$env:LOCALAPPDATA\Programs\roastmesh"
+          foreach ($f in @("roastmesh.exe", "roastmesh-gui.exe", "uninstall.exe")) {
             if (-not (Test-Path "$dir\$f")) { throw "installer did not place $f" }
           }
-          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\roastnet.lnk")) {
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\roastmesh.lnk")) {
             throw "Start Menu shortcut missing"
           }
-          & "$dir\roastnet.exe" --version
+          & "$dir\roastmesh.exe" --version
           & "$dir\uninstall.exe" /S
           Start-Sleep -Seconds 10
-          if (Test-Path "$dir\roastnet.exe") { throw "uninstaller left roastnet.exe behind" }
+          if (Test-Path "$dir\roastmesh.exe") { throw "uninstaller left roastmesh.exe behind" }
           Write-Host "install -> run -> uninstall OK"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: roastnet-windows
+          name: roastmesh-windows
           path: |
-            dist/roastnet.exe
-            dist/roastnet-gui.exe
-            dist/roastnet-setup-x86_64.exe
+            dist/roastmesh.exe
+            dist/roastmesh-gui.exe
+            dist/roastmesh-setup-x86_64.exe
 
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        # The Linux assets are named bare `roastnet` / `roastnet-gui` and
+        # The Linux assets are named bare `roastmesh` / `roastmesh-gui` and
         # install.sh fetches those exact names, so the .exe names coexist with
         # them. Renaming the Linux assets would break every copy of install.sh
         # already in circulation.
-        run: gh release upload "${{ github.ref_name }}" dist/roastnet.exe dist/roastnet-gui.exe dist/roastnet-setup-x86_64.exe --clobber
+        run: gh release upload "${{ github.ref_name }}" dist/roastmesh.exe dist/roastmesh-gui.exe dist/roastmesh-setup-x86_64.exe --clobber

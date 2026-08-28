@@ -13,10 +13,10 @@ pytest.importorskip("tkinter")
 
 import tkinter as tk
 
-from roastnet.alog.parser import SourceMeta, parse_alog
-from roastnet.alog.record import to_roast_record
-from roastnet.gui.chart import RoastChart
-from roastnet.gui.units import CELSIUS, FAHRENHEIT, convert_temp
+from roastmesh.alog.parser import SourceMeta, parse_alog
+from roastmesh.alog.record import to_roast_record
+from roastmesh.gui.chart import RoastChart
+from roastmesh.gui.units import CELSIUS, FAHRENHEIT, convert_temp
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SOURCE = SourceMeta(source_type="local", source_ref="test")

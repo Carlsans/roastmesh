@@ -1,4 +1,4 @@
-# Portable build environment for the roastnet/roastnet-gui standalone
+# Portable build environment for the roastmesh/roastmesh-gui standalone
 # binaries. Built here rather than on whatever machine happens to run
 # build.sh because glibc (and the linker's relocation format) is
 # forward-compatible only -- a binary built on a very new system can
@@ -31,4 +31,4 @@ RUN python3.10 -m venv /app/.venv-build \
 # Writes into /app/dist and /app/build -- build-docker.sh bind-mounts the
 # host's dist/ (and a scratch build/) over these so the binaries land back
 # on the host.
-ENTRYPOINT ["/app/.venv-build/bin/pyinstaller", "packaging/roastnet.spec", "--clean", "--noconfirm"]
+ENTRYPOINT ["/app/.venv-build/bin/pyinstaller", "packaging/roastmesh.spec", "--clean", "--noconfirm"]

@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 
-from roastnet.dht import (
+from roastmesh.dht import (
     K,
     DhtClient,
     LookupStats,

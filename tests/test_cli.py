@@ -3,7 +3,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from roastnet.cli import main
+from roastmesh.cli import main
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -140,8 +140,8 @@ def test_feed_ingest_user_log_flag_marks_entries_as_your_own(tmp_path: Path, mon
 
     # publish via append_entry directly (bypassing the CLI's own
     # auto-ingest-at-publish) to simulate a feed indexed by an old version
-    from roastnet.feed import append_entry
-    from roastnet.identity import load_or_create_identity
+    from roastmesh.feed import append_entry
+    from roastmesh.identity import load_or_create_identity
     identity, _ = load_or_create_identity()
     append_entry(feed_dir, identity, FIXTURES_DIR / "kaleido_1.alog", timestamp="2026-01-01T00:00:00Z")
 
@@ -229,9 +229,9 @@ def test_search_shows_all_peers_by_default_and_lan_only_narrows_it(tmp_path: Pat
     opt-in that narrows results back to the local network."""
     from datetime import datetime, timezone
 
-    from roastnet.index.db import connect
-    from roastnet.index.ingest import ingest_file
-    from roastnet.peers import Peer, save_peers
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_file
+    from roastmesh.peers import Peer, save_peers
 
     db_path = tmp_path / "cli.sqlite3"
     peers_file = tmp_path / "peers.json"
@@ -323,13 +323,13 @@ def test_show_json_includes_hidden_status(tmp_path: Path) -> None:
 
 
 def test_refresh_updates_stale_entries_and_is_a_fast_noop_second_time(tmp_path: Path) -> None:
-    import roastnet
+    import roastmesh
 
     db_path = tmp_path / "cli.sqlite3"
     runner = CliRunner()
     runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
 
-    from roastnet.index.db import connect
+    from roastmesh.index.db import connect
     conn = connect(db_path)
     conn.execute("UPDATE roasts SET title = NULL")  # simulate a pre-title-field entry
     conn.commit()
@@ -337,7 +337,7 @@ def test_refresh_updates_stale_entries_and_is_a_fast_noop_second_time(tmp_path: 
 
     first = runner.invoke(main, ["--db", str(db_path), "refresh"])
     assert first.exit_code == 0, first.output
-    assert f"refreshed 1 roast(s) for v{roastnet.__version__}" in first.output
+    assert f"refreshed 1 roast(s) for v{roastmesh.__version__}" in first.output
 
     conn = connect(db_path)
     title = conn.execute("SELECT title FROM roasts").fetchone()["title"]

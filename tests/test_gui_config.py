@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from roastnet.gui.config import GuiConfig, load_config, save_config
+from roastmesh.gui.config import GuiConfig, load_config, save_config
 
 
 def _isolate(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("roastnet.gui.config.config_path", lambda: tmp_path / "gui_config.json")
+    monkeypatch.setattr("roastmesh.gui.config.config_path", lambda: tmp_path / "gui_config.json")
 
 
 def test_load_config_returns_defaults_when_no_file_exists(monkeypatch, tmp_path: Path) -> None:

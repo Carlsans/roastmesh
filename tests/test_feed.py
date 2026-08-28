@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from roastnet.feed import (
+from roastmesh.feed import (
     FeedEntry,
     append_entry,
     blob_path_for,
@@ -13,7 +13,7 @@ from roastnet.feed import (
     verify_feed,
     write_received_entry,
 )
-from roastnet.identity import generate_identity
+from roastmesh.identity import generate_identity
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:3]

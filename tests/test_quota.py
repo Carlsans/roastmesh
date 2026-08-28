@@ -1,5 +1,5 @@
-from roastnet.feed import FeedEntry
-from roastnet.quota import QuotaLimits, check_feed_metadata
+from roastmesh.feed import FeedEntry
+from roastmesh.quota import QuotaLimits, check_feed_metadata
 
 
 def _entry(seq: int, *, size_bytes: int = 1000, day: str = "2026-01-01") -> FeedEntry:

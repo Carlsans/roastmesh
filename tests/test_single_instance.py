@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import queue
 
-from roastnet.gui import single_instance
+from roastmesh.gui import single_instance
 
 # Dedicated test port range -- distinct from single_instance.PORT (the
 # real one) so these tests never collide with an actual running instance.

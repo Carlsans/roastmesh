@@ -2,7 +2,7 @@
 only applies to a brand-new database -- a column added to an existing
 table definition needs its own explicit, idempotent ALTER TABLE
 (_apply_added_columns), or a database created by an earlier version of
-roastnet never gets it. This simulates exactly that: a database built
+roastmesh never gets it. This simulates exactly that: a database built
 before the `title` column existed.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from roastnet.index.db import connect
+from roastmesh.index.db import connect
 
 
 def _create_pre_title_database(db_path: Path) -> None:

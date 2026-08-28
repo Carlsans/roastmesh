@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Log CPU time actually consumed by a running roastnet-gui -- including
+# Log CPU time actually consumed by a running roastmesh-gui -- including
 # every subprocess it spawns, even short-lived ones a plain `top` snapshot
 # would usually miss entirely -- to a CSV file for later analysis.
 #
 # Background: three real, measured causes of sustained idle CPU use (and
 # the fan-cycling that comes with it) were found and fixed using this same
 # technique:
-#   1. The GUI used to shell out to a whole new `roastnet peer list`
+#   1. The GUI used to shell out to a whole new `roastmesh peer list`
 #      process every 5 seconds, forever, just to refresh the "Known
 #      peers" table -- ~0.3s of CPU per run under a packaged build
 #      (PyInstaller onefile self-extracts on every launch). Now every 30s.
@@ -44,9 +44,9 @@
 #   packaging/benchmark_cpu.sh [duration_seconds] [interval_seconds] [logfile]
 #     duration_seconds  how long to sample for (default 3600 = 1 hour)
 #     interval_seconds  how often to sample (default 2)
-#     logfile           CSV output path (default ./roastnet_cpu_log_<timestamp>.csv)
+#     logfile           CSV output path (default ./roastmesh_cpu_log_<timestamp>.csv)
 #
-# Start roastnet-gui first, then run this alongside it (it finds the
+# Start roastmesh-gui first, then run this alongside it (it finds the
 # already-running process by name). Leave the app idle for a meaningful
 # "is it doing anything with nobody touching it" reading, or use it
 # normally if you want a realistic usage-pattern log instead.
@@ -64,19 +64,19 @@ fi
 
 DURATION="${1:-3600}"
 INTERVAL="${2:-2}"
-LOGFILE="${3:-roastnet_cpu_log_$(date +%Y%m%d_%H%M%S).csv}"
+LOGFILE="${3:-roastmesh_cpu_log_$(date +%Y%m%d_%H%M%S).csv}"
 
-GUI_PATTERN='roastnet-gui'
+GUI_PATTERN='roastmesh-gui'
 SERVE_PATTERN='node serve'
 
 if ! pgrep -f "$GUI_PATTERN" > /dev/null; then
-    echo "No running roastnet-gui process found. Start it first, then run this." >&2
+    echo "No running roastmesh-gui process found. Start it first, then run this." >&2
     exit 1
 fi
 
 CLK_TCK="$(getconf CLK_TCK)"
 
-echo "roastnet CPU benchmark"
+echo "roastmesh CPU benchmark"
 echo "  watching for '$GUI_PATTERN' and '$SERVE_PATTERN' processes for ${DURATION}s, sampling every ${INTERVAL}s"
 echo "  logging to: $LOGFILE"
 echo "  own_cpu_pct      = summed CPU use of every matching process, this interval"
@@ -162,7 +162,7 @@ sample_role() {
 while [ "$(date +%s)" -lt "$end_ts" ]; do
     now="$(date +%s)"
     if ! sample_role "$GUI_PATTERN" "gui" "$now"; then
-        echo "roastnet-gui no longer found -- stopping early." >&2
+        echo "roastmesh-gui no longer found -- stopping early." >&2
         break
     fi
     sample_role "$SERVE_PATTERN" "serve" "$now" || true  # not an error -- serving may be stopped

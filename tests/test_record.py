@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from roastnet.alog.parser import SourceMeta, parse_alog
-from roastnet.alog.record import to_roast_record
+from roastmesh.alog.parser import SourceMeta, parse_alog
+from roastmesh.alog.record import to_roast_record
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))

@@ -1,6 +1,6 @@
 [project]
-name = "roastnet"
-version = "0.4.0"
+name = "roastmesh"
+version = "0.5.0"
 description = "Local parser, metadata extractor, and search index for Artisan .alog roast profiles -- the standalone building block for a P2P roast-profile sharing network."
 requires-python = ">=3.10"
 dependencies = [
@@ -22,13 +22,13 @@ build = [
 asyncio_mode = "auto"
 
 [project.scripts]
-roastnet = "roastnet.cli:main"
+roastmesh = "roastmesh.cli:main"
 
 [project.gui-scripts]
 # Declared under gui-scripts (not scripts) so on Windows it launches without
 # a console window attached; on Linux the two are equivalent. Same reasoning
 # roastlab's own pyproject.toml uses for roastlab-gui.
-roastnet-gui = "roastnet.gui.app:main"
+roastmesh-gui = "roastmesh.gui.app:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -38,5 +38,5 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"roastnet.index" = ["schema.sql"]
-"roastnet.gui" = ["locales/*.json"]
+"roastmesh.index" = ["schema.sql"]
+"roastmesh.gui" = ["locales/*.json"]

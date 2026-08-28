@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke-test the built dist/roastnet + dist/roastnet-gui binaries across
+# Smoke-test the built dist/roastmesh + dist/roastmesh-gui binaries across
 # major Linux distributions, in Docker. Each container gets just enough
 # installed to simulate a real desktop (X11 runtime libs + xvfb-run +
 # curl) -- a bare server image lacks what any real desktop install
@@ -9,17 +9,17 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-if [ ! -x dist/roastnet ] || [ ! -x dist/roastnet-gui ]; then
-    echo "dist/roastnet(-gui) not found -- run packaging/build-docker.sh first." >&2
+if [ ! -x dist/roastmesh ] || [ ! -x dist/roastmesh-gui ]; then
+    echo "dist/roastmesh(-gui) not found -- run packaging/build-docker.sh first." >&2
     exit 1
 fi
 
 TEST_BODY='
 set -e
 echo "--- identity show ---"
-/dist/roastnet identity show
+/dist/roastmesh identity show
 echo "--- gui launch under Xvfb ---"
-xvfb-run -a /dist/roastnet-gui &
+xvfb-run -a /dist/roastmesh-gui &
 GUI_PID=$!
 sleep 3
 if kill -0 "$GUI_PID" 2>/dev/null; then

@@ -5,11 +5,11 @@ import pytest
 
 from datetime import datetime, timedelta, timezone
 
-from roastnet.feed import append_entry
-from roastnet.identity import generate_identity
-from roastnet.index.db import connect
-from roastnet.index.ingest import ingest_feed
-from roastnet.peers import Peer, prune_stale
+from roastmesh.feed import append_entry
+from roastmesh.identity import generate_identity
+from roastmesh.index.db import connect
+from roastmesh.index.ingest import ingest_feed
+from roastmesh.peers import Peer, prune_stale
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:3]

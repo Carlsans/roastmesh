@@ -9,11 +9,11 @@ import sys
 
 import pytest
 
-from roastnet import net
-from roastnet.feed import append_entry, blob_path_for, read_entries
-from roastnet.identity import generate_identity
-from roastnet.peers import Peer, load_peers, save_peers
-from roastnet.quota import QuotaLimits
+from roastmesh import net
+from roastmesh.feed import append_entry, blob_path_for, read_entries
+from roastmesh.identity import generate_identity
+from roastmesh.peers import Peer, load_peers, save_peers
+from roastmesh.quota import QuotaLimits
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:3]
@@ -301,7 +301,7 @@ async def test_lan_discovery_auto_syncs_without_a_manual_sync_call(tmp_path: Pat
     discovery on find each other and node B ends up with node A's entries
     in its search index -- without net.sync_with_peer ever being called
     directly anywhere in this test."""
-    from roastnet.index.db import connect
+    from roastmesh.index.db import connect
 
     LAN_PORT = 41977  # dedicated test port -- distinct from the production default
 
@@ -392,7 +392,7 @@ async def test_serve_auto_ingests_watch_folder_files_as_the_users_own_roasts(tmp
     file dropped there gets shared with every peer but never shows up in
     the user's own local search, the same disconnect `feed publish` used
     to have before it auto-ingested too."""
-    from roastnet.index.db import connect
+    from roastmesh.index.db import connect
 
     identity = generate_identity()
     feed_dir = tmp_path / "feed"
@@ -436,7 +436,7 @@ async def test_serve_refreshes_stale_entries_on_startup(tmp_path: Path) -> None:
     of the parser, must show up automatically the next time the app is
     opened -- without a manual reindex, and without the user needing to
     know anything happened."""
-    from roastnet.index.db import connect
+    from roastmesh.index.db import connect
 
     identity = generate_identity()
     feed_dir = tmp_path / "feed"
@@ -444,7 +444,7 @@ async def test_serve_refreshes_stale_entries_on_startup(tmp_path: Path) -> None:
     _publish(feed_dir, identity, FIXTURES[:1])
 
     conn = connect(db_path)
-    from roastnet.index.ingest import ingest_feed
+    from roastmesh.index.ingest import ingest_feed
     ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex, is_user_log=True)
     conn.execute("UPDATE roasts SET title = NULL")  # simulate "indexed by an older version"
     conn.commit()

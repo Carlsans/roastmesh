@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from roastnet.alog.parser import AlogParseError, parse_alog, parse_alog_text
+from roastmesh.alog.parser import AlogParseError, parse_alog, parse_alog_text
 
 FIXTURES = sorted((Path(__file__).parent / "fixtures").glob("*.alog"))
 

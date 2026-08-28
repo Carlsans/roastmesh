@@ -1,7 +1,7 @@
 """models.py: small pure-logic helpers with no existing dedicated test file."""
 from __future__ import annotations
 
-from roastnet.models import weight_loss_pct
+from roastmesh.models import weight_loss_pct
 
 
 def test_weight_loss_pct_basic() -> None:

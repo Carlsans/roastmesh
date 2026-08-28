@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from roastnet.gui import i18n
+from roastmesh.gui import i18n
 
-GUI_DIR = Path(__file__).parent.parent / "src" / "roastnet" / "gui"
+GUI_DIR = Path(__file__).parent.parent / "src" / "roastmesh" / "gui"
 FR_CATALOG_PATH = GUI_DIR / "locales" / "fr.json"
 
 
@@ -71,15 +71,15 @@ def test_tn_plural_selection_differs_by_language() -> None:
 
 
 def test_resolve_language_precedence(monkeypatch) -> None:
-    monkeypatch.delenv("ROASTNET_LANG", raising=False)
+    monkeypatch.delenv("ROASTMESH_LANG", raising=False)
     monkeypatch.delenv("LC_ALL", raising=False)
     monkeypatch.delenv("LC_MESSAGES", raising=False)
     monkeypatch.delenv("LANG", raising=False)
 
     # env > configured
-    monkeypatch.setenv("ROASTNET_LANG", "fr")
+    monkeypatch.setenv("ROASTMESH_LANG", "fr")
     assert i18n.resolve_language("en") == "fr"
-    monkeypatch.delenv("ROASTNET_LANG")
+    monkeypatch.delenv("ROASTMESH_LANG")
 
     # configured > OS locale
     monkeypatch.setenv("LANG", "fr_FR.UTF-8")
@@ -95,7 +95,7 @@ def test_resolve_language_precedence(monkeypatch) -> None:
 
 
 def test_resolve_language_falls_through_an_unrecognized_value_at_each_step(monkeypatch) -> None:
-    monkeypatch.setenv("ROASTNET_LANG", "xx")  # unrecognized env
+    monkeypatch.setenv("ROASTMESH_LANG", "xx")  # unrecognized env
     monkeypatch.delenv("LC_ALL", raising=False)
     monkeypatch.delenv("LC_MESSAGES", raising=False)
     monkeypatch.setenv("LANG", "fr_FR.UTF-8")
@@ -152,7 +152,7 @@ _COLUMN_LABELS_NEVER_LOOKED_UP_VERBATIM = {"Drop °C"}
 
 def _collect_translation_keys() -> set[str]:
     """Every string literal passed as the key argument to t()/tn() anywhere
-    under src/roastnet/gui/*.py, plus the column-header labels in
+    under src/roastmesh/gui/*.py, plus the column-header labels in
     widgets.py's _COLUMNS/_PEER_COLUMNS (see note above)."""
     keys: set[str] = set()
     for path in GUI_DIR.glob("*.py"):

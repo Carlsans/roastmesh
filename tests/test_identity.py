@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from roastnet.identity import (
+from roastmesh.identity import (
     generate_identity,
     load_identity,
     load_or_create_identity,
@@ -20,21 +20,21 @@ def test_generate_identity_has_valid_hex_public_key() -> None:
 
 def test_sign_and_verify_round_trip() -> None:
     identity = generate_identity()
-    signature = identity.sign(b"hello roastnet")
-    assert verify(identity.public_key_hex, b"hello roastnet", signature) is True
+    signature = identity.sign(b"hello roastmesh")
+    assert verify(identity.public_key_hex, b"hello roastmesh", signature) is True
 
 
 def test_verify_fails_on_tampered_data() -> None:
     identity = generate_identity()
-    signature = identity.sign(b"hello roastnet")
-    assert verify(identity.public_key_hex, b"goodbye roastnet", signature) is False
+    signature = identity.sign(b"hello roastmesh")
+    assert verify(identity.public_key_hex, b"goodbye roastmesh", signature) is False
 
 
 def test_verify_fails_with_wrong_public_key() -> None:
     identity = generate_identity()
     other = generate_identity()
-    signature = identity.sign(b"hello roastnet")
-    assert verify(other.public_key_hex, b"hello roastnet", signature) is False
+    signature = identity.sign(b"hello roastmesh")
+    assert verify(other.public_key_hex, b"hello roastmesh", signature) is False
 
 
 def test_verify_fails_on_garbage_signature() -> None:

@@ -10,8 +10,8 @@ import socket
 
 import pytest
 
-from roastnet.dht import bdecode, bencode, encode_compact_addr
-from roastnet.wan_discovery import run_wan_discovery
+from roastmesh.dht import bdecode, bencode, encode_compact_addr
+from roastmesh.wan_discovery import run_wan_discovery
 
 
 class _FakeDhtNode(asyncio.DatagramProtocol):
@@ -159,13 +159,13 @@ async def test_resolve_returns_only_ipv4_addresses() -> None:
     Without `family=AF_INET`, `getaddrinfo` returns AAAA first on any
     IPv6-preferring host and result [0] is then an IPv6 address handed to an
     IPv4 socket: every query vanishes and the node never reaches the DHT at
-    all. Reproduced on a real dual-stack machine, where roastnet reported the
+    all. Reproduced on a real dual-stack machine, where roastmesh reported the
     DHT unreachable while a raw IPv4 probe to the same router answered
     instantly.
     """
     import ipaddress
 
-    from roastnet.wan_discovery import _resolve
+    from roastmesh.wan_discovery import _resolve
 
     resolved = await _resolve([("dht.transmissionbt.com", 6881),
                                ("dht.libtorrent.org", 25401)])

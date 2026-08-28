@@ -4,9 +4,9 @@ import sys
 
 import pytest
 
-from roastnet.lan_discovery import run_beacon
+from roastmesh.lan_discovery import run_beacon
 
-# a dedicated test port so this never collides with a real roastnet node
+# a dedicated test port so this never collides with a real roastmesh node
 # (or another test run) using the production default
 TEST_PORT = 41999
 

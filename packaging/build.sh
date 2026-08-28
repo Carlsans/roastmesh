@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the roastnet/roastnet-gui single binaries for THIS platform.
+# Build the roastmesh/roastmesh-gui single binaries for THIS platform.
 #
 # PyInstaller does not cross-compile: a macOS or Windows build has to be run
 # on that OS, with the `build` extra installed there too. This script is the
@@ -8,8 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-pyinstaller packaging/roastnet.spec --clean --noconfirm
+pyinstaller packaging/roastmesh.spec --clean --noconfirm
 
 echo
 echo "built:"
-ls -lh dist/roastnet dist/roastnet-gui 2>/dev/null || ls -lh dist/
+ls -lh dist/roastmesh dist/roastmesh-gui 2>/dev/null || ls -lh dist/

@@ -2,9 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from roastnet.index import repository as repo
-from roastnet.index.db import connect
-from roastnet.index.ingest import ingest_file, ingest_path, refresh_known_sources
+from roastmesh.index import repository as repo
+from roastmesh.index.db import connect
+from roastmesh.index.ingest import ingest_file, ingest_path, refresh_known_sources
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

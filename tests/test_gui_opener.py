@@ -17,7 +17,7 @@ failure) must be reported, never silent.
 Part two: once Artisan itself was found and launched, it still failed
 with a real IOError, because its Flatpak sandbox can only see
 ~/Documents (confirmed via `flatpak info --show-permissions
-org.artisan_scope.artisan`) -- not the actual roastnet-managed path it
+org.artisan_scope.artisan`) -- not the actual roastmesh-managed path it
 was handed. _find_artisan_launcher/_stage_for_artisan are the fix, kept
 general on purpose (not hardcoded to just the one packaging this was
 found on) so the same class of bug doesn't resurface for some other
@@ -25,10 +25,10 @@ sandboxed distribution of Artisan later.
 
 Part three: even once Artisan launched and could read the file, a
 different real machine hit "openssl not found" / libcrypto.so errors --
-the frozen roastnet-gui sets LD_LIBRARY_PATH to its own PyInstaller temp
+the frozen roastmesh-gui sets LD_LIBRARY_PATH to its own PyInstaller temp
 extraction dir (confirmed via /proc/<pid>/environ on a real frozen
 build), and every external program _run_opener launches inherited it,
-picking up roastnet's *bundled* libcrypto over the system's own.
+picking up roastmesh's *bundled* libcrypto over the system's own.
 _external_subprocess_env is the fix.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ import pytest
 
 pytest.importorskip("tkinter")
 
-from roastnet.gui.app import (
+from roastmesh.gui.app import (
     _external_subprocess_env,
     _find_artisan_launcher,
     _is_snap_wrapper,
@@ -80,7 +80,7 @@ def test_run_opener_reports_success_for_a_still_running_command() -> None:
 
 
 def test_run_opener_reports_an_error_when_the_command_does_not_exist() -> None:
-    error = _run_opener(["roastnet-definitely-not-a-real-command-xyz"])
+    error = _run_opener(["roastmesh-definitely-not-a-real-command-xyz"])
     assert error is not None
     assert "could not run" in error
 
@@ -199,7 +199,7 @@ def test_find_artisan_launcher_flags_staging_for_a_snap_style_path(monkeypatch) 
     # shutil.which is faked directly instead, since only
     # _find_artisan_launcher's own PATH-vs-Snap-path branching is under
     # test here, not shutil.which itself.
-    import roastnet.gui.app as app_module
+    import roastmesh.gui.app as app_module
     monkeypatch.setattr(app_module.shutil, "which",
                          lambda name: "/snap/bin/artisan" if name == "artisan" else None)
     launcher, needs_staging = _find_artisan_launcher("/tmp/roast.alog")
@@ -209,7 +209,7 @@ def test_find_artisan_launcher_flags_staging_for_a_snap_style_path(monkeypatch) 
 
 # _stage_for_artisan: real bug #2, found right after fixing #1 above --
 # Artisan's Flatpak sandbox can only see ~/Documents (confirmed via
-# `flatpak info --show-permissions`), so handing it a raw roastnet path
+# `flatpak info --show-permissions`), so handing it a raw roastmesh path
 # launched Artisan fine but it then failed to read the file at all (a
 # real IOError, seen on a real machine).
 
@@ -222,7 +222,7 @@ def test_stage_for_artisan_copies_into_documents(monkeypatch, tmp_path) -> None:
 
     staged = _stage_for_artisan(str(source))
 
-    assert staged == str(fake_home / "Documents" / ".roastnet-open" / "roast.alog")
+    assert staged == str(fake_home / "Documents" / ".roastmesh-open" / "roast.alog")
     assert Path(staged).read_text() == "roast data"
 
 
@@ -258,7 +258,7 @@ def test_open_alog_file_stages_for_a_flatpak_style_launch(monkeypatch, tmp_path)
 
     assert error is None
     seen_path = (tmp_path / "seen_path.txt").read_text().strip()
-    assert seen_path == str(fake_home / "Documents" / ".roastnet-open" / "roast.alog")
+    assert seen_path == str(fake_home / "Documents" / ".roastmesh-open" / "roast.alog")
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="this path is Linux-specific")
@@ -282,7 +282,7 @@ def test_open_alog_file_does_not_stage_for_a_plain_native_install(monkeypatch, t
 
 # _external_subprocess_env: the real bug behind "openssl not found" /
 # libcrypto.so errors a user hit on a different machine than the one
-# above -- a frozen roastnet-gui's LD_LIBRARY_PATH (pointing at its own
+# above -- a frozen roastmesh-gui's LD_LIBRARY_PATH (pointing at its own
 # PyInstaller temp extraction dir) leaking into every external program
 # _run_opener launches.
 
