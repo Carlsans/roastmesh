@@ -977,6 +977,29 @@ class RoastnetApp(tk.Tk):
         self.wan_discovery_enabled.trace_add(
             "write", lambda *_args: self._apply_discovery_change())
 
+        # Resizing (Ctrl+scroll or Ctrl+plus/minus, Ctrl+0 to go back to
+        # auto-detect) restarts the whole app rather than re-laying-out live
+        # -- see _relaunch_with_scale's docstring for why. bind_all so it
+        # works no matter which tab/widget has focus. Both wheel conventions
+        # are bound: X11 sends Button-4/5, while Windows, macOS and some
+        # Wayland/XWayland Tk builds send MouseWheel.
+        #
+        # These belong here, in __init__, and nowhere else. They spent two
+        # releases misplaced inside _apply_discovery_change, which meant they
+        # were bound only if the user toggled internet discovery *while
+        # serving* -- so Ctrl+scroll silently did nothing on a normal launch,
+        # and the tests missed it by calling _relaunch_with_scale directly
+        # instead of checking that anything was bound to reach it.
+        self.bind_all("<Control-MouseWheel>", self._on_scale_wheel)
+        self.bind_all("<Control-Button-4>", lambda _e: self._nudge_scale(widgets.SCALE_STEP))
+        self.bind_all("<Control-Button-5>", lambda _e: self._nudge_scale(-widgets.SCALE_STEP))
+        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self.bind_all(seq, lambda _e: self._nudge_scale(widgets.SCALE_STEP))
+        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self.bind_all(seq, lambda _e: self._nudge_scale(-widgets.SCALE_STEP))
+        for seq in ("<Control-0>", "<Control-KP_0>"):
+            self.bind_all(seq, lambda _e: self._relaunch_with_scale(None))
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_discovery_change(self) -> None:
@@ -987,23 +1010,6 @@ class RoastnetApp(tk.Tk):
         tab._on_stop_serve()
         # Give the old process a moment to release its ports before rebinding.
         self.after(800, tab._on_start_serve)
-
-        # Resizing (Ctrl+scroll or Ctrl+plus/minus, Ctrl+0 to go back to
-        # auto-detect) restarts the whole app rather than re-laying-out live
-        # -- see _relaunch_with_scale's docstring for why. bind_all so it
-        # works no matter which tab/widget has focus. Both wheel
-        # conventions are bound since this app only ships for Linux/X11
-        # (Button-4/5), but a Wayland/XWayland Tk build may deliver
-        # MouseWheel instead depending on the compositor.
-        self.bind_all("<Control-MouseWheel>", self._on_scale_wheel)
-        self.bind_all("<Control-Button-4>", lambda _e: self._nudge_scale(widgets.SCALE_STEP))
-        self.bind_all("<Control-Button-5>", lambda _e: self._nudge_scale(-widgets.SCALE_STEP))
-        for seq in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
-            self.bind_all(seq, lambda _e: self._nudge_scale(widgets.SCALE_STEP))
-        for seq in ("<Control-minus>", "<Control-KP_Subtract>"):
-            self.bind_all(seq, lambda _e: self._nudge_scale(-widgets.SCALE_STEP))
-        for seq in ("<Control-0>", "<Control-KP_0>"):
-            self.bind_all(seq, lambda _e: self._relaunch_with_scale(None))
 
     def _on_scale_wheel(self, event: tk.Event) -> None:
         self._nudge_scale(widgets.SCALE_STEP if event.delta > 0 else -widgets.SCALE_STEP)

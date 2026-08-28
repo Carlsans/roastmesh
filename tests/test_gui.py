@@ -836,3 +836,34 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "BEFORE False" in r.stdout, r.stdout
     assert "AFTER True" in r.stdout, r.stdout
+
+
+def test_scale_keyboard_shortcuts_are_bound_at_startup(tmp_path: Path) -> None:
+    """The Ctrl+scroll / Ctrl+plus / Ctrl+0 bindings must exist on a plain
+    launch, with nothing else touched first.
+
+    They spent two releases misplaced inside _apply_discovery_change, so they
+    were only ever bound if the user toggled internet discovery while serving
+    -- meaning the documented way to resize the interface silently did nothing.
+    The existing scale tests all called _relaunch_with_scale directly, which
+    exercised the handler while proving nothing about whether any key could
+    reach it. This asserts the binding itself.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.update()
+for seq in ("<Control-MouseWheel>", "<Control-Button-4>", "<Control-Button-5>",
+            "<Control-plus>", "<Control-minus>", "<Control-0>"):
+    print("BOUND", seq, bool(app.bind_all(seq)))
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    unbound = [line for line in r.stdout.splitlines()
+               if line.startswith("BOUND") and line.endswith("False")]
+    assert not unbound, f"scale shortcuts not bound at startup: {unbound}"
