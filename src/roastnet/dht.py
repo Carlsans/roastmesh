@@ -316,8 +316,24 @@ class DhtClient:
         )
 
     async def announce_peer(self, addr: Addr, info_hash: bytes, token: bytes, *, timeout: float = 4.0) -> dict | None:
+        """Announce under this socket's address.
+
+        `implied_port=1` asks the storing node to use the packet's source port,
+        which is the only correct value behind NAT (the external port differs
+        from ours). But observed on the real swarm: some nodes store the
+        *literal value* of implied_port instead, publishing peers as
+        `<ip>:1` -- an address no hello can ever reach. Sending our real local
+        port rather than the customary 0 costs nothing and gives those nodes
+        something usable; nodes that honour implied_port ignore it, and a
+        non-NAT host (a VPS, where this was caught) is then advertised
+        correctly either way."""
+        local_port = 0
+        try:
+            local_port = int(self._transport.get_extra_info("sockname")[1])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            pass
         return await self._query(addr, "announce_peer", {
-            b"id": self.own_id, b"info_hash": info_hash, b"port": 0,
+            b"id": self.own_id, b"info_hash": info_hash, b"port": local_port,
             b"implied_port": 1, b"token": token,
         }, timeout=timeout)
 
