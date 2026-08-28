@@ -796,3 +796,41 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "CURRENT_LANGUAGE en" in r.stdout, r.stdout
     assert "TAB0_TEXT Search" in r.stdout, r.stdout
+
+
+def test_toggling_internet_discovery_restarts_serving_with_the_new_flag(tmp_path: Path) -> None:
+    """Ticking the Settings checkbox has to actually turn discovery on.
+
+    Serving auto-starts at launch and `--wan-discovery` is decided once, right
+    then, so before this the checkbox silently changed nothing until the user
+    also found Stop-then-Start on the Network tab. That cost a real user an
+    evening of "it's supposed to be on" while their node never announced
+    itself -- exactly the kind of failure that looks like a network problem
+    and isn't.
+    """
+    home = tmp_path / "home"
+    (home / ".local" / "share" / "roastnet").mkdir(parents=True)
+    (home / ".local" / "share" / "roastnet" / "gui_config.json").write_text(
+        '{"wan_discovery_enabled": false}')
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastnet.gui.app import RoastnetApp
+app = RoastnetApp()
+app.update()
+net_tab = app.network_tab
+print("BEFORE", "--wan-discovery" in net_tab.serve_task.argv)
+
+app.wan_discovery_enabled.set(True)
+for _ in range(60):          # the restart is deferred via after(); let it land
+    app.update()
+    time.sleep(0.05)
+    if "--wan-discovery" in net_tab.serve_task.argv:
+        break
+print("AFTER", "--wan-discovery" in net_tab.serve_task.argv)
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "BEFORE False" in r.stdout, r.stdout
+    assert "AFTER True" in r.stdout, r.stdout

@@ -837,8 +837,9 @@ class SettingsTab(Tab):
                   "roastnet's own involved. The trade-off: your public IP address (and the fact "
                   "that it's running roastnet) becomes visible to anyone else looking at that same "
                   "swarm, which a LAN broadcast never exposes. Uncheck this if you'd rather only "
-                  "ever be found on your local network. Restart serving (Network tab: Stop, then "
-                  "Start) after changing this."))
+                  "ever be found on your local network. Takes effect immediately -- serving "
+                  "restarts on its own when you change this, so the ticket on the Network "
+                  "tab will change."))
         ttk.Checkbutton(wan_section, text=t("Find peers over the whole internet, not just my LAN"),
                          variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
 
@@ -962,8 +963,27 @@ class RoastnetApp(tk.Tk):
         notebook.add(network_tab, text=t("Network"))
         notebook.add(settings_tab, text=t("Settings"))
         self.tabs: list[Tab] = [search_tab, publish_tab, network_tab, settings_tab]
+        self.network_tab = network_tab
+        # Ticking "find peers over the whole internet" has to actually turn it
+        # on. Serving auto-starts at launch and `--wan-discovery` is decided
+        # once, right then (NetworkTab._on_start_serve), so until now the
+        # checkbox changed nothing until the user also found Stop-then-Start on
+        # another tab. Nobody reads a checkbox that way -- it cost a real user
+        # an evening of "it's supposed to be on" while their node never
+        # announced itself.
+        self.wan_discovery_enabled.trace_add(
+            "write", lambda *_args: self._apply_discovery_change())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _apply_discovery_change(self) -> None:
+        """Restart serving so the new discovery setting takes effect now."""
+        tab = getattr(self, "network_tab", None)
+        if tab is None or tab.serve_task is None or not tab.serve_task.running:
+            return  # not serving yet; the next start picks it up anyway
+        tab._on_stop_serve()
+        # Give the old process a moment to release its ports before rebinding.
+        self.after(800, tab._on_start_serve)
 
         # Resizing (Ctrl+scroll or Ctrl+plus/minus, Ctrl+0 to go back to
         # auto-detect) restarts the whole app rather than re-laying-out live
