@@ -123,13 +123,22 @@ def udp_socket(port: int) -> socket.socket:
     this is a plain UDP socket.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    if hasattr(socket, "SIO_UDP_CONNRESET"):
-        try:
-            sock.ioctl(socket.SIO_UDP_CONNRESET, False)  # type: ignore[attr-defined]
-        except OSError:
-            pass  # not fatal: worst case is the pre-existing Windows behaviour
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", port))
+    if hasattr(socket, "SIO_UDP_CONNRESET"):
+        # After bind, not before: applied to an unbound socket this silently
+        # failed to take effect, and CI then showed the very error it is meant
+        # to suppress -- "dht: socket error: ConnectionResetError(10054)",
+        # with the lookup collapsing to 2/19 replied.
+        #
+        # And reported, not swallowed. The first version passed on `except
+        # OSError: pass`, so a call that never worked looked identical to one
+        # that did, and the resulting failure got misread as a timeout.
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)  # type: ignore[attr-defined]
+        except OSError as exc:
+            print(f"dht: could not disable UDP connection-reset reporting ({exc!r}); "
+                  "discovery may stall on this machine", flush=True)
     sock.setblocking(False)
     return sock
 
