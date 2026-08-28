@@ -44,17 +44,33 @@ jobs:
         run: pyinstaller packaging/roastmesh.spec --clean --noconfirm
 
       - name: Smoke-test the binaries
-        # Mirrors packaging/test-docker.sh: prove the CLI runs (which exercises
-        # the bundled cryptography and iroh native libraries) and that the GUI
-        # survives startup rather than exiting immediately.
+        # Prove the CLI runs (which exercises the bundled cryptography and iroh
+        # native libraries) and that the GUI actually *starts*.
+        #
+        # "Still running after N seconds" is not sufficient on Windows, and
+        # trusting it shipped a completely broken GUI to a user: PyInstaller
+        # reports fatal startup errors in a dialog, which keeps the process
+        # alive, so this check passed while roastmesh-gui.exe was dying on a
+        # missing module. The honest signal is the single-instance listener --
+        # the GUI binds it in main(), so it can only be there if startup
+        # genuinely got that far.
         shell: pwsh
         run: |
           .\dist\roastmesh.exe --version
           .\dist\roastmesh.exe identity show
           $gui = Start-Process -FilePath .\dist\roastmesh-gui.exe -PassThru
-          Start-Sleep -Seconds 10
-          if ($gui.HasExited) { throw "roastmesh-gui.exe exited early (code $($gui.ExitCode))" }
-          Write-Host "GUI still running after 10s -- OK"
+          $listening = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            if ($gui.HasExited) { throw "roastmesh-gui.exe exited early (code $($gui.ExitCode))" }
+            $c = New-Object Net.Sockets.TcpClient
+            try { $c.Connect("127.0.0.1", 41892); $listening = $true } catch { } finally { $c.Close() }
+            if ($listening) { break }
+          }
+          if (-not $listening) {
+            throw "roastmesh-gui.exe is running but never bound its single-instance port -- it did not actually start (a PyInstaller error dialog keeps the process alive)"
+          }
+          Write-Host "GUI started and bound its single-instance port -- OK"
           Stop-Process -Id $gui.Id -Force
 
       - name: Check the DHT is reachable from the packaged build

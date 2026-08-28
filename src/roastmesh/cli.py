@@ -19,6 +19,7 @@ from roastmesh.index.db import connect, get_meta, set_meta
 from roastmesh.index.ingest import ingest_feed, ingest_file, ingest_path, refresh_known_sources
 from roastmesh.peers import Peer, default_peers_path, load_peers, node_id_from_ticket, prune_stale, save_peers, upsert_peer
 from roastmesh.watch_folder import default_watch_dir
+from roastmesh import asyncio_policy
 
 DEFAULT_DB = "roastmesh.sqlite3"
 
@@ -51,6 +52,10 @@ def _report_ingest_results(results) -> None:
 @click.pass_context
 def main(ctx: click.Context, db: str) -> None:
     """Local parser, metadata extractor, and search index for Artisan .alog roast profiles."""
+    # Before any asyncio.run() below -- see roastmesh.asyncio_policy for why
+    # Windows needs a different loop, and why this is applied here rather than
+    # from the package root.
+    asyncio_policy.apply()
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db
 
