@@ -45,6 +45,7 @@ WAN_PORT = 41890
 DHT_LOOKUP_INTERVAL_S = 120.0
 HELLO_RESYNC_S = 60.0  # minimum time between (re-)helloing the same address/peer
 HELLO_RETRIES = (0.0, 2.0, 6.0)  # see _hello_with_retries
+RETRY_INTERVAL_S = 20.0  # after a round that announced to nobody; see run_wan_discovery
 
 SWARM_INFO_HASH = hashlib.sha1(b"roastnet-swarm-v1").digest()
 
@@ -108,6 +109,7 @@ async def run_wan_discovery(
     port: int = WAN_PORT,
     lookup_interval_s: float = DHT_LOOKUP_INTERVAL_S,
     hello_resync_s: float = HELLO_RESYNC_S,
+    retry_interval_s: float = RETRY_INTERVAL_S,
     bootstrap_nodes: list[Addr] | None = None,
     info_hash: bytes = SWARM_INFO_HASH,
     node_cache_path=None,
@@ -128,6 +130,7 @@ async def run_wan_discovery(
     own_id = hashlib.sha1(bytes.fromhex(own_pubkey_hex)).digest()
     client = await DhtClient.bind(port=port, own_id=own_id)
     node_cache = load_node_cache(cache_path)
+    failed_rounds = 0
 
     last_helloed: dict[Addr, float] = {}
     last_seen_pubkey: dict[str, float] = {}
@@ -218,6 +221,22 @@ async def run_wan_discovery(
                 on_round(stats)
             for addr in addrs:
                 _maybe_hello(addr)
-            await asyncio.sleep(lookup_interval_s)
+
+            # Retry sooner when a round achieved nothing, instead of sitting
+            # out the full interval. Measured: a healthy first round makes a
+            # brand-new node discoverable by a stranger in under 15 seconds --
+            # but a round where no node accepted the announcement (the routers
+            # answer `get_peers` without a token, so a cold start can land
+            # there) left the node invisible for the whole 120s until the next
+            # one. The average was never the problem; that worst case was.
+            # Backs off to the normal interval as soon as a round succeeds, so
+            # steady-state traffic is unchanged.
+            if stats.announced > 0:
+                failed_rounds = 0
+                delay = lookup_interval_s
+            else:
+                failed_rounds += 1
+                delay = min(retry_interval_s * (2 ** (failed_rounds - 1)), lookup_interval_s)
+            await asyncio.sleep(delay)
     finally:
         client.close()
