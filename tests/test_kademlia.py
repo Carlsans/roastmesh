@@ -318,8 +318,14 @@ async def test_lookup_survives_nodes_that_never_answer_and_give_no_token() -> No
     client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20))
     try:
         stats = LookupStats()
+        # 3s, not 1s. The dead seed has to time out for this test to mean
+        # anything, so the budget is real wall-clock time -- and 1s proved too
+        # tight on a loaded Windows CI runner driving 150 in-process nodes,
+        # failing there while passing on the previous run of the same code.
+        # The point of the test is that a dead seed doesn't stop the lookup,
+        # not how fast the rest of the swarm answers.
         await client.discover_and_announce_peers(
-            info_hash, [dead, *swarm.seeds()], timeout=1.0, stats=stats,
+            info_hash, [dead, *swarm.seeds()], timeout=3.0, stats=stats,
         )
         assert stats.announced > 0, f"dead seed broke the lookup: {stats.summary()}"
         assert stats.queried > stats.replied  # the dead one was genuinely tried
