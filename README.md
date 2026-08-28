@@ -57,6 +57,15 @@ Download **`roastnet-setup-x86_64.exe`** from the
 your user profile (no administrator prompt), adds a Start Menu entry, and can be removed from
 Add/Remove Programs. Windows 10 or 11, 64-bit.
 
+**Tick "Private networks" when Windows asks.** Shortly after you first open roastnet, Windows
+Firewall asks whether to allow it on a network. **Private networks must be ticked** — otherwise
+Windows blocks the beacon roastnet uses to find other machines on your home or studio network,
+and it will quietly find nobody there with nothing to suggest a firewall is why. Sharing over the
+internet doesn't depend on this, only local-network discovery does.
+
+Missed the prompt? Fix it under **Windows Security → Firewall & network protection → Allow an app
+through firewall**, find roastnet, and make sure the Private column is ticked.
+
 **Windows will warn you the first time.** The installer is not code-signed — a certificate is an
 annual expense this project doesn't carry — so SmartScreen shows *"Windows protected your PC"*.
 Click **More info → Run anyway**. That warning means "we don't recognise the publisher", not
@@ -175,7 +184,9 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
 
 - **LAN discovery** (on by default): a small UDP broadcast on your local network (port `41888`)
   — any roastnet node nearby announces itself and reacts to others' announcements. Never leaves
-  the local network.
+  the local network. **On Windows this needs the firewall to allow roastnet on private networks**
+  (see [Install](#windows--one-installer)); if that box wasn't ticked, LAN discovery finds nothing
+  and gives no indication why.
 - **Internet-wide discovery** (on by default in the GUI's Settings tab; off by default from the
   CLI, where it's an explicit opt-in `--wan-discovery` flag): the same idea,
   extended to the whole internet, as easy to join as a BitTorrent swarm. Every opted-in roastnet

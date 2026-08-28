@@ -36,6 +36,15 @@ BrandingText    "${APPNAME} ${VERSION}"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\roastnet-gui.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Open roastnet"
 
+; Shown at exactly the moment it matters: Windows raises its firewall prompt
+; the first time roastnet opens a listening socket, which is seconds after
+; this page. "Private networks" is unticked by default in some Windows
+; configurations, and without it the LAN beacon is blocked -- roastnet then
+; finds nobody on the home network and looks broken, with nothing to indicate
+; a firewall is the cause.
+!define MUI_FINISHPAGE_TITLE "roastnet is installed"
+!define MUI_FINISHPAGE_TEXT "One thing before you start.$\r$\n$\r$\nWhen Windows asks whether to allow roastnet on a network, tick PRIVATE NETWORKS. Windows Firewall otherwise blocks the beacon roastnet uses to find other machines on your home or studio network, and it will quietly find nobody there.$\r$\n$\r$\nIf you miss the prompt, you can fix it later under Windows Security > Firewall & network protection > Allow an app through firewall.$\r$\n$\r$\nSharing over the internet does not depend on this."
+
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
