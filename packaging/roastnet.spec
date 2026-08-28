@@ -54,6 +54,13 @@ package_datas = [
     *iroh_datas,
 ]
 
+# Windows shows this in the taskbar, Alt-Tab, the title bar, Explorer and
+# Add/Remove Programs; without it the app is a generic Tk feather everywhere.
+# PyInstaller ignores `icon` on Linux, so this is harmless there. The .ico is
+# multi-resolution (16..256) because Windows picks a different size per
+# context and will scale one badly if it has to.
+ICON = str(ROOT / "packaging" / "roastnet.ico")
+
 common_kwargs = dict(
     pathex=[str(SRC)],
     binaries=iroh_binaries,
@@ -70,7 +77,7 @@ cli_analysis = Analysis([str(ROOT / "packaging" / "entry_cli.py")], **common_kwa
 cli_pyz = PYZ(cli_analysis.pure)
 cli_exe = EXE(
     cli_pyz, cli_analysis.scripts, cli_analysis.binaries, cli_analysis.zipfiles, cli_analysis.datas,
-    [], name="roastnet", console=True,
+    [], name="roastnet", console=True, icon=ICON,
 )
 
 # -- GUI ------------------------------------------------------------------
@@ -81,5 +88,5 @@ gui_analysis = Analysis(
 gui_pyz = PYZ(gui_analysis.pure)
 gui_exe = EXE(
     gui_pyz, gui_analysis.scripts, gui_analysis.binaries, gui_analysis.zipfiles, gui_analysis.datas,
-    [], name="roastnet-gui", console=False,
+    [], name="roastnet-gui", console=False, icon=ICON,
 )

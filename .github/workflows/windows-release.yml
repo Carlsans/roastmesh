@@ -1,0 +1,112 @@
+name: Windows build
+
+# Windows binaries cannot be produced on the Linux machine this project is
+# developed on -- PyInstaller does not cross-compile -- so this is the only
+# path to a Windows artifact. The Linux release deliberately stays a manual
+# `packaging/build-docker.sh` run, because that pipeline is already verified
+# against five distros and there is no reason to disturb it.
+#
+# On a tag push the installer is attached to that tag's GitHub release.
+# workflow_dispatch builds and uploads an artifact without releasing, which is
+# how to test a change to this file without cutting a version.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to attach assets to the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[build,dev]"
+
+      - name: Run the test suite on Windows
+        # The highest-value step here. These fixes were written by auditing,
+        # without a Windows machine to try them on, so this is the first thing
+        # that actually executes them on the target platform -- the process
+        # cancellation path, the UTF-8 file handling, the socket setup.
+        run: pytest -q
+
+      - name: Build the binaries
+        run: pyinstaller packaging/roastnet.spec --clean --noconfirm
+
+      - name: Smoke-test the binaries
+        # Mirrors packaging/test-docker.sh: prove the CLI runs (which exercises
+        # the bundled cryptography and iroh native libraries) and that the GUI
+        # survives startup rather than exiting immediately.
+        shell: pwsh
+        run: |
+          .\dist\roastnet.exe --version
+          .\dist\roastnet.exe identity show
+          $gui = Start-Process -FilePath .\dist\roastnet-gui.exe -PassThru
+          Start-Sleep -Seconds 10
+          if ($gui.HasExited) { throw "roastnet-gui.exe exited early (code $($gui.ExitCode))" }
+          Write-Host "GUI still running after 10s -- OK"
+          Stop-Process -Id $gui.Id -Force
+
+      - name: Check the DHT is reachable from the packaged build
+        # The feature this whole release exists to deliver. Windows has a UDP
+        # quirk (see dht.py's udp_socket) that would make discovery fail
+        # silently; this is what would catch a regression in that fix.
+        shell: pwsh
+        continue-on-error: true      # a runner's egress may block the DHT; informational
+        run: .\dist\roastnet.exe node doctor
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          if (-not $version) { $version = "0.0.0" }
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "/DVERSION=$version" packaging\roastnet.nsi
+
+      - name: Test the installer end to end
+        # Catches the "works from dist\, broken once installed" class -- which
+        # is exactly how the Linux side once shipped translations that worked
+        # from source and silently fell back to English when packaged.
+        shell: pwsh
+        run: |
+          .\dist\roastnet-setup-x86_64.exe /S
+          Start-Sleep -Seconds 10
+          $dir = "$env:LOCALAPPDATA\Programs\roastnet"
+          foreach ($f in @("roastnet.exe", "roastnet-gui.exe", "uninstall.exe")) {
+            if (-not (Test-Path "$dir\$f")) { throw "installer did not place $f" }
+          }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\roastnet.lnk")) {
+            throw "Start Menu shortcut missing"
+          }
+          & "$dir\roastnet.exe" --version
+          & "$dir\uninstall.exe" /S
+          Start-Sleep -Seconds 10
+          if (Test-Path "$dir\roastnet.exe") { throw "uninstaller left roastnet.exe behind" }
+          Write-Host "install -> run -> uninstall OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roastnet-windows
+          path: |
+            dist/roastnet.exe
+            dist/roastnet-gui.exe
+            dist/roastnet-setup-x86_64.exe
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The Linux assets are named bare `roastnet` / `roastnet-gui` and
+        # install.sh fetches those exact names, so the .exe names coexist with
+        # them. Renaming the Linux assets would break every copy of install.sh
+        # already in circulation.
+        run: gh release upload "${{ github.ref_name }}" dist/roastnet.exe dist/roastnet-gui.exe dist/roastnet-setup-x86_64.exe --clobber

@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (on by default in the GUI, opt-in from the CLI) over the whole internet
 via the public BitTorrent DHT, no tracker or bootstrap node of roastnet's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 278 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 280 tests, all passing.
 
 The desktop app (`roastnet-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -47,8 +47,21 @@ forward-compatible only, so building on an old base is what makes the same binar
 systems too — see `packaging/Dockerfile.build` for why this matters) and are verified, in Docker,
 to actually run — both the CLI and the GUI under Xvfb — on Ubuntu 22.04, Ubuntu 24.04, Debian 12,
 Fedora, and Arch Linux (`packaging/test-docker.sh` reruns this check any time). x86_64 only for
-now; no prebuilt binaries yet for other architectures or for macOS/Windows (PyInstaller doesn't
-cross-compile) — see the from-source option below for those.
+now; no prebuilt binaries yet for other architectures or for macOS — see the from-source option
+below for those.
+
+### Windows — one installer
+
+Download **`roastnet-setup-x86_64.exe`** from the
+[latest release](https://github.com/Carlsans/roastnet/releases/latest) and run it. It installs to
+your user profile (no administrator prompt), adds a Start Menu entry, and can be removed from
+Add/Remove Programs. Windows 10 or 11, 64-bit.
+
+**Windows will warn you the first time.** The installer is not code-signed — a certificate is an
+annual expense this project doesn't carry — so SmartScreen shows *"Windows protected your PC"*.
+Click **More info → Run anyway**. That warning means "we don't recognise the publisher", not
+"this is known to be harmful"; if you'd rather not take that on faith, the from-source install
+below avoids it entirely.
 
 **ARM (e.g. Raspberry Pi OS)**: no prebuilt binary yet, but the from-source install below works —
 confirmed with a real install and a real generated identity under aarch64 emulation. This needs
@@ -342,10 +355,16 @@ Two ways to produce `dist/roastnet` + `dist/roastnet-gui`:
   is only guaranteed to run on systems at least as new as the build machine — not what you want
   for something you're about to hand to someone else.
 
-Either way, this has to be run **on each target OS** — PyInstaller does not cross-compile. Only
-Linux x86_64 exists today (built and verified, including running fully standalone with no dev
-environment present, a real two-binary network sync, and — via `packaging/test-docker.sh` — actually
-running on 5 different distros in Docker); macOS and Windows builds are unbuilt and unverified.
+Either way, this has to be run **on each target OS** — PyInstaller does not cross-compile.
+
+Linux x86_64 is built here and verified running standalone with no dev environment present, doing
+a real two-binary network sync, and — via `packaging/test-docker.sh` — actually running on 5
+distros in Docker.
+
+Windows x86_64 is built by `.github/workflows/windows-release.yml` on a GitHub Actions runner,
+since it can't be produced from a Linux machine. That job runs the full test suite on Windows,
+smoke-tests both binaries, and installs, runs and uninstalls the installer before attaching it to
+the release. macOS remains unbuilt and unverified.
 
 ## Development
 
