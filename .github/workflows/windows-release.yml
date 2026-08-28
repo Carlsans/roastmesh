@@ -70,7 +70,25 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}" -replace '^v', ''
           if (-not $version) { $version = "0.0.0" }
-          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "/DVERSION=$version" packaging\roastnet.nsi
+
+          # Located rather than assumed: NSIS ships on the runner images, but
+          # not always at the same path (a hardcoded Program Files (x86) path
+          # failed outright on windows-latest), and the image contents drift.
+          $nsis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $nsis) {
+            foreach ($p in @("${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+                             "$env:ProgramFiles\NSIS\makensis.exe",
+                             "$env:ChocolateyInstall\bin\makensis.exe")) {
+              if ($p -and (Test-Path $p)) { $nsis = $p; break }
+            }
+          }
+          if (-not $nsis) {
+            choco install nsis -y --no-progress | Out-Null
+            $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          }
+          Write-Host "using $nsis"
+          & $nsis "/DVERSION=$version" packaging\roastnet.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
 
       - name: Test the installer end to end
         # Catches the "works from dist\, broken once installed" class -- which
