@@ -1039,6 +1039,16 @@ class RoastnetApp(tk.Tk):
         self._ui_scale_override = new_scale
         self._save_config()
         self._on_close()
+        # os.execv replaces the process on POSIX. Windows has no real execv --
+        # CPython emulates it by spawning and exiting, which changes the PID
+        # and detaches the new process from whatever launched it. Spawning
+        # explicitly and exiting is the same thing, minus the pretence.
+        if sys.platform == "win32":
+            subprocess.Popen(
+                [sys.executable, *sys.argv[1:]],
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            sys.exit(0)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _save_config(self) -> None:
@@ -1075,7 +1085,14 @@ def main(*, single_instance_port: int = single_instance.PORT) -> None:
     def _handle_terminate(signum, frame) -> None:
         app._on_close()
 
-    signal.signal(signal.SIGTERM, _handle_terminate)
+    # Windows accepts this call but never actually delivers SIGTERM (Task
+    # Manager "End task" is a TerminateProcess, which gives no notification at
+    # all), so the orphaned-`node serve` protection described above is POSIX
+    # only. On Windows the equivalent guarantee comes from cancel()'s
+    # `taskkill /T`, which reaches the child tree when the window closes
+    # normally. Guarded rather than assumed, so a future reader isn't misled.
+    if hasattr(signal, "SIGTERM") and sys.platform != "win32":
+        signal.signal(signal.SIGTERM, _handle_terminate)
 
     focus_requests: queue.Queue = queue.Queue()
     # start_focus_listener's callback runs on a background thread -- Tk

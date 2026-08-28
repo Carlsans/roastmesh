@@ -66,9 +66,15 @@ class Task:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # interleave, so failures appear in order
                 text=True,
+                # The CLI prints degree signs and, in French, accented text.
+                # Without an explicit encoding this decodes as cp1252 on
+                # Windows and either mangles the console output or raises
+                # inside the read loop below.
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
                 # Own process group, so cancel() can take down children too.
-                start_new_session=True,
+                **_process_group_kwargs(),
             )
         except FileNotFoundError as exc:
             self.output.put(("error", t("could not start: {error}", error=exc)))
@@ -98,19 +104,60 @@ class Task:
         self.output.put(("done", str(code)))
 
     def cancel(self) -> None:
-        """Stop the command. Safe to call when nothing is running."""
+        """Stop the command, and its children, on either platform.
+
+        Killing the whole tree matters more than it looks: `node serve` is the
+        long-lived child, and leaving it behind means an invisible node that
+        keeps serving, discovering and auto-publishing with no window attached
+        -- a leak this project has already hit for real on Linux.
+
+        The POSIX path signals the process group. On Windows there are no
+        process groups in that sense and `os.killpg`/`os.getpgid`/`SIGKILL` do
+        not exist at all -- they would raise AttributeError, which the old
+        `except (ProcessLookupError, PermissionError)` did not catch, so every
+        Cancel press and every window close would have thrown and left the app
+        unclosable. `taskkill /T` is the Windows equivalent that reaches
+        descendants; `proc.terminate()` alone would only kill the direct child.
+        """
         self._cancelled = True
         proc = self._proc
         if proc is None or proc.poll() is not None:
             return
         try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=10,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                proc.wait(timeout=5)
+                return
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass  # already gone
+        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired, OSError):
+            pass  # already gone, or refused -- either way there is nothing left to do
+
+
+def _process_group_kwargs() -> dict:
+    """Popen kwargs that put the child where cancel() can reach its whole tree.
+
+    POSIX gets its own session; Windows gets its own process group plus
+    CREATE_NO_WINDOW. That last flag is not cosmetic polish: `roastnet.exe` is
+    a console binary, so without it every command the GUI runs flashes a black
+    console window -- including the peer-list refresh, which fires every 30
+    seconds for as long as the app is open.
+
+    `start_new_session` is silently ignored on Windows rather than raising, so
+    the old code left the child in the parent's group and the "cancel can take
+    down children too" guarantee simply did not hold there.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))}
+    return {"start_new_session": True}
 
 
 def roastnet_argv(*args: str) -> list[str]:

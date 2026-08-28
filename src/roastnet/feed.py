@@ -79,7 +79,7 @@ def _blobs_dir(feed_dir: Path) -> Path:
 
 
 def feed_pubkey(feed_dir: Path) -> str:
-    return (feed_dir / "pubkey.txt").read_text().strip()
+    return (feed_dir / "pubkey.txt").read_text(encoding="utf-8").strip()
 
 
 def _init_feed_dir(feed_dir: Path, pubkey_hex: str) -> None:
@@ -88,11 +88,11 @@ def _init_feed_dir(feed_dir: Path, pubkey_hex: str) -> None:
     _blobs_dir(feed_dir).mkdir(exist_ok=True)
     pubkey_path = feed_dir / "pubkey.txt"
     if pubkey_path.exists():
-        existing = pubkey_path.read_text().strip()
+        existing = pubkey_path.read_text(encoding="utf-8").strip()
         if existing != pubkey_hex:
             raise ValueError(f"{feed_dir} already belongs to a different feed ({existing})")
     else:
-        pubkey_path.write_text(pubkey_hex + "\n")
+        pubkey_path.write_text(pubkey_hex + "\n", encoding="utf-8")
 
 
 def read_entries(feed_dir: Path) -> list[FeedEntry]:
@@ -101,7 +101,7 @@ def read_entries(feed_dir: Path) -> list[FeedEntry]:
         return []
     entries = []
     for path in sorted(entries_dir.glob("*.json")):
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         entries.append(FeedEntry(**data))
     return entries
 
@@ -129,7 +129,7 @@ def append_entry(feed_dir: Path, identity: Identity, alog_path: Path, *, timesta
                        prev_hash=prev_hash, size_bytes=size_bytes, signature=signature)
 
     entry_path = _entries_dir(feed_dir) / f"{seq:08d}.json"
-    entry_path.write_text(json.dumps(entry.__dict__, sort_keys=True))
+    entry_path.write_text(json.dumps(entry.__dict__, sort_keys=True), encoding="utf-8")
     return entry
 
 
@@ -200,4 +200,4 @@ def write_received_entry(feed_dir: Path, pubkey_hex: str, entry: FeedEntry, blob
 
     entry_path = _entries_dir(feed_dir) / f"{entry.seq:08d}.json"
     if not entry_path.exists():
-        entry_path.write_text(json.dumps(entry.__dict__, sort_keys=True))
+        entry_path.write_text(json.dumps(entry.__dict__, sort_keys=True), encoding="utf-8")

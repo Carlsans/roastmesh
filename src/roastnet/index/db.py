@@ -53,7 +53,7 @@ def _apply_added_columns(conn: sqlite3.Connection) -> None:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    schema_sql = resources.files("roastnet.index").joinpath("schema.sql").read_text()
+    schema_sql = resources.files("roastnet.index").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(schema_sql)
     _apply_added_columns(conn)
     conn.commit()

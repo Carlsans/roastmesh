@@ -22,6 +22,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 
+from roastnet.dht import udp_socket
 from roastnet.hello import decode_hello, encode_hello
 
 BEACON_PORT = 41888
@@ -45,6 +46,12 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
     def __init__(self, own_pubkey_hex: str, handle: Callable[[str, str], None]) -> None:
         self._own_pubkey_hex = own_pubkey_hex
         self._handle = handle
+
+    def error_received(self, exc: Exception) -> None:
+        # Surfaced rather than swallowed, for the same reason as dht.py's:
+        # a transport that has quietly stopped reading is indistinguishable
+        # from a network with no peers on it.
+        print(f"lan: socket error: {exc!r}", flush=True)
 
     def datagram_received(self, data: bytes, addr) -> None:
         decoded = decode_hello(data)
@@ -84,13 +91,15 @@ async def run_beacon(
         last_seen[pubkey] = now
         asyncio.create_task(on_peer_discovered(pubkey, ticket))
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # udp_socket() applies SO_REUSEADDR, the bind, and -- on Windows -- the
+    # SIO_UDP_CONNRESET ioctl that stops one ICMP "port unreachable" from
+    # making the socket permanently deaf. See its docstring in dht.py; a
+    # beacon broadcasting to a LAN where nothing is listening provokes exactly
+    # that.
+    sock = udp_socket(port)
     if hasattr(socket, "SO_REUSEPORT"):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.bind(("0.0.0.0", port))
-    sock.setblocking(False)
 
     transport, _ = await loop.create_datagram_endpoint(
         lambda: _BeaconProtocol(own_pubkey_hex, _handle), sock=sock,

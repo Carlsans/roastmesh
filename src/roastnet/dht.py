@@ -76,7 +76,7 @@ def load_node_cache(path) -> dict[Addr, bytes]:
     stopped 2^158 from the target. Warm nodes make a lookup independent of
     whether a router feels like answering today."""
     try:
-        raw = json.loads(Path(path).read_text())
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     cache: dict[Addr, bytes] = {}
@@ -97,9 +97,41 @@ def save_node_cache(path, nodes: dict[Addr, bytes], *, limit: int = 400) -> None
     try:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(items))
+        path.write_text(json.dumps(items), encoding="utf-8")
     except OSError:
         pass
+
+
+def udp_socket(port: int) -> socket.socket:
+    """A UDP socket that keeps receiving after a peer refuses a datagram.
+
+    Windows-critical. On Windows, when a datagram provokes an ICMP Port
+    Unreachable, the *next* `recvfrom` on that socket fails with
+    WSAECONNRESET -- and asyncio's default Proactor transport reports that to
+    `error_received()` and then stops reading altogether. The socket goes
+    permanently deaf, silently.
+
+    A DHT talks to dead nodes constantly by design: two of the well-known
+    bootstrap routers resolve but never answer, and a *good* lookup round here
+    was measured at 25 replies out of 34. So this fires within seconds of the
+    first round, and the symptom -- endless "0/N replied" -- is indistinguishable
+    from a firewall blocking us, which is the exact misdiagnosis `node doctor`
+    exists to prevent.
+
+    SIO_UDP_CONNRESET(False) tells Windows not to surface those resets. The
+    constant only exists on Windows, hence the guard; on every other platform
+    this is a plain UDP socket.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if hasattr(socket, "SIO_UDP_CONNRESET"):
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)  # type: ignore[attr-defined]
+        except OSError:
+            pass  # not fatal: worst case is the pre-existing Windows behaviour
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    sock.setblocking(False)
+    return sock
 
 
 def distance(a: bytes, b: bytes) -> int:
@@ -222,6 +254,13 @@ class _DhtProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
 
+    def error_received(self, exc: Exception) -> None:
+        # Never silent. Without this, asyncio's default handler is all there
+        # is, and a transport that has stopped reading (see udp_socket) looks
+        # identical to a quiet network -- which is how a completely dead DHT
+        # could be mistaken for a firewall for as long as anyone cared to look.
+        print(f"dht: socket error: {exc!r}", flush=True)
+
     def datagram_received(self, data: bytes, addr) -> None:
         try:
             msg = bdecode(data)
@@ -257,7 +296,7 @@ class DhtClient:
         client._pending = {}
         client._next_t = 0
         transport, protocol = await loop.create_datagram_endpoint(
-            lambda: _DhtProtocol(client), local_addr=("0.0.0.0", port),
+            lambda: _DhtProtocol(client), sock=udp_socket(port),
         )
         client._transport = transport
         return client

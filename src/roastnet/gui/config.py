@@ -54,7 +54,7 @@ def load_config() -> GuiConfig:
     if not path.exists():
         return defaults
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return defaults
     return GuiConfig(
@@ -76,4 +76,4 @@ def _valid_ui_scale(value: object) -> float | None:
 def save_config(cfg: GuiConfig) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(cfg), indent=2))
+    path.write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")

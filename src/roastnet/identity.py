@@ -62,13 +62,13 @@ def default_identity_path() -> Path:
 def save_identity(identity: Identity, path: Path | None = None) -> None:
     path = path or default_identity_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"secret_key_hex": identity.secret_key_hex}))
+    path.write_text(json.dumps({"secret_key_hex": identity.secret_key_hex}), encoding="utf-8")
     os.chmod(path, 0o600)
 
 
 def load_identity(path: Path | None = None) -> Identity:
     path = path or default_identity_path()
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     return Identity.from_secret_key_hex(data["secret_key_hex"])
 
 

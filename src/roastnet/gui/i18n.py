@@ -71,8 +71,14 @@ def _load_catalog(code: str) -> dict[str, str]:
         # A translation catalog is never load-bearing -- worst case is
         # English text, never a crash. Reported once, not raised, so a
         # missing/corrupt catalog can't take the whole app down with it.
-        print(f"roastnet: could not load the '{code}' translation catalog -- "
-              "falling back to English.", file=sys.stderr)
+        # `if sys.stderr` is load-bearing on Windows: the GUI runs under
+        # pythonw, where sys.stderr is None, and a bare print() would raise
+        # AttributeError here -- inverting this handler's whole purpose, since
+        # set_language() runs before any tab is built. A corrupt catalog would
+        # have taken down startup instead of falling back to English.
+        if sys.stderr is not None:
+            print(f"roastnet: could not load the '{code}' translation catalog -- "
+                  "falling back to English.", file=sys.stderr)
     _catalogs[code] = catalog
     return catalog
 

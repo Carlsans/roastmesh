@@ -31,13 +31,13 @@ def load_peers(path: Path | None = None) -> list[Peer]:
     path = path or default_peers_path()
     if not path.exists():
         return []
-    return [Peer(**d) for d in json.loads(path.read_text())]
+    return [Peer(**d) for d in json.loads(path.read_text(encoding="utf-8"))]
 
 
 def save_peers(peers: list[Peer], path: Path | None = None) -> None:
     path = path or default_peers_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([asdict(p) for p in peers], indent=2))
+    path.write_text(json.dumps([asdict(p) for p in peers], indent=2), encoding="utf-8")
 
 
 def node_id_from_ticket(ticket: str) -> str | None:

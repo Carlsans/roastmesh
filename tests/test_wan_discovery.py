@@ -78,6 +78,11 @@ async def test_two_nodes_find_each_other_via_a_fake_dht_and_exchange_hellos(tmp_
         node_cache_path=tmp_path / "nodes_b.json",
     ))
     try:
+        # 20s, not the original 5s: this window flaked twice, only ever in a
+        # full-suite run alongside the real-iroh and GUI-subprocess tests --
+        # exactly when the event loop is most starved. The hello retry
+        # schedule alone spans 6s, so 5s never had headroom. Exits as soon as
+        # both sides have discovered each other, so passing runs are no slower.
         for _ in range(200):
             if discovered_by_a and discovered_by_b:
                 break
@@ -124,6 +129,11 @@ async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the
         node_cache_path=tmp_path / "nodes_b.json",
     ))
     try:
+        # 20s, not the original 5s: this window flaked twice, only ever in a
+        # full-suite run alongside the real-iroh and GUI-subprocess tests --
+        # exactly when the event loop is most starved. The hello retry
+        # schedule alone spans 6s, so 5s never had headroom. Exits as soon as
+        # both sides have discovered each other, so passing runs are no slower.
         for _ in range(200):
             if discovered_by_a:
                 break
