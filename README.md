@@ -9,7 +9,7 @@ feeds, real peer sync over [Iroh](https://iroh.computer), quota enforcement, a d
 standalone binaries, and a read-only web gateway. On top of that: automatic peer discovery, both
 on your local network and (on by default in the GUI, opt-in from the CLI) over the whole internet
 via the public BitTorrent DHT, no tracker or bootstrap node of roastmesh's own required — see
-[Peer discovery](#peer-discovery-lan-and-internet) below. 285 tests, all passing.
+[Peer discovery](#peer-discovery-lan-and-internet) below. 283 tests, all passing (plus 3 live-network DHT tests, opt-in).
 
 The desktop app (`roastmesh-gui`) is the primary way to use this — search, publish (including by
 just dropping files in a folder), and serve and sync with peers, all from four tabs, no typing
@@ -399,12 +399,14 @@ end-to-end claim, checked against other people's BEP 5 implementations rather th
 is the thing to run when internet sharing is suspect:
 
 ```bash
-ROASTMESH_LIVE_DHT=1 pytest tests/test_dht.py -k announce_then_find -v
+ROASTMESH_LIVE_DHT=1 pytest tests/test_dht.py -v
 ```
 
-It's opt-in because it takes ~80 seconds and shares the public DHT's per-IP rate limits with
-anything else on the machine (including this suite's own GUI tests, which start real serving
-nodes) — run back-to-back with those it can fail for reasons unrelated to the code. The
+Opt-in, along with the other two live-network DHT tests, because they take up to ~90 seconds and
+share the public DHT's per-IP rate limits with anything else on the machine — including this
+suite's own GUI tests, which start real serving nodes. Run back-to-back with those they fail for
+reasons that have nothing to do with the code, and a release build is the worst place to discover
+someone else's rate limit. The
 equivalent property is covered offline and in a second by `tests/test_kademlia.py`, which runs a
 real in-process DHT swarm, including a check that the *previous*, broken lookup fails it.
 

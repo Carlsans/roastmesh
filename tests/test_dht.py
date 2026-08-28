@@ -90,37 +90,6 @@ def real_dht() -> None:
         pytest.skip("no route to the public BitTorrent DHT from here")
 
 
-async def test_ping_the_real_public_dht(real_dht) -> None:
-    client = await DhtClient.bind(port=0, own_id=b"q" * 20)
-    try:
-        ip = socket.gethostbyname("dht.transmissionbt.com")
-        reply = await client.ping((ip, 6881), timeout=5.0)
-        assert reply is not None
-        assert len(reply[b"id"]) == 20
-    finally:
-        client.close()
-
-
-async def test_get_peers_against_the_real_public_dht_for_a_made_up_infohash(real_dht) -> None:
-    # Nobody is announcing this exact info-hash, so this just proves the
-    # request/response/token/nodes-parsing path works end to end against a
-    # real, independent implementation of the protocol -- not that any
-    # peers come back.
-    client = await DhtClient.bind(port=0, own_id=b"r" * 20)
-    try:
-        ip = socket.gethostbyname("dht.transmissionbt.com")
-        reply = await client.get_peers((ip, 6881), b"z" * 20, timeout=5.0)
-        assert reply is not None
-        # Real-world observed quirk: this well-known bootstrap router
-        # replies to get_peers without a `token` (BEP 5 says one should
-        # always be present) -- discover_and_announce_peers already
-        # tolerates a missing token by simply skipping announce_peer for
-        # that node, so this only asserts what's actually guaranteed.
-        assert b"nodes" in reply or b"values" in reply
-    finally:
-        client.close()
-
-
 @pytest.fixture
 def live_dht_optin(real_dht) -> None:
     """Opt-in via `ROASTMESH_LIVE_DHT=1`, because this one is different in kind
@@ -140,7 +109,38 @@ def live_dht_optin(real_dht) -> None:
     import os
 
     if os.environ.get("ROASTMESH_LIVE_DHT") != "1":
-        pytest.skip("set ROASTMESH_LIVE_DHT=1 to run the live announce/lookup round trip")
+        pytest.skip("set ROASTMESH_LIVE_DHT=1 to run the live public-DHT tests")
+
+
+async def test_ping_the_real_public_dht(live_dht_optin) -> None:
+    client = await DhtClient.bind(port=0, own_id=b"q" * 20)
+    try:
+        ip = socket.gethostbyname("dht.transmissionbt.com")
+        reply = await client.ping((ip, 6881), timeout=5.0)
+        assert reply is not None
+        assert len(reply[b"id"]) == 20
+    finally:
+        client.close()
+
+
+async def test_get_peers_against_the_real_public_dht_for_a_made_up_infohash(live_dht_optin) -> None:
+    # Nobody is announcing this exact info-hash, so this just proves the
+    # request/response/token/nodes-parsing path works end to end against a
+    # real, independent implementation of the protocol -- not that any
+    # peers come back.
+    client = await DhtClient.bind(port=0, own_id=b"r" * 20)
+    try:
+        ip = socket.gethostbyname("dht.transmissionbt.com")
+        reply = await client.get_peers((ip, 6881), b"z" * 20, timeout=5.0)
+        assert reply is not None
+        # Real-world observed quirk: this well-known bootstrap router
+        # replies to get_peers without a `token` (BEP 5 says one should
+        # always be present) -- discover_and_announce_peers already
+        # tolerates a missing token by simply skipping announce_peer for
+        # that node, so this only asserts what's actually guaranteed.
+        assert b"nodes" in reply or b"values" in reply
+    finally:
+        client.close()
 
 
 async def test_announce_then_find_it_again_on_the_real_public_dht(live_dht_optin) -> None:
