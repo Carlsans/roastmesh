@@ -29,6 +29,25 @@ from roastmesh.identity import Identity, verify as verify_signature
 from roastmesh.paths import data_dir
 
 _GENESIS_PREFIX = b"roastmesh-feed-genesis:"
+# The same constant under the project's old name. Renaming roastnet ->
+# roastmesh silently changed what every feed is anchored to: entry 0's
+# prev_hash is this value for any feed started before the rename, so
+# verify_feed computed a different genesis, reported "broken hash chain:
+# entry 0", and -- since ingest_feed refuses everything a feed fails to
+# verify -- every peer discarded that publisher's entire history.
+#
+# Found on a real feed: 44 entries, all signatures individually valid,
+# rejected wholesale by every consumer including its own owner. The
+# failure is silent from the outside -- `peer sync` reports success and
+# ingests nothing -- so it looks like "the network found nobody" rather
+# than "your data was thrown away".
+#
+# The entries are not re-signed and nothing is rewritten: prev_hash is
+# covered by each signature, so rewriting the anchor would invalidate
+# every signature it is meant to protect. Instead a feed keeps whichever
+# anchor it was born with, exactly like paths.py keeps the legacy data
+# directory. New feeds use the current prefix.
+_LEGACY_GENESIS_PREFIX = b"roastnet-feed-genesis:"
 
 
 @dataclass
@@ -69,6 +88,25 @@ def _canonical_json(obj: dict) -> bytes:
 
 def _genesis_hash(pubkey_hex: str) -> str:
     return hashlib.sha256(_GENESIS_PREFIX + bytes.fromhex(pubkey_hex)).hexdigest()
+
+
+def _legacy_genesis_hash(pubkey_hex: str) -> str:
+    return hashlib.sha256(_LEGACY_GENESIS_PREFIX + bytes.fromhex(pubkey_hex)).hexdigest()
+
+
+def _anchor_for(pubkey_hex: str, entries: list[FeedEntry]) -> str:
+    """The genesis hash this particular feed is anchored to.
+
+    A feed started before the roastnet -> roastmesh rename is anchored to
+    the old constant (see _LEGACY_GENESIS_PREFIX). Accepting it is not a
+    weakening: the anchor only has to be one of two fixed, publicly known
+    values, every entry's signature is still checked against the feed's
+    public key, and an attacker gains nothing from picking either one.
+    """
+    current = _genesis_hash(pubkey_hex)
+    if entries and entries[0].prev_hash == _legacy_genesis_hash(pubkey_hex):
+        return _legacy_genesis_hash(pubkey_hex)
+    return current
 
 
 def _entries_dir(feed_dir: Path) -> Path:
@@ -142,7 +180,7 @@ def verify_feed(feed_dir: Path, expected_pubkey_hex: str | None = None) -> FeedV
         return FeedVerifyResult(0, 0, f"could not read feed pubkey: {exc}")
 
     entries = read_entries(feed_dir)
-    expected_prev = _genesis_hash(pubkey_hex)
+    expected_prev = _anchor_for(pubkey_hex, entries)
     valid_count = 0
     for entry in entries:
         if entry.seq != valid_count:

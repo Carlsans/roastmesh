@@ -207,3 +207,62 @@ def test_write_received_entry_rejects_mismatched_pubkey_directory(tmp_path: Path
     other = generate_identity()
     with pytest.raises(ValueError):
         write_received_entry(mirror_dir, other.public_key_hex, entry, blob_bytes)
+
+
+def _reanchor_to_legacy_genesis(feed_dir: Path, identity) -> None:
+    """Rewrite a freshly-built feed so it is anchored to the pre-rename
+    genesis constant, exactly as a feed published before roastnet became
+    roastmesh is on disk. Entries are re-signed here only because the
+    fixture is synthesising history the old code would have signed itself.
+    """
+    from roastmesh.feed import _legacy_genesis_hash
+
+    entries = read_entries(feed_dir)
+    prev = _legacy_genesis_hash(identity.public_key_hex)
+    for entry in entries:
+        unsigned = FeedEntry(seq=entry.seq, content_sha256=entry.content_sha256,
+                             timestamp=entry.timestamp, prev_hash=prev,
+                             size_bytes=entry.size_bytes, signature="")
+        signed = FeedEntry(seq=entry.seq, content_sha256=entry.content_sha256,
+                           timestamp=entry.timestamp, prev_hash=prev,
+                           size_bytes=entry.size_bytes,
+                           signature=identity.sign(unsigned.canonical_signed_bytes()).hex())
+        (feed_dir / "entries" / f"{entry.seq:08d}.json").write_text(
+            json.dumps(signed.__dict__, sort_keys=True), encoding="utf-8")
+        prev = hashlib.sha256(signed.canonical_stored_bytes()).hexdigest()
+
+
+def test_a_feed_anchored_to_the_pre_rename_genesis_still_verifies(tmp_path: Path, identity) -> None:
+    """Renaming roastnet -> roastmesh changed the genesis constant every feed
+    is anchored to, which silently orphaned every feed published before it:
+    verify_feed reported "broken hash chain: entry 0", ingest_feed refuses
+    anything that fails to verify, so peers threw away the publisher's entire
+    history while `peer sync` still reported success.
+
+    Found on a real 44-entry feed whose signatures were all individually
+    valid and which no peer -- nor its own owner -- would accept.
+    """
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+    _reanchor_to_legacy_genesis(feed_dir, identity)
+
+    result = verify_feed(feed_dir)
+    assert result.error is None, result.error
+    assert result.valid_count == result.total_count == len(FIXTURES)
+
+
+def test_accepting_the_legacy_anchor_does_not_weaken_verification(tmp_path: Path, identity) -> None:
+    """The legacy anchor is one specific alternative value, not "any prev_hash
+    goes" -- a genuinely tampered chain must still be rejected."""
+    feed_dir = tmp_path / "feed"
+    _publish_all(feed_dir, identity)
+    _reanchor_to_legacy_genesis(feed_dir, identity)
+
+    entry_path = feed_dir / "entries" / "00000000.json"
+    tampered = json.loads(entry_path.read_text(encoding="utf-8"))
+    tampered["prev_hash"] = "00" * 32
+    entry_path.write_text(json.dumps(tampered, sort_keys=True), encoding="utf-8")
+
+    result = verify_feed(feed_dir)
+    assert result.error is not None
+    assert "entry 0" in result.error
