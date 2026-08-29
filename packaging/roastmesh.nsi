@@ -56,11 +56,16 @@ Section "roastmesh" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
 
-  ; Both binaries must land in the same directory: roastmesh-gui.exe resolves
-  ; the CLI as its own sibling (gui/runner.py's roastmesh_argv), so shipping
-  ; the GUI alone would leave every button in the app unable to do anything.
-  File "..\dist\roastmesh.exe"
-  File "..\dist\roastmesh-gui.exe"
+  ; The Windows build is onedir (see roastmesh.spec): dist\roastmesh\ holds
+  ; both .exe files plus the shared _internal\ runtime they both load. The
+  ; whole tree has to be installed -- an .exe without its _internal\ sibling
+  ; cannot start at all.
+  ;
+  ; Both binaries must also land in the same directory: roastmesh-gui.exe
+  ; resolves the CLI as its own sibling (gui/runner.py's roastmesh_argv), so
+  ; shipping the GUI alone would leave every button in the app unable to do
+  ; anything. COLLECT already places them together; /r preserves that.
+  File /r "..\dist\roastmesh\*.*"
   File "roastmesh.ico"
 
   CreateShortCut "$SMPROGRAMS\roastmesh.lnk" "$INSTDIR\roastmesh-gui.exe" "" "$INSTDIR\roastmesh.ico"
@@ -82,6 +87,10 @@ Section "Uninstall"
   Delete "$INSTDIR\roastmesh-gui.exe"
   Delete "$INSTDIR\roastmesh.ico"
   Delete "$INSTDIR\uninstall.exe"
+  ; onedir ships a _internal\ tree beside the executables; a plain RMDir only
+  ; removes an already-empty directory, so without this the uninstaller would
+  ; leave ~50MB behind and silently fail to remove $INSTDIR at all.
+  RMDir /r "$INSTDIR\_internal"
   RMDir  "$INSTDIR"
   Delete "$SMPROGRAMS\roastmesh.lnk"
 

@@ -56,9 +56,14 @@ jobs:
         # genuinely got that far.
         shell: pwsh
         run: |
-          .\dist\roastmesh.exe --version
-          .\dist\roastmesh.exe identity show
-          $gui = Start-Process -FilePath .\dist\roastmesh-gui.exe -PassThru
+          # onedir: both executables live in dist\roastmesh\ beside the
+          # shared _internal\ runtime (see packaging/roastmesh.spec).
+          if (-not (Test-Path ".\dist\roastmesh\_internal")) {
+            throw "expected a onedir build -- dist\roastmesh\_internal is missing"
+          }
+          .\dist\roastmesh\roastmesh.exe --version
+          .\dist\roastmesh\roastmesh.exe identity show
+          $gui = Start-Process -FilePath .\dist\roastmesh\roastmesh-gui.exe -PassThru
           $listening = $false
           foreach ($i in 1..30) {
             Start-Sleep -Seconds 1
@@ -79,7 +84,7 @@ jobs:
         # silently; this is what would catch a regression in that fix.
         shell: pwsh
         continue-on-error: true      # a runner's egress may block the DHT; informational
-        run: .\dist\roastmesh.exe node doctor
+        run: .\dist\roastmesh\roastmesh.exe node doctor
 
       - name: Build the installer
         shell: pwsh
@@ -118,6 +123,12 @@ jobs:
           foreach ($f in @("roastmesh.exe", "roastmesh-gui.exe", "uninstall.exe")) {
             if (-not (Test-Path "$dir\$f")) { throw "installer did not place $f" }
           }
+          # An exe without its _internal sibling cannot start at all, so a
+          # missing tree here is the difference between an installer that
+          # looks right and one that ships a dead app.
+          if (-not (Test-Path "$dir\_internal")) {
+            throw "installer did not place the _internal runtime directory"
+          }
           if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\roastmesh.lnk")) {
             throw "Start Menu shortcut missing"
           }
@@ -125,14 +136,22 @@ jobs:
           & "$dir\uninstall.exe" /S
           Start-Sleep -Seconds 10
           if (Test-Path "$dir\roastmesh.exe") { throw "uninstaller left roastmesh.exe behind" }
+          if (Test-Path "$dir\_internal") { throw "uninstaller left the _internal tree behind" }
           Write-Host "install -> run -> uninstall OK"
+
+      - name: Zip the portable build
+        # onedir means a bare .exe is no longer a usable download -- without
+        # its _internal\ sibling it cannot start. Publishing loose .exe files
+        # would hand people a broken app, so the portable option ships as one
+        # archive of the whole directory instead.
+        shell: pwsh
+        run: Compress-Archive -Path dist\roastmesh\* -DestinationPath dist\roastmesh-windows-x86_64.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: roastmesh-windows
           path: |
-            dist/roastmesh.exe
-            dist/roastmesh-gui.exe
+            dist/roastmesh-windows-x86_64.zip
             dist/roastmesh-setup-x86_64.exe
 
       - name: Attach to the release
@@ -140,7 +159,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         # The Linux assets are named bare `roastmesh` / `roastmesh-gui` and
-        # install.sh fetches those exact names, so the .exe names coexist with
+        # install.sh fetches those exact names, so these names coexist with
         # them. Renaming the Linux assets would break every copy of install.sh
         # already in circulation.
-        run: gh release upload "${{ github.ref_name }}" dist/roastmesh.exe dist/roastmesh-gui.exe dist/roastmesh-setup-x86_64.exe --clobber
+        run: gh release upload "${{ github.ref_name }}" dist/roastmesh-windows-x86_64.zip dist/roastmesh-setup-x86_64.exe --clobber

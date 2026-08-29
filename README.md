@@ -63,6 +63,11 @@ Download **`roastmesh-setup-x86_64.exe`** from the
 your user profile (no administrator prompt), adds a Start Menu entry, and can be removed from
 Add/Remove Programs. Windows 10 or 11, 64-bit.
 
+Prefer not to run an installer? `roastmesh-windows-x86_64.zip` on the same page is the same build
+as a plain folder — unzip it anywhere and run `roastmesh-gui.exe` from inside. Keep the folder
+intact: both executables load a shared `_internal` directory that sits beside them, so a lone
+`.exe` moved out of it will not start.
+
 **Tick "Private networks" when Windows asks.** Shortly after you first open roastmesh, Windows
 Firewall asks whether to allow it on a network. **Private networks must be ticked** — otherwise
 Windows blocks the beacon roastmesh uses to find other machines on your home or studio network,
@@ -78,11 +83,19 @@ Click **More info → Run anyway**. That warning means "we don't recognise the p
 "this is known to be harmful"; if you'd rather not take that on faith, the from-source install
 below avoids it entirely.
 
-**ARM (e.g. Raspberry Pi OS)**: no prebuilt binary yet, but the from-source install below works —
-confirmed with a real install and a real generated identity under aarch64 emulation. This needs
-64-bit Raspberry Pi OS (the default on Pi 3/4/5 and newer); 32-bit Raspberry Pi OS is not
-supported, because `iroh`, one of the three real dependencies, has never published a 32-bit ARM
-(armv7/armhf) wheel for Linux.
+**Windows Defender may quarantine the download.** It is a false positive, and a well-understood
+one: the build unpacks and runs from a folder of its own, it is unsigned so it carries no
+download reputation, and the launcher stub PyInstaller produces also turns up inside real
+malware, so its bytes match signatures. If it happens, restore the file under **Windows Security
+→ Protection history**, and report it at
+[Microsoft's false-positive form](https://www.microsoft.com/en-us/wdsi/filesubmission) — a
+confirmed report clears it for everyone, not just you. Every release lists SHA-256 hashes so you
+can check what you downloaded is what CI built.
+
+**ARM (e.g. Raspberry Pi OS)**: prebuilt `aarch64` binaries ship with every release, and the
+one-line installer above picks them automatically. This needs 64-bit Raspberry Pi OS (the default
+on Pi 3/4/5 and newer); 32-bit Raspberry Pi OS is not supported, because `iroh`, one of the three
+real dependencies, has never published a 32-bit ARM (armv7/armhf) wheel for Linux.
 
 ### Everyone else — from source (Linux, macOS, Windows)
 

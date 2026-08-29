@@ -9,12 +9,24 @@
                          a roaster downloads and double-clicks --
                          ARCHITECTURE.md's Distribution section.
 
-Both are onefile builds (single native binary, matches the doc most
+Linux builds are onefile (single native binary, matches the doc most
 directly). Known tradeoff: onefile self-extracts to a temp directory at
 startup, which breaks on a system with a noexec-mounted /tmp -- a real but
-uncommon constraint. If that ever matters, switch EXE(..., exclude_binaries=
-True, ...) + COLLECT(...) (onedir mode) for the affected target instead;
-not done here since it's not needed for normal desktop/VPS use.
+uncommon constraint.
+
+**Windows builds are onedir**, producing dist/roastmesh/ with both .exe files
+and a shared _internal/ beside them. Not a stylistic choice: Windows Defender
+quarantined the onefile installer as malware. That is a false positive, and a
+well-understood one -- a onefile binary unpacks itself to %TEMP% and executes
+from there, which is what a dropper does, and the stock PyInstaller bootloader
+it is built from appears inside real malware, so its bytes match signatures.
+Unsigned code with no download reputation gets no benefit of the doubt.
+onedir removes the self-extraction behaviour entirely, which is the single
+biggest lever available without paying for a code-signing certificate.
+
+Linux deliberately stays onefile: install.sh and every release since v0.1
+fetch bare `roastmesh` / `roastmesh-gui` assets by name, and Linux has no
+equivalent false-positive problem to solve.
 
 Run with: pyinstaller packaging/roastmesh.spec --clean
 (from the repo root, with the `build` extra installed: pip install -e ".[build]")
@@ -24,10 +36,12 @@ PyInstaller does not cross-compile, so it has to actually run on each target
 OS; this spec is written to be platform-portable but Mac/Windows outputs are
 unverified from this (Linux) environment.
 """
+import sys
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH).parent
+ONEDIR = sys.platform == "win32"   # see the module docstring for why
 SRC = ROOT / "src"
 
 # `iroh`'s Python bindings are uniffi-generated: the compiled Rust extension
@@ -75,10 +89,6 @@ common_kwargs = dict(
 # -- CLI ----------------------------------------------------------------
 cli_analysis = Analysis([str(ROOT / "packaging" / "entry_cli.py")], **common_kwargs)
 cli_pyz = PYZ(cli_analysis.pure)
-cli_exe = EXE(
-    cli_pyz, cli_analysis.scripts, cli_analysis.binaries, cli_analysis.zipfiles, cli_analysis.datas,
-    [], name="roastmesh", console=True, icon=ICON,
-)
 
 # -- GUI ------------------------------------------------------------------
 gui_analysis = Analysis(
@@ -86,7 +96,33 @@ gui_analysis = Analysis(
     **{**common_kwargs, "hiddenimports": [*iroh_hiddenimports, "tkinter"]},
 )
 gui_pyz = PYZ(gui_analysis.pure)
-gui_exe = EXE(
-    gui_pyz, gui_analysis.scripts, gui_analysis.binaries, gui_analysis.zipfiles, gui_analysis.datas,
-    [], name="roastmesh-gui", console=False, icon=ICON,
-)
+
+if ONEDIR:
+    # Both executables share one COLLECT, so they land in a single directory
+    # with one copy of the runtime between them rather than two ~20MB trees.
+    # That co-location is also required, not incidental: gui/runner.py's
+    # roastmesh_argv() resolves the CLI as a sibling of sys.executable, so
+    # roastmesh.exe must sit next to roastmesh-gui.exe or every action the
+    # GUI performs breaks.
+    cli_exe = EXE(
+        cli_pyz, cli_analysis.scripts, [], exclude_binaries=True,
+        name="roastmesh", console=True, icon=ICON,
+    )
+    gui_exe = EXE(
+        gui_pyz, gui_analysis.scripts, [], exclude_binaries=True,
+        name="roastmesh-gui", console=False, icon=ICON,
+    )
+    coll = COLLECT(
+        cli_exe, cli_analysis.binaries, cli_analysis.zipfiles, cli_analysis.datas,
+        gui_exe, gui_analysis.binaries, gui_analysis.zipfiles, gui_analysis.datas,
+        strip=False, upx=False, name="roastmesh",
+    )
+else:
+    cli_exe = EXE(
+        cli_pyz, cli_analysis.scripts, cli_analysis.binaries, cli_analysis.zipfiles,
+        cli_analysis.datas, [], name="roastmesh", console=True, icon=ICON,
+    )
+    gui_exe = EXE(
+        gui_pyz, gui_analysis.scripts, gui_analysis.binaries, gui_analysis.zipfiles,
+        gui_analysis.datas, [], name="roastmesh-gui", console=False, icon=ICON,
+    )
