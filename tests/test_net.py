@@ -303,6 +303,7 @@ async def test_lan_discovery_auto_syncs_without_a_manual_sync_call(tmp_path: Pat
     in its search index -- without net.sync_with_peer ever being called
     directly anywhere in this test."""
     from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_feed
 
     LAN_PORT = 41977  # dedicated test port -- distinct from the production default
 
@@ -394,6 +395,7 @@ async def test_serve_auto_ingests_watch_folder_files_as_the_users_own_roasts(tmp
     the user's own local search, the same disconnect `feed publish` used
     to have before it auto-ingested too."""
     from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_feed
 
     identity = generate_identity()
     feed_dir = tmp_path / "feed"
@@ -438,6 +440,7 @@ async def test_serve_refreshes_stale_entries_on_startup(tmp_path: Path) -> None:
     opened -- without a manual reindex, and without the user needing to
     know anything happened."""
     from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_feed
 
     identity = generate_identity()
     feed_dir = tmp_path / "feed"
@@ -672,6 +675,7 @@ async def test_auto_sync_persists_peer_profile_even_when_nothing_new_to_ingest(t
     gate its whole DB block on new_entry_count > 0, which meant a peer who
     had already published everything they ever would never got a name."""
     from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_feed
     from roastmesh.profile import update_and_sign
 
     server_identity = generate_identity()
@@ -761,3 +765,41 @@ async def test_sync_tolerates_a_gossiped_peer_dict_with_an_unknown_field(tmp_pat
         assert "c" * 64 in by_pubkey  # the gossiped peer still made it through
     finally:
         await _stop_server(server_task)
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_ingests_a_mirror_the_index_never_took(tmp_path: Path) -> None:
+    """Upgrading must heal a feed that was mirrored but rejected.
+
+    Every feed published before the roastnet -> roastmesh rename failed
+    verification on arrival: its entries were written to the peer mirror and
+    then dropped. After the fix the feed verifies, but auto-discovery asked
+    only "did new entries arrive?" -- and the answer on the next sync is 0,
+    because the mirror already holds them. Ingest was skipped and those
+    roasts stayed invisible for good, unless the user ran `peer sync` by hand.
+    """
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_feed
+    from roastmesh.net import _index_is_behind_mirror
+
+    publisher = generate_identity()
+    feed_dir = tmp_path / "feed"
+    for i, fixture in enumerate(sorted(FIXTURES_DIR.glob("*.alog"))[:3]):
+        append_entry(feed_dir, publisher, fixture, timestamp=f"2026-01-0{i + 1}T00:00:00Z")
+
+    # A mirror holding the publisher's entries, with an index that took none
+    # of them -- exactly the state a pre-fix rejection leaves behind.
+    mirror_dir = tmp_path / "peer_feeds" / publisher.public_key_hex
+    shutil.copytree(feed_dir, mirror_dir)
+
+    db_path = tmp_path / "index.sqlite3"
+    conn = connect(db_path)
+    try:
+        assert _index_is_behind_mirror(conn, publisher.public_key_hex, mirror_dir) is True
+
+        ingest_feed(conn, mirror_dir, expected_pubkey_hex=publisher.public_key_hex)
+
+        # once ingested, it must stop asking for the work again every sync
+        assert _index_is_behind_mirror(conn, publisher.public_key_hex, mirror_dir) is False
+    finally:
+        conn.close()

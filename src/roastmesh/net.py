@@ -199,6 +199,26 @@ def persist_peer_profile(conn, profile: dict) -> None:
         repo.add_user_like(conn, pubkey, liked_pubkey)
 
 
+def _index_is_behind_mirror(conn, peer_pubkey_hex: str, mirror_dir: Path) -> bool:
+    """True when a peer's mirrored feed holds entries the index doesn't.
+
+    Cheap (one COUNT against an indexed column) and only ever used to decide
+    whether to re-run an ingest that is itself idempotent, so a false positive
+    costs a little work and a false negative costs correctness -- which is the
+    right way round.
+    """
+    try:
+        mirrored = len(read_entries(mirror_dir))
+    except OSError:
+        return False
+    if mirrored == 0:
+        return False
+    indexed = conn.execute(
+        "SELECT COUNT(*) FROM sources WHERE author_pubkey = ?", (peer_pubkey_hex,)
+    ).fetchone()[0]
+    return indexed < mirrored
+
+
 async def _auto_sync_discovered_peer(
     peer_pubkey_hex: str,
     peer_ticket: str,
@@ -236,8 +256,18 @@ async def _auto_sync_discovered_peer(
     if db_path is not None:
         conn = connect(db_path)
         try:
-            if report.new_entry_count > 0:
-                mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+            mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+            # "Nothing new arrived" is not the same as "nothing to ingest".
+            # A mirror can hold entries the index does not: every feed
+            # published before the roastnet -> roastmesh rename failed
+            # verification on arrival, so its entries were mirrored to disk
+            # and then dropped. Upgrading fixed the verification, but this
+            # path still asked only "did new entries arrive?" -- the answer
+            # was 0, ingest was skipped, and those roasts stayed invisible
+            # forever unless the user happened to run `peer sync` by hand.
+            # Comparing what the mirror holds against what the index has for
+            # that author costs one COUNT and makes the upgrade self-healing.
+            if report.new_entry_count > 0 or _index_is_behind_mirror(conn, peer_pubkey_hex, mirror_dir):
                 ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
             if report.profile is not None:
                 persist_peer_profile(conn, report.profile)
