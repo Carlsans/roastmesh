@@ -616,3 +616,30 @@ def test_declaring_your_machine_makes_your_blank_roastertype_roasts_findable(tmp
     # A machine nobody declared and no roast carries must still match nothing.
     other = runner.invoke(main, ["--db", str(db_path), "search", "--machine", "giesen_w6a", "--json"])
     assert json.loads(other.output) == []
+
+
+def test_json_output_is_pure_json_even_on_the_run_that_creates_the_identity(
+        tmp_path: Path, monkeypatch) -> None:
+    """`--json` must print only JSON on stdout.
+
+    The first run creates an Ed25519 identity and says so. That notice used to
+    go to stdout, so whichever `--json` command happened to be the one
+    creating the identity returned "created new identity: ...\\n{...}" --
+    not JSON. The GUI parsed it, threw, and silently showed a blank field to
+    every brand-new user.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    db_path = tmp_path / "index.sqlite3"
+
+    result = CliRunner().invoke(
+        main, ["--db", str(db_path), "profile", "show", "--json"])
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.stdout)   # must not need any cleaning up
+    assert len(payload["pubkey"]) == 64
+    assert payload["name"]
+
+    # the notice still has to reach the user -- on stderr, where it belongs
+    assert "created new identity" in result.stderr

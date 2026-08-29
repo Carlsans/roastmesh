@@ -35,7 +35,7 @@ from roastmesh.gui import units
 from roastmesh.gui import widgets
 from roastmesh.gui.chart import RoastChart
 from roastmesh.gui.i18n import t, tn
-from roastmesh.gui.runner import Task, describe, roastmesh_argv, stream_into
+from roastmesh.gui.runner import Task, describe, parse_json_output, roastmesh_argv, stream_into
 from roastmesh.models import weight_loss_pct
 from roastmesh.gui.widgets import (
     BG,
@@ -424,7 +424,7 @@ class SearchTab(Tab):
         if code != 0:
             return
         try:
-            keys = json.loads("".join(buf))
+            keys = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             return
         self.machine.set_values(keys)
@@ -489,7 +489,7 @@ class SearchTab(Tab):
             self.table.set_error(text.strip() or _exited_with_code(code))
             return
         try:
-            rows = json.loads(text)
+            rows = parse_json_output(text)
         except json.JSONDecodeError:
             self.table.set_error(t("could not parse results"))
             return
@@ -513,7 +513,7 @@ class SearchTab(Tab):
             self.user_status.set(t("Couldn't load users: {error}", error="".join(buf).strip()))
             return
         try:
-            rows = json.loads("".join(buf))
+            rows = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             self.user_status.set(t("could not parse results"))
             return
@@ -555,7 +555,7 @@ class SearchTab(Tab):
         if code != 0 or self.selected_user_pubkey != pubkey:
             return  # a different row was selected before this landed
         try:
-            profile = json.loads("".join(buf))
+            profile = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             return
         liked = pubkey in (profile.get("likes") or [])
@@ -617,7 +617,7 @@ class SearchTab(Tab):
         if code != 0:
             return
         try:
-            payload = json.loads("".join(buf))
+            payload = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             return
         # kept as an attribute (not just a local) so tests can reach the
@@ -1014,7 +1014,7 @@ class NetworkTab(Tab):
 
     def _peers_loaded(self, buf: list[str]) -> None:
         try:
-            peers = json.loads("".join(buf))
+            peers = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             return
         self.peers_table.set_rows(peers)
@@ -1150,7 +1150,7 @@ class SettingsTab(Tab):
         if code != 0:
             return
         try:
-            profile = json.loads("".join(buf))
+            profile = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             return
         self.app.display_name.set(profile.get("name") or "")
@@ -1167,7 +1167,7 @@ class SettingsTab(Tab):
         if code != 0:
             return
         try:
-            catalogue = json.loads("".join(buf))
+            catalogue = parse_json_output("".join(buf))
         except json.JSONDecodeError:
             return
         # Several catalogue entries share the same machine_key (e.g. three

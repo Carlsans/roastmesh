@@ -5,24 +5,66 @@
 # packaging/build.sh (no Docker) is fine for quick local iteration on
 # whatever machine you're on, but its output is only guaranteed to run on
 # systems at least as new as the machine that built it.
+#
+# Usage:
+#   packaging/build-docker.sh              # host architecture -> dist/
+#   packaging/build-docker.sh aarch64      # ARM64 -> dist-aarch64/
+#
+# aarch64 covers 64-bit Raspberry Pi OS (Pi 4/5) and ARM servers. Built here
+# on an x86_64 machine through qemu emulation, which works but is slow --
+# expect roughly 10x a native build, most of it in PyInstaller's analysis
+# pass. Needs binfmt handlers registered on the host; check with
+#   ls /proc/sys/fs/binfmt_misc | grep qemu-aarch64
+# and register them if missing with
+#   docker run --privileged --rm tonistiigi/binfmt --install arm64
+#
+# iroh ships a manylinux_2_28_aarch64 wheel, so nothing has to be compiled
+# from source inside the emulated container -- which is what makes this
+# merely slow rather than impractical.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-docker build -f packaging/Dockerfile.build -t roastmesh-builder .
+ARCH="${1:-native}"
+case "$ARCH" in
+    native)
+        PLATFORM_ARGS=()
+        IMAGE="roastmesh-builder"
+        DIST_DIR="dist"
+        SCRATCH="build-docker-scratch"
+        ;;
+    aarch64|arm64)
+        PLATFORM_ARGS=(--platform linux/arm64)
+        IMAGE="roastmesh-builder-arm64"
+        DIST_DIR="dist-aarch64"
+        SCRATCH="build-arm64-scratch"
+        if ! ls /proc/sys/fs/binfmt_misc 2>/dev/null | grep -q qemu-aarch64; then
+            echo "No qemu-aarch64 binfmt handler registered -- an ARM64 build cannot run here." >&2
+            echo "Register one with: docker run --privileged --rm tonistiigi/binfmt --install arm64" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Unknown architecture '$ARCH' -- use 'native' or 'aarch64'." >&2
+        exit 1
+        ;;
+esac
 
-mkdir -p dist
-rm -rf build-docker-scratch
-mkdir -p build-docker-scratch
+docker build "${PLATFORM_ARGS[@]}" -f packaging/Dockerfile.build -t "$IMAGE" .
 
-docker run --rm \
+mkdir -p "$DIST_DIR"
+rm -rf "$SCRATCH"
+mkdir -p "$SCRATCH"
+
+docker run --rm "${PLATFORM_ARGS[@]}" \
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp \
-    -v "$(pwd)/dist:/app/dist" \
-    -v "$(pwd)/build-docker-scratch:/app/build" \
-    roastmesh-builder
+    -v "$(pwd)/$DIST_DIR:/app/dist" \
+    -v "$(pwd)/$SCRATCH:/app/build" \
+    "$IMAGE"
 
-rm -rf build-docker-scratch
+rm -rf "$SCRATCH"
 
 echo
 echo "built (Ubuntu 22.04 base, portable to newer systems):"
-ls -lh dist/roastmesh dist/roastmesh-gui
+ls -lh "$DIST_DIR/roastmesh" "$DIST_DIR/roastmesh-gui"
+file "$DIST_DIR/roastmesh" | sed 's/^/  /'

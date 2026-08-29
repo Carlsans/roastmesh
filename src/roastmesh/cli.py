@@ -29,7 +29,11 @@ DEFAULT_DB = "roastmesh.sqlite3"
 
 def _remind_backup_if_new(identity, created: bool) -> None:
     if created:
-        click.echo(f"created new identity: {identity.public_key_hex}")
+        # stderr, like the line below it: this is a notice, not output. On
+        # stdout it corrupted every `--json` command that happened to be the
+        # one creating the identity -- the payload became "created new
+        # identity: ...\n{...}", which is not JSON.
+        click.echo(f"created new identity: {identity.public_key_hex}", err=True)
         click.echo(
             "run `roastmesh identity export` to back up your secret key -- "
             "it cannot be recovered if lost.", err=True,

@@ -25,6 +25,7 @@ SIGTERM first, then SIGKILL after a grace period.
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import signal
@@ -226,3 +227,32 @@ def describe(argv: Sequence[str]) -> str:
     for a in argv:
         parts.append(f'"{a}"' if " " in a else a)
     return " ".join(parts)
+
+
+def parse_json_output(text: str):
+    """Parse what a CLI `--json` command printed, tolerating notice lines
+    that came before the payload.
+
+    Task deliberately merges the child's stderr into its stdout (one stream
+    is what a Console should show), so anything the CLI writes to either
+    lands in the same buffer the GUI then tries to parse. A one-off notice
+    is therefore enough to destroy a perfectly good payload.
+
+    That is not hypothetical. On a brand-new install, whichever command
+    happens to create the identity prints "created new identity: ..." first,
+    so `profile show --json` returned that line followed by its JSON.
+    json.loads() raised, the handler silently returned, and the Settings name
+    field stayed blank forever -- intermittent, because it only happens when
+    that command wins the race against the node the GUI starts at the same
+    moment. The notice now goes to stderr, but every `--json` reader in the
+    GUI still routes through here so a future one cannot cause this again.
+
+    Raises json.JSONDecodeError if there is no JSON at all, so callers that
+    already handle malformed output keep behaving exactly as before.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            return json.loads("\n".join(lines[i:]))
+    return json.loads(text)

@@ -506,7 +506,12 @@ tab = app.tabs[3]
 # does not always finish inside a fixed window -- which made this test fail
 # about one run in six. The loop exits as soon as the value lands, so a
 # generous ceiling costs nothing when things are healthy.
-for _ in range(2500):
+#
+# The ceiling must stay comfortably under _run_headless's own subprocess
+# timeout, or a slow machine trades one failure for a worse one: the whole
+# interpreter is killed mid-run and the assertion that reports *why* never
+# gets to speak. Polling ~20s inside a 90s harness leaves that margin.
+for _ in range(1000):
     app.update()
     if tab.app.display_name.get():
         break
@@ -523,7 +528,7 @@ for _ in range(100):
 print("STATUS", tab.you_status.get())
 app._on_close()
 print("OK")
-""")
+""", timeout=90)
     assert "OK" in r.stdout, r.stderr
     # A default (deterministic) name was already there before we typed
     # anything -- confirms the field is seeded from `profile show`, not left

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# roastmesh installer -- Linux, x86_64.
+# roastmesh installer -- Linux, x86_64 and aarch64.
 #
 # Run it with:
 #   curl -fsSL https://raw.githubusercontent.com/Carlsans/roastmesh/master/install.sh | bash
@@ -56,12 +56,25 @@ if [ "$(uname -s)" != "Linux" ]; then
     exit 1
 fi
 
+# Asset naming: x86_64 keeps the bare `roastmesh`/`roastmesh-gui` names it
+# has always had, because every copy of this script already in circulation
+# fetches exactly those. aarch64 (Raspberry Pi 4/5 on a 64-bit OS, ARM
+# servers) gets a -aarch64 suffix instead, so both live in one release
+# without renaming anything.
 ARCH="$(uname -m)"
-if [ "$ARCH" != "x86_64" ]; then
-    echo "No prebuilt binary for '$ARCH' yet (only x86_64 today)." >&2
-    echo "You can still build from source -- see https://github.com/$REPO#install" >&2
-    exit 1
-fi
+case "$ARCH" in
+    x86_64)          ASSET_SUFFIX="" ;;
+    aarch64|arm64)   ASSET_SUFFIX="-aarch64" ;;
+    *)
+        echo "No prebuilt binary for '$ARCH' yet (x86_64 and aarch64 today)." >&2
+        if [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv6l" ]; then
+            echo "That looks like a 32-bit Raspberry Pi OS. A 64-bit OS on the same" >&2
+            echo "hardware ('uname -m' reporting aarch64) is supported." >&2
+        fi
+        echo "You can still build from source -- see https://github.com/$REPO#install" >&2
+        exit 1
+        ;;
+esac
 
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL "$1" -o "$2"; }
@@ -74,10 +87,10 @@ fi
 
 mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
 
-echo "Downloading roastmesh..."
-fetch "https://github.com/$REPO/releases/latest/download/roastmesh" "$BIN_DIR/roastmesh.new"
-echo "Downloading roastmesh-gui..."
-fetch "https://github.com/$REPO/releases/latest/download/roastmesh-gui" "$BIN_DIR/roastmesh-gui.new"
+echo "Downloading roastmesh ($ARCH)..."
+fetch "https://github.com/$REPO/releases/latest/download/roastmesh$ASSET_SUFFIX" "$BIN_DIR/roastmesh.new"
+echo "Downloading roastmesh-gui ($ARCH)..."
+fetch "https://github.com/$REPO/releases/latest/download/roastmesh-gui$ASSET_SUFFIX" "$BIN_DIR/roastmesh-gui.new"
 
 chmod +x "$BIN_DIR/roastmesh.new" "$BIN_DIR/roastmesh-gui.new"
 # only replace the live binaries once both downloads have fully succeeded
