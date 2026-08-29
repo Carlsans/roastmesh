@@ -630,7 +630,12 @@ def test_json_output_is_pure_json_even_on_the_run_that_creates_the_identity(
     """
     home = tmp_path / "home"
     home.mkdir()
+    # HOME alone does not isolate anything on Windows -- Path.home() resolves
+    # USERPROFILE there, so this test ran against the real profile, found an
+    # identity already present, and saw no first-run notice at all. Caught by
+    # the Windows CI job, which is exactly what it is for.
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     db_path = tmp_path / "index.sqlite3"
 
     result = CliRunner().invoke(
