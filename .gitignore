@@ -6,3 +6,5 @@ __pycache__/
 *.sqlite3
 build/
 dist/
+dist-aarch64/
+build-arm64-scratch/

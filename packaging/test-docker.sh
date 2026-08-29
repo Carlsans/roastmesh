@@ -41,6 +41,23 @@ DISTROS=(
     "arch|archlinux:latest|pacman -Sy --noconfirm --quiet xorg-server-xvfb libx11 libxft libxss curl >/dev/null 2>&1"
 )
 
+# Pin the platform explicitly. `docker run ubuntu:22.04` uses whatever is
+# cached under that tag, and building the aarch64 release pulls the arm64
+# image under the *same* tag -- after which this script silently ran the
+# x86_64 binaries inside an ARM container and reported
+#   bash: /dist/roastmesh: No such file or directory
+# for ubuntu:22.04 only, which reads like a genuine glibc/portability
+# failure on the one base the binaries are actually built on. It is not:
+# that message is the kernel failing to find a loader for the wrong
+# architecture. Naming the platform makes the cache irrelevant.
+case "$(uname -m)" in
+    x86_64)         PLATFORM="linux/amd64" ;;
+    aarch64|arm64)  PLATFORM="linux/arm64" ;;
+    *)              PLATFORM="" ;;
+esac
+PLATFORM_ARGS=()
+[ -n "$PLATFORM" ] && PLATFORM_ARGS=(--platform "$PLATFORM")
+
 FAILED=()
 for entry in "${DISTROS[@]}"; do
     IFS='|' read -r name image install_cmd <<< "$entry"
@@ -48,7 +65,7 @@ for entry in "${DISTROS[@]}"; do
     echo "=================================================================="
     echo "  $name  ($image)"
     echo "=================================================================="
-    if docker run --rm -v "$(pwd)/dist:/dist:ro" "$image" bash -c "
+    if docker run --rm "${PLATFORM_ARGS[@]}" -v "$(pwd)/dist:/dist:ro" "$image" bash -c "
         $install_cmd
         $TEST_BODY
     "; then
