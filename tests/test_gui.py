@@ -501,8 +501,15 @@ app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
 tab = app.tabs[3]
-for _ in range(150):
+# Poll for the value rather than sleeping a fixed 3s: the field is seeded
+# by a background `profile show` subprocess, and on a loaded machine that
+# does not always finish inside a fixed window -- which made this test fail
+# about one run in six. The loop exits as soon as the value lands, so a
+# generous ceiling costs nothing when things are healthy.
+for _ in range(2500):
     app.update()
+    if tab.app.display_name.get():
+        break
     time.sleep(0.02)
 print("LOADED_NAME", repr(tab.app.display_name.get()))
 tab.app.display_name.set("Amber Chaff")

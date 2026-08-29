@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -299,6 +300,31 @@ async def _watch_publish_loop(
         await asyncio.sleep(interval_s)
 
 
+def _discovery_is_offline() -> bool:
+    """True when ROASTMESH_DISCOVERY_OFFLINE is set to something truthy.
+
+    A node that must not touch the network at all. This exists because the
+    test suite was quietly polluting the real one: every GUI test builds a
+    RoastmeshApp, which auto-starts `node serve` with a throwaway identity
+    from an isolated HOME, and that node beaconed on the real LAN port and
+    -- since wan_discovery_enabled defaults to True -- announced itself on
+    the real public BitTorrent DHT before being torn down seconds later.
+
+    Measured, not guessed: sniffing UDP 41888 during one `pytest
+    tests/test_gui.py` run showed the two genuine nodes beaconing every 5s
+    plus four one-shot pubkeys that existed only for the length of a test,
+    and this machine's peers.json grew by exactly those four. It holds 876
+    peers of which two have ever published anything; 606 arrived this way.
+    Each one was also announced to the global swarm, so every other
+    roastmesh user was handed dead peers to try to reach, and it burned
+    this IP's share of the public DHT's rate limits.
+
+    Also genuinely useful outside tests: a node that should serve and sync
+    only with peers you hand it, with no broadcast and no DHT presence.
+    """
+    return os.environ.get("ROASTMESH_DISCOVERY_OFFLINE", "").strip().lower() not in ("", "0", "false", "no")
+
+
 async def serve(
     identity: Identity,
     feed_dir: Path,
@@ -352,7 +378,28 @@ async def serve(
     profile.default_profile_path()", i.e. this identity's own, real profile.
     Tests point it elsewhere so a profile fixture never touches the real
     user's config directory.
+
+    Setting ROASTMESH_DISCOVERY_OFFLINE=1 forces both discovery mechanisms
+    off regardless of what the caller asked for. See _discovery_is_offline.
     """
+    if _discovery_is_offline():
+        # Only the *shared* channels are closed: the production LAN beacon
+        # port, and the internet DHT (of which there is only one, whatever
+        # local port is used). A caller that asked for LAN discovery on its
+        # own port is talking to nobody but itself and is left alone -- which
+        # is what lets the discovery tests keep proving discovery works while
+        # the suite as a whole stays off the real network.
+        muted = []
+        if enable_lan_discovery and lan_discovery_port == BEACON_PORT:
+            enable_lan_discovery = False
+            muted.append(f"LAN beacon on the shared port {BEACON_PORT}")
+        if enable_wan_discovery:
+            enable_wan_discovery = False
+            muted.append("internet (DHT) discovery")
+        if muted:
+            print(f"serve: ROASTMESH_DISCOVERY_OFFLINE is set -- disabled {' and '.join(muted)}",
+                  flush=True)
+
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
     if relay:
         # Wait for a home relay before minting the ticket. Immediately after
