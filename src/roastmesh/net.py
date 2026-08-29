@@ -18,15 +18,21 @@ manual length-prefixing -- `write_all()` + `finish()` on one side and
     {"op": "get_feed", "since_seq": N, "limit": K}  -> {"entries": [...]}  (this node's own feed,
                                                         seq >= N, at most K entries, "limit"
                                                         omitted = unbounded)
+    {"op": "get_profile"}                          -> {"profile": {...} | None}  (this node's own
+                                                        signed profile.py profile, or None if it
+                                                        has never set one)
 
 `get_feed_meta` exists so a client can apply ARCHITECTURE.md's Abuse
 Resistance quota checks (roastmesh.quota) against cheap metadata *before*
 deciding how much content is worth fetching -- see sync_with_peer.
 
-Scope: `get_feed`/`get_feed_meta` only ever return the responding peer's
-*own* feed -- syncing with peer P replicates exactly P's data, not a relay
-of everyone P knows about ("every peer mirrors the entire corpus" is later
-work).
+Scope: `get_feed`/`get_feed_meta`/`get_profile` only ever return the
+responding peer's *own* feed/profile -- syncing with peer P replicates
+exactly P's data, not a relay of everyone P knows about ("every peer
+mirrors the entire corpus" is later work). `get_profile` is additive: an
+un-upgraded peer answers `{"error": "unknown op 'get_profile'"}`, which
+sync_with_peer treats as "this peer has no profile", never as a failure --
+the existing three ops and their payloads are byte-for-byte unchanged.
 """
 from __future__ import annotations
 
@@ -50,10 +56,12 @@ from roastmesh.feed import (
     write_received_entry,
 )
 from roastmesh.identity import Identity
+from roastmesh.index import repository as repo
 from roastmesh.index.db import connect
 from roastmesh.index.ingest import ingest_feed
 from roastmesh.lan_discovery import BEACON_INTERVAL_S, BEACON_PORT, run_beacon
-from roastmesh.peers import Peer, load_peers, save_peers, upsert_peer
+from roastmesh.peers import Peer, load_peers, peer_from_dict, save_peers, upsert_peer
+from roastmesh.profile import load_profile, verify_profile
 from roastmesh.quota import QuotaCheckResult, QuotaLimits, check_feed_metadata
 from roastmesh.wan_discovery import DHT_LOOKUP_INTERVAL_S, WAN_PORT, run_wan_discovery
 from roastmesh.watch_folder import publish_new_files
@@ -69,6 +77,12 @@ class SyncReport:
     verify: FeedVerifyResult
     quota: QuotaCheckResult
     peers_known: int
+    # The peer's own signed profile (profile.py), once verified against its
+    # own pubkey and against `conn.remote_id()` -- or None if the peer has
+    # no profile, answered `unknown op 'get_profile'` (an un-upgraded
+    # node), or its profile failed verification. Never a third party's
+    # profile: see sync_with_peer's docstring on why relaying is refused.
+    profile: dict | None = None
 
 
 async def bind_endpoint(identity: Identity, *, alpns: list[bytes] | None = None, relay: bool = True) -> iroh.Endpoint:
@@ -111,7 +125,7 @@ def _entry_from_wire(wire: dict) -> tuple[FeedEntry, bytes]:
     return FeedEntry(**wire), blob
 
 
-def _build_response(request: dict, feed_dir: Path, peers_path: Path) -> dict:
+def _build_response(request: dict, feed_dir: Path, peers_path: Path, profile_path: Path | None = None) -> dict:
     op = request.get("op")
     if op == "get_peers":
         return {"peers": [asdict(p) for p in load_peers(peers_path)]}
@@ -126,13 +140,21 @@ def _build_response(request: dict, feed_dir: Path, peers_path: Path) -> dict:
         if limit is not None:
             entries = entries[:int(limit)]
         return {"entries": [_entry_to_wire(feed_dir, e) for e in entries]}
+    if op == "get_profile":
+        # A peer may only ever be served ITS OWN profile -- there is no
+        # "profile of pubkey X" lookup here, deliberately: this node has no
+        # way to know that a claimed third-party profile wasn't tampered
+        # with in transit by whoever is answering. sync_with_peer enforces
+        # the other half of that (profile["pubkey"] == conn.remote_id()).
+        own_profile = load_profile(profile_path)
+        return {"profile": own_profile.to_dict() if own_profile else None}
     return {"error": f"unknown op {op!r}"}
 
 
-async def _handle_request(bi, feed_dir: Path, peers_path: Path) -> None:
+async def _handle_request(bi, feed_dir: Path, peers_path: Path, profile_path: Path | None = None) -> None:
     try:
         request = await _recv_message(bi)
-        response = _build_response(request, feed_dir, peers_path)
+        response = _build_response(request, feed_dir, peers_path, profile_path)
     except Exception as exc:
         response = {"error": str(exc)}
     try:
@@ -141,7 +163,7 @@ async def _handle_request(bi, feed_dir: Path, peers_path: Path) -> None:
         pass  # peer likely disconnected mid-response; nothing more to do
 
 
-async def _handle_connection(incoming, feed_dir: Path, peers_path: Path) -> None:
+async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile_path: Path | None = None) -> None:
     try:
         accepting = await incoming.accept()
         conn = await accepting.connect()
@@ -152,7 +174,28 @@ async def _handle_connection(incoming, feed_dir: Path, peers_path: Path) -> None
             bi = await conn.accept_bi()
         except Exception:
             return  # connection closed
-        asyncio.create_task(_handle_request(bi, feed_dir, peers_path))
+        asyncio.create_task(_handle_request(bi, feed_dir, peers_path, profile_path))
+
+
+def persist_peer_profile(conn, profile: dict) -> None:
+    """Write a signature-verified peer profile (sync_with_peer has already
+    checked verify_profile and the pubkey/conn.remote_id match before this
+    is ever called) into the local index: the `users` row itself, plus
+    every pubkey in its `likes` list as a `user_likes` row attributed to
+    the profile's own pubkey as liker -- the only two things a synced
+    profile can ever produce (repository.py's `user_likes` invariant).
+    Shared by the LAN/WAN auto-sync path and the CLI's `peer sync`."""
+    pubkey = profile["pubkey"]
+    repo.upsert_user_from_profile(
+        conn,
+        pubkey_hex=pubkey,
+        display_name=profile.get("name"),
+        machine_key=profile.get("machine_key"),
+        machine_display=profile.get("machine_display"),
+        profile_updated_at=profile.get("updated_at"),
+    )
+    for liked_pubkey in profile.get("likes") or []:
+        repo.add_user_like(conn, pubkey, liked_pubkey)
 
 
 async def _auto_sync_discovered_peer(
@@ -182,11 +225,21 @@ async def _auto_sync_discovered_peer(
     print(f"{source}: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
           flush=True)
 
-    if db_path is not None and report.new_entry_count > 0:
-        mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+    # Two independent things can each need the DB, and neither implies the
+    # other: new feed entries to ingest, and a profile to persist so this
+    # peer gets a name/machine even on a sync that pulled nothing new (the
+    # trap this comment exists to flag -- a peer who has already published
+    # everything they ever will still deserves to stop showing up as a bare
+    # pubkey). So the connection is opened whenever db_path is given at
+    # all, not gated on new_entry_count.
+    if db_path is not None:
         conn = connect(db_path)
         try:
-            ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
+            if report.new_entry_count > 0:
+                mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+                ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
+            if report.profile is not None:
+                persist_peer_profile(conn, report.profile)
         finally:
             conn.close()
 
@@ -261,6 +314,7 @@ async def serve(
     enable_wan_discovery: bool = False,
     wan_discovery_port: int = WAN_PORT,
     wan_discovery_interval_s: float = DHT_LOOKUP_INTERVAL_S,
+    profile_path: Path | None = None,
     publish_watch_dir: Path | None = None,
     publish_watch_interval_s: float = 10.0,
 ) -> None:
@@ -292,6 +346,12 @@ async def serve(
     missing title) because they were indexed by an older version, without
     a manual reindex and without losing hidden status or "my own roasts"
     tagging the way wiping the database would.
+
+    `profile_path` is which signed profile (profile.py) this node answers
+    `get_profile` requests with -- None (the default) means "whatever's at
+    profile.default_profile_path()", i.e. this identity's own, real profile.
+    Tests point it elsewhere so a profile fixture never touches the real
+    user's config directory.
     """
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
     if relay:
@@ -365,7 +425,7 @@ async def serve(
             incoming = await ep.accept_next()
             if incoming is None:
                 break
-            asyncio.create_task(_handle_connection(incoming, feed_dir, peers_path))
+            asyncio.create_task(_handle_connection(incoming, feed_dir, peers_path, profile_path))
     finally:
         for task in background_tasks:
             task.cancel()
@@ -441,7 +501,10 @@ async def sync_with_peer(
             raise RuntimeError(f"peer {peer_pubkey_hex} returned an error for get_peers: {peers_response['error']}")
         local_peers = load_peers(peers_path)
         for peer_dict in peers_response.get("peers", []):
-            gossiped = Peer(**{**peer_dict, "added_via": "gossip"})
+            # peer_from_dict (not Peer(**...)) so a field a newer peer added
+            # and this version doesn't know about yet is dropped instead of
+            # raising TypeError and aborting the whole sync (see peers.py).
+            gossiped = peer_from_dict({**peer_dict, "added_via": "gossip"})
             local_peers = upsert_peer(local_peers, gossiped)
 
         now = datetime.now(timezone.utc).isoformat()
@@ -451,12 +514,36 @@ async def sync_with_peer(
         ))
         save_peers(local_peers, peers_path)
 
+        # Ask for the peer's own signed profile (profile.py). Accepted only
+        # if it verifies AND claims to be the same pubkey we just
+        # authenticated over the QUIC handshake -- a peer may only ever
+        # serve its own profile, never relay someone else's (the one thing
+        # that would let a hostile node inject arbitrary like-graph edges).
+        # An old peer that doesn't know this op yet answers
+        # {"error": "unknown op 'get_profile'"} -- and any of that, or a
+        # transport hiccup, or a malformed/unsigned/mismatched profile, is
+        # treated as "this peer has no profile", never as a sync failure.
+        peer_profile: dict | None = None
+        try:
+            profile_response = await _request(conn, {"op": "get_profile"})
+            if "error" not in profile_response:
+                candidate = profile_response.get("profile")
+                if (
+                    isinstance(candidate, dict)
+                    and verify_profile(candidate)
+                    and str(candidate.get("pubkey")) == peer_pubkey_hex
+                ):
+                    peer_profile = candidate
+        except Exception:  # noqa: BLE001 -- a profile is a nice-to-have, never worth failing sync over
+            peer_profile = None
+
         return SyncReport(
             peer_pubkey_hex=peer_pubkey_hex,
             new_entry_count=len(new_entries),
             verify=verify_result,
             quota=quota_result,
             peers_known=len(local_peers),
+            profile=peer_profile,
         )
     finally:
         await ep.close()

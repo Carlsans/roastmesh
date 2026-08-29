@@ -19,11 +19,12 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 FIXTURES = sorted(FIXTURES_DIR.glob("*.alog"))[:3]
 
 
-async def _start_server(identity, feed_dir, peers_path):
+async def _start_server(identity, feed_dir, peers_path, *, profile_path=None):
     ready: asyncio.Future = asyncio.get_event_loop().create_future()
     task = asyncio.create_task(
         net.serve(identity, feed_dir, peers_path, relay=False, ready_callback=ready.set_result,
-                  enable_lan_discovery=False)  # these tests exercise manual sync, not LAN discovery
+                  enable_lan_discovery=False,  # these tests exercise manual sync, not LAN discovery
+                  profile_path=profile_path)
     )
     ticket = await asyncio.wait_for(ready, timeout=10)
     return task, ticket
@@ -472,3 +473,291 @@ async def test_serve_refreshes_stale_entries_on_startup(tmp_path: Path) -> None:
         assert refreshed, "title was never refreshed on serve() startup"
     finally:
         await _stop_server(task)
+
+
+# ---------------------------------------------------------------------------
+# get_profile: the one new wire op, and the Peer(**d) compatibility fix.
+# ---------------------------------------------------------------------------
+
+async def test_get_profile_response_returns_the_saved_profile(tmp_path: Path) -> None:
+    from roastmesh.profile import update_and_sign
+
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    profile_path = tmp_path / "server_profile.json"
+    update_and_sign(server_identity, name="Amber Chaff", machine_key="aillio_bullet", path=profile_path)
+
+    server_task, ticket = await _start_server(
+        server_identity, server_feed_dir, tmp_path / "server_peers.json", profile_path=profile_path,
+    )
+    try:
+        client_identity = generate_identity()
+        ep = await net.bind_endpoint(client_identity, relay=False)
+        try:
+            ticket_obj = iroh.EndpointTicket.from_string(ticket)
+            conn = await ep.connect(ticket_obj.endpoint_addr(), net.ALPN)
+            response = await net._request(conn, {"op": "get_profile"})
+            assert response["profile"]["name"] == "Amber Chaff"
+            assert response["profile"]["pubkey"] == server_identity.public_key_hex
+        finally:
+            await ep.close()
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_get_profile_response_is_none_when_nothing_saved(tmp_path: Path) -> None:
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    server_task, ticket = await _start_server(
+        server_identity, server_feed_dir, tmp_path / "server_peers.json",
+        profile_path=tmp_path / "no_such_profile.json",
+    )
+    try:
+        client_identity = generate_identity()
+        ep = await net.bind_endpoint(client_identity, relay=False)
+        try:
+            ticket_obj = iroh.EndpointTicket.from_string(ticket)
+            conn = await ep.connect(ticket_obj.endpoint_addr(), net.ALPN)
+            response = await net._request(conn, {"op": "get_profile"})
+            assert response["profile"] is None
+        finally:
+            await ep.close()
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_get_peers_and_get_feed_payloads_are_unaffected_by_get_profile(tmp_path: Path) -> None:
+    """The one new op must not change anything about the existing three --
+    same payload shape as before get_profile ever existed."""
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+    server_task, ticket = await _start_server(server_identity, server_feed_dir, tmp_path / "server_peers.json")
+    try:
+        client_identity = generate_identity()
+        ep = await net.bind_endpoint(client_identity, relay=False)
+        try:
+            ticket_obj = iroh.EndpointTicket.from_string(ticket)
+            conn = await ep.connect(ticket_obj.endpoint_addr(), net.ALPN)
+            peers_response = await net._request(conn, {"op": "get_peers"})
+            assert set(peers_response.keys()) == {"peers"}
+            meta_response = await net._request(conn, {"op": "get_feed_meta", "since_seq": 0})
+            assert set(meta_response.keys()) == {"entries"}
+        finally:
+            await ep.close()
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_sync_accepts_a_valid_matching_profile(tmp_path: Path) -> None:
+    from roastmesh.profile import update_and_sign
+
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+    profile_path = tmp_path / "server_profile.json"
+    update_and_sign(
+        server_identity, name="Amber Chaff", machine_key="aillio_bullet",
+        machine_display="Aillio Bullet R1", likes=["c" * 64], path=profile_path,
+    )
+
+    server_task, ticket = await _start_server(
+        server_identity, server_feed_dir, tmp_path / "server_peers.json", profile_path=profile_path,
+    )
+    try:
+        client_identity = generate_identity()
+        report = await net.sync_with_peer(
+            ticket, client_identity, tmp_path / "client_peer_feeds", tmp_path / "client_peers.json", relay=False,
+        )
+        assert report.profile is not None
+        assert report.profile["name"] == "Amber Chaff"
+        assert report.profile["pubkey"] == server_identity.public_key_hex
+        assert report.profile["likes"] == ["c" * 64]
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_sync_completes_cleanly_against_a_peer_that_does_not_know_get_profile(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The compat test that matters most: an un-upgraded peer -- one whose
+    _build_response has no get_profile case at all -- answers
+    {"error": "unknown op 'get_profile'"}, and sync_with_peer must treat
+    that as "this peer has no profile", not as a sync failure."""
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+
+    real_build_response = net._build_response
+
+    def old_peer_build_response(request, feed_dir, peers_path, profile_path=None):
+        if request.get("op") == "get_profile":
+            return {"error": "unknown op 'get_profile'"}
+        return real_build_response(request, feed_dir, peers_path, profile_path)
+
+    monkeypatch.setattr(net, "_build_response", old_peer_build_response)
+
+    server_task, ticket = await _start_server(server_identity, server_feed_dir, tmp_path / "server_peers.json")
+    try:
+        client_identity = generate_identity()
+        report = await net.sync_with_peer(
+            ticket, client_identity, tmp_path / "client_peer_feeds", tmp_path / "client_peers.json", relay=False,
+        )
+        assert report.profile is None
+        assert report.new_entry_count == 1
+        assert report.verify.ok
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_sync_rejects_a_profile_whose_pubkey_does_not_match_the_connection(tmp_path: Path) -> None:
+    from roastmesh.profile import update_and_sign
+
+    server_identity = generate_identity()
+    other_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+
+    # Validly signed -- just not by the identity actually answering this
+    # connection. A peer may only ever serve its OWN profile (relaying a
+    # third party's would let a hostile node inject arbitrary like-graph
+    # edges), so sync_with_peer must reject this without failing the sync.
+    profile_path = tmp_path / "server_profile.json"
+    update_and_sign(other_identity, name="Not The Server", path=profile_path)
+
+    server_task, ticket = await _start_server(
+        server_identity, server_feed_dir, tmp_path / "server_peers.json", profile_path=profile_path,
+    )
+    try:
+        client_identity = generate_identity()
+        report = await net.sync_with_peer(
+            ticket, client_identity, tmp_path / "client_peer_feeds", tmp_path / "client_peers.json", relay=False,
+        )
+        assert report.profile is None
+        assert report.new_entry_count == 1  # feed sync itself is unaffected
+        assert report.verify.ok
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_sync_rejects_a_profile_with_a_bad_signature(tmp_path: Path) -> None:
+    from roastmesh.profile import Profile, save_profile, sign_profile
+
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+
+    profile = Profile(pubkey="", name="Amber Chaff")
+    sign_profile(server_identity, profile)
+    profile.name = "Tampered Name"  # invalidates the signature without re-signing
+    profile_path = tmp_path / "server_profile.json"
+    save_profile(profile, profile_path)
+
+    server_task, ticket = await _start_server(
+        server_identity, server_feed_dir, tmp_path / "server_peers.json", profile_path=profile_path,
+    )
+    try:
+        client_identity = generate_identity()
+        report = await net.sync_with_peer(
+            ticket, client_identity, tmp_path / "client_peer_feeds", tmp_path / "client_peers.json", relay=False,
+        )
+        assert report.profile is None
+        assert report.new_entry_count == 1
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_auto_sync_persists_peer_profile_even_when_nothing_new_to_ingest(tmp_path: Path) -> None:
+    """The trap called out in the plan: _auto_sync_discovered_peer used to
+    gate its whole DB block on new_entry_count > 0, which meant a peer who
+    had already published everything they ever would never got a name."""
+    from roastmesh.index.db import connect
+    from roastmesh.profile import update_and_sign
+
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+    profile_path = tmp_path / "server_profile.json"
+    update_and_sign(
+        server_identity, name="Amber Chaff", machine_key="aillio_bullet",
+        machine_display="Aillio Bullet R1", path=profile_path,
+    )
+
+    server_task, ticket = await _start_server(
+        server_identity, server_feed_dir, tmp_path / "server_peers.json", profile_path=profile_path,
+    )
+    try:
+        client_identity = generate_identity()
+        peer_feeds_root = tmp_path / "client_peer_feeds"
+        peers_path = tmp_path / "client_peers.json"
+        db_path = tmp_path / "client_index.sqlite3"
+
+        # First auto-sync: pulls the one entry (new_entry_count == 1).
+        await net._auto_sync_discovered_peer(
+            server_identity.public_key_hex, ticket, identity=client_identity,
+            peer_feeds_root=peer_feeds_root, peers_path=peers_path, db_path=db_path, relay=False,
+        )
+        # Second auto-sync: nothing new to ingest (new_entry_count == 0) --
+        # the profile must still be persisted.
+        await net._auto_sync_discovered_peer(
+            server_identity.public_key_hex, ticket, identity=client_identity,
+            peer_feeds_root=peer_feeds_root, peers_path=peers_path, db_path=db_path, relay=False,
+        )
+
+        conn = connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT display_name, machine_key FROM users WHERE pubkey_hex = ?",
+                (server_identity.public_key_hex,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row["display_name"] == "Amber Chaff"
+        assert row["machine_key"] == "aillio_bullet"
+    finally:
+        await _stop_server(server_task)
+
+
+async def test_sync_tolerates_a_gossiped_peer_dict_with_an_unknown_field(tmp_path: Path, monkeypatch) -> None:
+    """Peer(**d) landmine, from the wire: a peer dict carrying a field this
+    version doesn't recognize (e.g. one a newer peer added) must not raise
+    TypeError and abort the whole sync."""
+    from datetime import datetime, timezone
+
+    server_identity = generate_identity()
+    server_feed_dir = tmp_path / "server_feed"
+    _publish(server_feed_dir, server_identity, FIXTURES[:1])
+    server_peers_path = tmp_path / "server_peers.json"
+    now = datetime.now(timezone.utc).isoformat()
+    known_peer_c = Peer(
+        ticket="deadbeef-fake-ticket-for-peer-c", feed_pubkey_hex="c" * 64,
+        first_seen=now, last_seen=now, added_via="manual",
+    )
+    save_peers([known_peer_c], server_peers_path)
+
+    real_build_response = net._build_response
+
+    def build_response_with_extra_peer_field(request, feed_dir, peers_path, profile_path=None):
+        response = real_build_response(request, feed_dir, peers_path, profile_path)
+        if request.get("op") == "get_peers":
+            for peer_dict in response["peers"]:
+                peer_dict["a_future_field_this_version_does_not_know_about"] = "surprise"
+        return response
+
+    monkeypatch.setattr(net, "_build_response", build_response_with_extra_peer_field)
+
+    server_task, ticket = await _start_server(server_identity, server_feed_dir, server_peers_path)
+    try:
+        client_identity = generate_identity()
+        client_peers_path = tmp_path / "client_peers.json"
+        report = await net.sync_with_peer(
+            ticket, client_identity, tmp_path / "client_peer_feeds", client_peers_path, relay=False,
+        )
+        assert report.new_entry_count == 1  # sync completed despite the unknown field
+
+        client_peers = load_peers(client_peers_path)
+        by_pubkey = {p.feed_pubkey_hex: p for p in client_peers}
+        assert "c" * 64 in by_pubkey  # the gossiped peer still made it through
+    finally:
+        await _stop_server(server_task)

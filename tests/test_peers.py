@@ -1,7 +1,8 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from roastmesh.peers import Peer, load_peers, prune_stale, save_peers, upsert_peer
+from roastmesh.peers import Peer, load_peers, peer_from_dict, prune_stale, save_peers, upsert_peer
 
 # A syntactically valid Iroh ticket isn't needed for most of these tests --
 # node_id_from_ticket() falls back to the raw ticket string when parsing
@@ -78,3 +79,31 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
 
 def test_load_peers_missing_file_returns_empty(tmp_path: Path) -> None:
     assert load_peers(tmp_path / "does-not-exist.json") == []
+
+
+def test_peer_from_dict_drops_unknown_fields() -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    peer = peer_from_dict({
+        "ticket": TICKET_A, "feed_pubkey_hex": "abc123", "first_seen": now, "last_seen": now,
+        "added_via": "manual", "a_future_field_this_version_does_not_know_about": "surprise",
+    })
+    assert peer.ticket == TICKET_A
+    assert not hasattr(peer, "a_future_field_this_version_does_not_know_about")
+
+
+def test_load_peers_tolerates_a_dict_with_an_unknown_field(tmp_path: Path) -> None:
+    """Peer(**d) landmine, from disk: a peers.json written by a newer
+    version of roastmesh that added a field this version doesn't know about
+    must not raise TypeError and abort the whole load."""
+    path = tmp_path / "peers.json"
+    now = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps([
+        {"ticket": TICKET_A, "feed_pubkey_hex": "abc123", "first_seen": now, "last_seen": now,
+         "added_via": "manual", "a_future_field_this_version_does_not_know_about": "surprise"},
+    ]))
+
+    loaded = load_peers(path)
+
+    assert len(loaded) == 1
+    assert loaded[0].ticket == TICKET_A
+    assert loaded[0].feed_pubkey_hex == "abc123"

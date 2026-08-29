@@ -44,12 +44,14 @@ from roastmesh.gui.widgets import (
     FONT_H2,
     FONT_MONO,
     MUTED,
+    AutocompleteField,
     Choice,
     Console,
     Field,
     PeerTable,
     ResultsTable,
     RunBar,
+    UserTable,
     explain,
     heading,
     screen_geometry,
@@ -281,7 +283,21 @@ class Tab(ttk.Frame):
 
 class SearchTab(Tab):
     """Find roast profiles in the local index -- own roasts plus anything
-    replicated from peers. First tab, per ARCHITECTURE.md's "search first"."""
+    replicated from peers. First tab, per ARCHITECTURE.md's "search first".
+
+    Two modes, chosen by the radio buttons at the top: *All users* (the
+    original form -- search everything, optionally narrowed by machine or
+    to favorited users' roasts) and *One user* (browse a single person's
+    roasts: filter/select from a user list, then their roasts land in the
+    same results table below). Both modes share the free-text box, the
+    roast-shape filters (roast type/DTR/drop temp/second crack), and the
+    lan-only/own-only/show-hidden checkboxes -- only what "Machine" and
+    "favorites" mean differs, since in One user mode those filter the user
+    list, not the roasts directly.
+    """
+
+    MODE_ALL = "all_users"
+    MODE_ONE = "one_user"
 
     def __init__(self, parent: tk.Widget, app: "RoastmeshApp") -> None:
         super().__init__(parent, app)
@@ -291,8 +307,62 @@ class SearchTab(Tab):
                          "Peers found through internet-wide discovery show up in results by default, "
                          "same as LAN peers -- check \"LAN only\" to hide anyone not on your local network."))
 
+        self.selected_user_pubkey: str | None = None
+        self._user_rows: dict[str, dict] = {}
+
+        mode_row = ttk.Frame(self)
+        mode_row.pack(fill="x", padx=10, pady=(0, 2))
+        tk.Label(mode_row, text=t("Show:"), font=FONT_BOLD, bg=BG, fg=FG).pack(side="left")
+        self.mode = tk.StringVar(value=self.MODE_ALL)
+        ttk.Radiobutton(mode_row, text=t("All users"), value=self.MODE_ALL, variable=self.mode,
+                        command=self._on_mode_changed).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(mode_row, text=t("One user"), value=self.MODE_ONE, variable=self.mode,
+                        command=self._on_mode_changed).pack(side="left", padx=(8, 0))
+
         self.query = Field(self, t("Text"), help_text=t("Free-text search, e.g. 'washed ethiopian'."))
-        self.machine = Field(self, t("Machine"), help_text=t("Exact machine_key, e.g. kaleido_m2."))
+
+        # Only one of these two frames is packed at a time (see
+        # _on_mode_changed) -- both live inside a fixed-position container so
+        # swapping between them doesn't disturb the rest of the tab's layout.
+        self.filter_container = ttk.Frame(self)
+        self.filter_container.pack(fill="x")
+
+        self.all_users_frame = ttk.Frame(self.filter_container)
+        self.machine = AutocompleteField(self.all_users_frame, t("Machine"),
+                                          help_text=t("Exact machine_key, e.g. kaleido_m2."))
+        self.favorites_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.all_users_frame,
+            text=t("Favorites only (hide roasts from anyone you haven't favorited)"),
+            variable=self.favorites_only,
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+
+        self.one_user_frame = ttk.Frame(self.filter_container)
+        explain(self.one_user_frame, t("Filter the list below, then select someone to see their roasts "
+                                        "in the results table below."))
+        self.user_machine = AutocompleteField(self.one_user_frame, t("Machine"),
+                                               help_text=t("Only list users who declared this machine."))
+        self.user_favorites_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.one_user_frame, text=t("Favorites only"),
+                         variable=self.user_favorites_only).pack(anchor="w", padx=10, pady=(0, 2))
+        ttk.Button(self.one_user_frame, text=t("Refresh list"),
+                   command=self._refresh_user_list).pack(anchor="w", padx=10, pady=(0, 4))
+        self.user_table = UserTable(self.one_user_frame)
+        self.user_table.tree.bind("<<TreeviewSelect>>", self._on_user_selected)
+        user_btn_row = ttk.Frame(self.one_user_frame)
+        user_btn_row.pack(fill="x", padx=10, pady=(0, 2))
+        self.favorite_btn = ttk.Button(user_btn_row, text=t("Favorite"),
+                                        command=self._on_toggle_user_favorite, state="disabled")
+        self.favorite_btn.pack(side="left")
+        self.like_btn = ttk.Button(user_btn_row, text=t("Like"),
+                                    command=self._on_toggle_user_like, state="disabled")
+        self.like_btn.pack(side="left", padx=(6, 0))
+        self.user_status = tk.StringVar(value="")
+        tk.Label(self.one_user_frame, textvariable=self.user_status, font=("TkDefaultFont", 9),
+                 fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=10, pady=(0, 4))
+
+        self.all_users_frame.pack(fill="x")  # default mode is MODE_ALL
+
         self.roast_type = Field(self, t("Roast type"), help_text=t("e.g. 'full city', 'vienna'."))
         self.dtr_min = Field(self, t("DTR min %"), width=8)
         self.dtr_max = Field(self, t("DTR max %"), width=8)
@@ -328,13 +398,51 @@ class SearchTab(Tab):
         self.table.tree.bind("<Double-1>", self._on_open_row)
         explain(self, t("Double-click a result to see its full detail and open the original .alog file."))
 
+        self._load_used_machines()
+
+    def _on_mode_changed(self) -> None:
+        if self.mode.get() == self.MODE_ONE:
+            self.all_users_frame.pack_forget()
+            self.one_user_frame.pack(fill="x")
+            self._refresh_user_list()
+        else:
+            self.one_user_frame.pack_forget()
+            self.all_users_frame.pack(fill="x")
+
+    def _load_used_machines(self) -> None:
+        """Populate both machine autocompletes from the machine_keys already
+        present in this index (`machines list --used`) -- the catalogue used
+        for the Settings picker is a different, much larger list of machines
+        this index has never actually seen a roast from."""
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("--db", self.app.db_path.get(), "machines", "list", "--used", "--json"))
+        task.start()
+        stream_into(task, buf.append, lambda code: self._used_machines_loaded(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _used_machines_loaded(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            return
+        try:
+            keys = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            return
+        self.machine.set_values(keys)
+        self.user_machine.set_values(keys)
+
     def _build_args(self) -> list[str]:
         args = ["search"]
         text = self.query.get()
         if text:
             args.append(text)
-        if self.machine.get():
-            args += ["--machine", self.machine.get()]
+        if self.mode.get() == self.MODE_ONE:
+            if self.selected_user_pubkey:
+                args += ["--user", self.selected_user_pubkey]
+        else:
+            if self.machine.get():
+                args += ["--machine", self.machine.get()]
+            if self.favorites_only.get():
+                args.append("--favorites-only")
         if self.roast_type.get():
             args += ["--roast-type", self.roast_type.get()]
         if self.dtr_min.get():
@@ -363,6 +471,9 @@ class SearchTab(Tab):
     def _on_run(self) -> None:
         if self.task is not None and self.task.running:
             return
+        if self.mode.get() == self.MODE_ONE and not self.selected_user_pubkey:
+            self.table.set_error(t("select a user above first"))
+            return
         argv = roastmesh_argv("--db", self.app.db_path.get(), *self._build_args())
         self._output = []
         self.table.set_error(t("running..."))
@@ -383,6 +494,113 @@ class SearchTab(Tab):
             self.table.set_error(t("could not parse results"))
             return
         self.table.set_rows(rows, unit=self.app.temp_unit.get())
+
+    def _refresh_user_list(self) -> None:
+        args = ["user", "list", "--json"]
+        if self.user_machine.get():
+            args += ["--machine", self.user_machine.get()]
+        if self.user_favorites_only.get():
+            args.append("--favorites")
+        argv = roastmesh_argv("--db", self.app.db_path.get(), *args)
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._users_loaded(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _users_loaded(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            self.user_status.set(t("Couldn't load users: {error}", error="".join(buf).strip()))
+            return
+        try:
+            rows = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            self.user_status.set(t("could not parse results"))
+            return
+        self._user_rows = {row["pubkey_hex"]: row for row in rows}
+        previously_selected = self.selected_user_pubkey
+        self.user_table.set_rows(rows)
+        if previously_selected in self._user_rows:
+            self.user_table.tree.selection_set(previously_selected)
+        else:
+            self.selected_user_pubkey = None
+            self.favorite_btn.configure(state="disabled")
+            self.like_btn.configure(state="disabled")
+
+    def _on_user_selected(self, event: tk.Event | None = None) -> None:
+        selection = self.user_table.tree.selection()
+        if not selection:
+            self.selected_user_pubkey = None
+            self.favorite_btn.configure(state="disabled")
+            self.like_btn.configure(state="disabled")
+            return
+        pubkey = selection[0]
+        self.selected_user_pubkey = pubkey
+        row = self._user_rows.get(pubkey, {})
+        self.favorite_btn.configure(
+            state="normal", text=t("Unfavorite") if row.get("is_favorite") else t("Favorite"),
+        )
+        self.like_btn.configure(state="normal", text=t("Like"))
+        self._refresh_like_button_label(pubkey)
+        self._on_run()
+
+    def _refresh_like_button_label(self, pubkey: str) -> None:
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("profile", "show", "--json"))
+        task.start()
+        stream_into(task, buf.append, lambda code: self._own_profile_loaded(code, buf, pubkey),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _own_profile_loaded(self, code: int, buf: list[str], pubkey: str) -> None:
+        if code != 0 or self.selected_user_pubkey != pubkey:
+            return  # a different row was selected before this landed
+        try:
+            profile = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            return
+        liked = pubkey in (profile.get("likes") or [])
+        self.like_btn.configure(text=t("Unlike") if liked else t("Like"))
+
+    def _on_toggle_user_favorite(self) -> None:
+        pubkey = self.selected_user_pubkey
+        if not pubkey:
+            return
+        now_favorite = not self._user_rows.get(pubkey, {}).get("is_favorite")
+        command = "favorite" if now_favorite else "unfavorite"
+        argv = roastmesh_argv("--db", self.app.db_path.get(), "user", command, pubkey)
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._on_user_favorite_toggled(code, buf, now_favorite),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_user_favorite_toggled(self, code: int, buf: list[str], now_favorite: bool) -> None:
+        if code != 0:
+            self.user_status.set(t("Couldn't change favorite status: {error}", error="".join(buf).strip()))
+            return
+        self.user_status.set(t("Favorited.") if now_favorite else t("Unfavorited."))
+        self._refresh_user_list()
+
+    def _on_toggle_user_like(self) -> None:
+        pubkey = self.selected_user_pubkey
+        if not pubkey:
+            return
+        now_liked = self.like_btn.cget("text") != t("Unlike")
+        command = "like" if now_liked else "unlike"
+        argv = roastmesh_argv("--db", self.app.db_path.get(), "user", command, pubkey)
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._on_user_like_toggled(code, buf, pubkey, now_liked),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_user_like_toggled(self, code: int, buf: list[str], pubkey: str, now_liked: bool) -> None:
+        if code != 0:
+            self.user_status.set(t("Couldn't change like status: {error}", error="".join(buf).strip()))
+            return
+        self.user_status.set(t("Liked.") if now_liked else t("Unliked."))
+        self._refresh_user_list()
+        self._refresh_like_button_label(pubkey)
 
     def _on_open_row(self, event: tk.Event) -> None:
         roast_id = self.table.tree.identify_row(event.y)
@@ -820,6 +1038,30 @@ class SettingsTab(Tab):
         container = scrollable(self)
         heading(container, t("Settings"), t("Where things live, and how far discovery reaches."))
 
+        you_section = section(container, t("You"))
+        explain(you_section, t("Your name and declared machine are shown to peers once they sync with "
+                                "you -- cosmetic only, never required, and never trusted for uniqueness. "
+                                "Saved when you leave the field or press Enter, not on every keystroke, "
+                                "since each save re-signs your profile."))
+        self.name_field = Field(you_section, t("Display name"), variable=self.app.display_name,
+                                 help_text=t("Shown to peers who sync with you."))
+        self.name_field.entry.bind("<FocusOut>", self._on_profile_field_changed)
+        self.name_field.entry.bind("<Return>", self._on_profile_field_changed)
+        self.machine_field = AutocompleteField(
+            you_section, t("Your machine"), variable=self.app.own_machine,
+            help_text=t("Your declared roaster -- also used as a fallback machine filter for your own "
+                        "roasts that have none of their own. Type a machine not in the list to use a "
+                        "custom one."))
+        self.machine_field.combo.bind("<FocusOut>", self._on_profile_field_changed)
+        self.machine_field.combo.bind("<Return>", self._on_profile_field_changed)
+        self.machine_field.combo.bind("<<ComboboxSelected>>", self._on_profile_field_changed)
+        self.you_status = tk.StringVar(value="")
+        tk.Label(you_section, textvariable=self.you_status, font=("TkDefaultFont", 9), fg=MUTED,
+                 bg=BG, anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+        self._machine_by_display: dict[str, str] = {}
+        self._load_profile()
+        self._load_machine_catalogue()
+
         db_section = section(container, t("Database file"))
         explain(db_section, t("Where your local search index lives. Search, Publish, and Network "
                                "all use this. Existing tabs pick up a change the next time they run."))
@@ -897,6 +1139,81 @@ class SettingsTab(Tab):
         if path:
             self.app.watch_dir.set(path)
 
+    def _load_profile(self) -> None:
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("--db", self.app.db_path.get(), "profile", "show", "--json"))
+        task.start()
+        stream_into(task, buf.append, lambda code: self._profile_loaded(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _profile_loaded(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            return
+        try:
+            profile = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            return
+        self.app.display_name.set(profile.get("name") or "")
+        self.app.own_machine.set(profile.get("machine_display") or profile.get("machine_key") or "")
+
+    def _load_machine_catalogue(self) -> None:
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("--db", self.app.db_path.get(), "machines", "list", "--json"))
+        task.start()
+        stream_into(task, buf.append, lambda code: self._catalogue_loaded(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _catalogue_loaded(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            return
+        try:
+            catalogue = json.loads("".join(buf))
+        except json.JSONDecodeError:
+            return
+        # Several catalogue entries share the same machine_key (e.g. three
+        # Aillio Bullet variants all collapse to "aillio_bullet") -- show
+        # the human-readable display_name in the dropdown, and remember
+        # only the first key for each so a selection resolves unambiguously.
+        values: list[str] = []
+        for m in catalogue:
+            display = m.get("display_name") or m.get("key")
+            if display and display not in self._machine_by_display:
+                self._machine_by_display[display] = m.get("key")
+                values.append(display)
+        self.machine_field.set_values(values)
+
+    def _on_profile_field_changed(self, event: tk.Event | None = None) -> None:
+        """Save name/machine on focus-out or Return -- deliberately NOT
+        wired to the trace_add auto-save every other Settings field uses
+        (see RoastmeshApp.__init__): that fires on every keystroke, and
+        each write here shells out to `profile set`, which re-signs
+        profile.json."""
+        name = self.app.display_name.get().strip()
+        machine_text = self.app.own_machine.get().strip()
+        args = ["--db", self.app.db_path.get(), "profile", "set"]
+        if name:
+            args += ["--name", name]
+        if machine_text:
+            key = self._machine_by_display.get(machine_text)
+            if key:
+                args += ["--machine", key]
+            else:
+                args += ["--machine-custom", machine_text]
+        if not name and not machine_text:
+            return  # nothing to save yet
+        argv = roastmesh_argv(*args)
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._on_profile_saved(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_profile_saved(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            self.you_status.set(t("Couldn't save: {error}", error="".join(buf).strip()))
+            return
+        self.you_status.set(t("Saved."))
+
 
 class RoastmeshApp(tk.Tk):
     def __init__(self) -> None:
@@ -961,6 +1278,14 @@ class RoastmeshApp(tk.Tk):
         for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled,
                     self.temp_unit, self.language):
             var.trace_add("write", lambda *_args: self._save_config())
+
+        # Your own profile (display name, declared machine) -- NOT part of
+        # the trace_add loop above. Those write to gui_config.json on every
+        # keystroke; these two are backed by `profile set` instead (see
+        # SettingsTab._on_profile_field_changed), which re-signs
+        # profile.json on every call, so they save on focus-out/Return only.
+        self.display_name = tk.StringVar(value="")
+        self.own_machine = tk.StringVar(value="")
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=6, pady=6)

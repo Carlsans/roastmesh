@@ -104,6 +104,64 @@ def test_machine_key_normalization() -> None:
     assert record.mechanism_family == "hottop_drum"
 
 
+# Ground truth captured from this project's already-shipped behavior for
+# every real-world fixture on hand, BEFORE roastmesh.machines' ~254-entry
+# Artisan catalogue lookup was added to normalize_machine_key. Every one of
+# these must still hold afterwards -- see the regression test below.
+_EXPECTED_MACHINE_KEYS = {
+    "alexzhu_1.alog": ("unknown", "unknown"),
+    "beastroaster_1.alog": ("unknown", "unknown"),
+    "hottop_1.alog": ("hottop", "hottop_drum"),
+    "hottop_2.alog": ("hottop", "hottop_drum"),
+    "kaleido_1.alog": ("kaleido_serial", "kaleido_drum"),
+    "kaleido_2.alog": ("kaleido_serial", "kaleido_drum"),
+    "kaleido_3.alog": ("kaleido_serial", "kaleido_drum"),
+    "philstyle_1.alog": ("unknown", "unknown"),
+    "philstyle_2.alog": ("unknown", "unknown"),
+}
+
+
+def test_catalogue_lookup_does_not_change_any_existing_fixtures_machine_key() -> None:
+    """The hard constraint on adding roastmesh.machines' catalogue lookup
+    ahead of the Kaleido special case and MACHINE_ALIASES: it must not
+    rename a single already-shipped key. Artisan's own catalogue happens to
+    contain the literal strings "Kaleido Serial"/"Network"/"Legacy" and, for
+    Hottop's KN-8828B-2K+ model, the exact string "Hottop 2K+" that these
+    fixtures themselves carry -- a naive catalogue-first exact match would
+    slugify "Hottop 2K+" to "hottop_2k" (not "hottop"), breaking every
+    already-ingested Hottop roast's machine_key. This pins every one of the
+    9 real-world fixtures on hand to its already-shipped
+    (machine_key, mechanism_family) pair.
+    """
+    assert set(_EXPECTED_MACHINE_KEYS) == {p.name for p in FIXTURES}, "fixtures dir changed -- update this table"
+    for path in FIXTURES:
+        raw = parse_alog(path)
+        record = to_roast_record(raw, SOURCE)
+        expected = _EXPECTED_MACHINE_KEYS[path.name]
+        assert (record.machine_key, record.mechanism_family) == expected, path.name
+
+
+def test_catalogue_lookup_resolves_a_machine_the_old_aliases_never_knew() -> None:
+    """A roastertype string the pre-catalogue logic (Kaleido special case +
+    the 4-entry MACHINE_ALIASES + a generic slugify fallback) had never
+    heard of, and would have collapsed to a bare slug with no real
+    manufacturer/display info -- the new catalogue lookup should now
+    recognize it exactly, since it's one of Artisan's own ~254 strings and
+    isn't in the excluded (kaleido/hottop/behmor/bullet/roaster scope)
+    conflict set."""
+    from roastmesh.alog.machine import normalize_machine_key
+
+    key, family, display = normalize_machine_key("Giesen W6A")
+    assert key == "giesen_w6a"
+    assert display == "Giesen W6A"
+    # No trustworthy drum/fluidbed data for a catalogue-only match --
+    # mechanism_family must not be invented.
+    assert family == "unknown"
+
+    # Case-insensitive, same as roastmesh.machines.find_by_roastertype.
+    assert normalize_machine_key("giesen w6a")[0] == "giesen_w6a"
+
+
 def test_density_is_none_or_positive() -> None:
     for path in FIXTURES:
         raw = parse_alog(path)

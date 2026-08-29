@@ -258,6 +258,36 @@ peer was discovered (LAN, the internet-wide DHT, a pasted ticket, or gossip). Na
 `--lan-only` to just your own roasts and peers on your local network, `--own-only` to only your
 own, or add `--show-hidden` to also include roasts you've hidden.
 
+**Users: who published what.** Every publisher is an Ed25519 public key -- that key *is* their
+identity, permanently, and it can't be taken or forged. On top of that each user has a display
+name and a declared roasting machine, both editable and both purely cosmetic. Until someone sets
+a name, one is derived from their key, so the same peer shows the same readable name on every
+machine without anyone having exchanged anything:
+
+```bash
+roastmesh profile show                                  # your own name, machine and likes
+roastmesh profile set --name "Carl" --machine hottop    # see `roastmesh machines list`
+roastmesh profile set --machine-custom "Home-built rig" # anything not in the catalogue
+
+roastmesh --db ~/roastmesh.sqlite3 user list            # who has published into your index
+roastmesh --db ~/roastmesh.sqlite3 user list --all      # every known peer, published or not
+roastmesh --db ~/roastmesh.sqlite3 user list --machine hottop
+roastmesh --db ~/roastmesh.sqlite3 search --user <pubkey-prefix>   # one person's roasts
+roastmesh --db ~/roastmesh.sqlite3 search --favorites-only
+```
+
+**Favorites are private; likes are public.** `user favorite` is local and never leaves your
+machine. `user like` goes into your signed profile, so anyone who syncs with you sees which
+users you liked. Be aware of what a like count is worth: identities are free in this network,
+so a count means "N peers *you* know like this person", never a global score, and nothing ranks
+or filters on it automatically.
+
+The machine catalogue covers the 254 roasters Artisan itself knows -- matched against the exact
+`roastertype` string Artisan writes into a profile -- plus the popular home roasters Artisan
+omits (Behmor, Gene Café, Quest, Kaffelogic, Fresh Roast and friends), plus whatever you type.
+Since many `.alog` files leave `roastertype` blank, `--machine` also matches roasts that have no
+machine of their own but whose owner declared that machine.
+
 **Hide a roast from your own search results** (local only -- see the GUI bullet above for why
 this can't retroactively un-share it from a peer):
 ```bash

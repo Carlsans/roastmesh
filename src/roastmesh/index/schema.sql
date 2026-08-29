@@ -5,8 +5,16 @@ CREATE TABLE IF NOT EXISTS sources (
     source_url      TEXT,
     fetched_at      TEXT NOT NULL,
     raw_path        TEXT NOT NULL,             -- path on disk where the original .alog bytes live
-    content_sha256  TEXT NOT NULL UNIQUE
+    content_sha256  TEXT NOT NULL UNIQUE,
+    author_pubkey   TEXT                       -- publishing user's pubkey hex; NULL if unknown (see db._ADDED_COLUMNS)
 );
+-- idx_sources_author is NOT created here: on a database that predates this
+-- column, this script's CREATE TABLE IF NOT EXISTS above is a no-op (the
+-- table already exists without author_pubkey), and an index on a
+-- not-yet-existing column would fail this whole executescript before
+-- db._apply_added_columns ever gets a chance to ALTER TABLE it in. db.py's
+-- migrate() creates this index itself, right after _apply_added_columns --
+-- by then the column exists on both a fresh and an upgraded database.
 
 CREATE TABLE IF NOT EXISTS roasts (
     roast_id            TEXT PRIMARY KEY,
@@ -68,6 +76,28 @@ CREATE TABLE IF NOT EXISTS index_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    pubkey_hex          TEXT PRIMARY KEY,
+    display_name        TEXT,      -- self-declared, cosmetic; NULL until learned
+    machine_key         TEXT,      -- same vocabulary as roasts.machine_key
+    machine_display     TEXT,      -- shown to humans; free text for a custom machine
+    profile_updated_at  TEXT,
+    is_favorite         INTEGER NOT NULL DEFAULT 0,  -- local-only, like roasts.hidden above:
+                                                      -- never leaves this machine, never touches
+                                                      -- the feed or gets sent to a peer
+    first_seen          TEXT,
+    last_seen            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_machine ON users(machine_key);
+
+CREATE TABLE IF NOT EXISTS user_likes (
+    liker_pubkey    TEXT NOT NULL,
+    subject_pubkey  TEXT NOT NULL,
+    liked_at        TEXT NOT NULL,
+    PRIMARY KEY (liker_pubkey, subject_pubkey)
+);
+CREATE INDEX IF NOT EXISTS idx_user_likes_subject ON user_likes(subject_pubkey);
 
 -- Free-text search over the fields .alog has no structured equivalent for
 -- (origin, process, etc. only ever show up as prose in beans_text/notes).

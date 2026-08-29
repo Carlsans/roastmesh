@@ -24,6 +24,40 @@ class IngestResult:
         self.error = error
 
 
+# Sentinel distinguishing "caller didn't pass local_pubkey_hex at all" from
+# "caller explicitly passed None" (a test asserting no local identity
+# exists, say) -- ingest_file's own default has to be *computed fresh on
+# every call* (never a plain `None` default parameter value that then gets
+# treated as "look it up"), because otherwise a caller who deliberately
+# passes local_pubkey_hex=None to mean "no local identity" would be
+# silently overridden by an autodetect.
+_UNSET = object()
+
+
+def _local_pubkey_hex() -> str | None:
+    """The local identity's public key, if an identity already exists on
+    disk -- this must NEVER create one. `load_or_create_identity` (what the
+    CLI normally uses) is deliberately not called here: minting a fresh
+    Ed25519 identity is a side effect a plain ingest/reindex has no
+    business causing."""
+    from roastmesh.identity import default_identity_path, load_identity
+
+    path = default_identity_path()
+    if not path.exists():
+        return None
+    return load_identity(path).public_key_hex
+
+
+def _resolve_author_pubkey(source_type: str, source_ref: str, local_pubkey_hex: str | None) -> str | None:
+    """p2p `source_ref` is `"<pubkey_hex>:<seq:08d>"` (see ingest_feed
+    below) -- the part before the colon is exactly who published it. A
+    local row has no such marker, so it's attributed to whoever this
+    machine's own identity is (possibly nobody yet)."""
+    if source_type == "p2p":
+        return source_ref.split(":", 1)[0] if source_ref else None
+    return local_pubkey_hex
+
+
 def ingest_file(
     conn: sqlite3.Connection,
     path: Path,
@@ -34,9 +68,13 @@ def ingest_file(
     is_user_log: bool = False,
     machine_key: str | None = None,
     mechanism_family: str | None = None,
+    local_pubkey_hex: str | None = _UNSET,  # type: ignore[assignment]
 ) -> IngestResult:
     path = Path(path)
     source_ref = source_ref or str(path)
+    if local_pubkey_hex is _UNSET:
+        local_pubkey_hex = _local_pubkey_hex()
+    author_pubkey = _resolve_author_pubkey(source_type, source_ref, local_pubkey_hex)
     try:
         raw_bytes = path.read_bytes()
     except OSError as exc:
@@ -83,6 +121,11 @@ def ingest_file(
         if existing_roast_id is not None:
             record.roast_id = existing_roast_id
         repo.insert_roast(conn, record, existing["source_id"])
+        # Backfills author_pubkey on a source row that predates the column
+        # (or simply needs recomputing) -- this is what makes
+        # refresh_known_sources's re-ingest of every already-known source
+        # actually populate it, without a separate migration-time pass.
+        repo.set_source_author_pubkey(conn, existing["source_id"], author_pubkey)
         conn.commit()
         return IngestResult(record, True, None)
 
@@ -95,6 +138,7 @@ def ingest_file(
         source_url=source_url,
         raw_path=str(path),
         content_sha256=content_sha256,
+        author_pubkey=author_pubkey,
     )
     repo.insert_roast(conn, record, source_id)
     conn.commit()

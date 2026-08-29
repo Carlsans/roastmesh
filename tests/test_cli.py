@@ -322,6 +322,207 @@ def test_show_json_includes_hidden_status(tmp_path: Path) -> None:
     assert "hidden: yes" in runner.invoke(main, ["--db", str(db_path), "show", roast_id]).output
 
 
+# ---------------------------------------------------------------------------
+# profile / user / machines (phase 2)
+# ---------------------------------------------------------------------------
+
+def test_profile_show_set_round_trip_including_custom_machine(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.profile import verify_profile
+
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    runner.invoke(main, ["identity", "show"])  # create the identity quietly first --
+    # otherwise its one-time "created new identity" banner (plain stdout,
+    # not --json) would land ahead of the JSON this test parses below.
+
+    default = json.loads(runner.invoke(main, ["profile", "show", "--json"]).output)
+    assert default["name"]  # deterministic default name, never blank
+    assert default["pubkey"]
+    assert len(default["pubkey"]) == 64
+
+    result = runner.invoke(main, ["profile", "set", "--name", "Amber Chaff", "--machine", "aillio_bullet"])
+    assert result.exit_code == 0, result.output
+
+    shown = json.loads(runner.invoke(main, ["profile", "show", "--json"]).output)
+    assert shown["name"] == "Amber Chaff"
+    assert shown["machine_key"] == "aillio_bullet"
+    assert shown["machine_display"] == "Aillio Bullet R1"
+    assert verify_profile(shown) is True
+
+    # a custom machine not in the catalogue
+    custom = runner.invoke(main, ["profile", "set", "--machine-custom", "My Home-Built Drum Roaster"])
+    assert custom.exit_code == 0, custom.output
+
+    shown2 = json.loads(runner.invoke(main, ["profile", "show", "--json"]).output)
+    assert shown2["machine_display"] == "My Home-Built Drum Roaster"
+    assert shown2["machine_key"] == "my_home_built_drum_roaster"
+    assert shown2["name"] == "Amber Chaff"  # untouched by the machine-only update
+    assert verify_profile(shown2) is True
+
+
+def test_profile_set_rejects_unknown_machine_key(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["profile", "set", "--machine", "not_a_real_machine_key"])
+    assert result.exit_code != 0
+    assert "unknown machine" in result.output
+
+
+def test_profile_set_rejects_machine_and_machine_custom_together(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["profile", "set", "--machine", "aillio_bullet", "--machine-custom", "Home Rig"]
+    )
+    assert result.exit_code != 0
+
+
+def test_user_list_with_roasts_default_vs_all_and_default_name_fallback(tmp_path: Path) -> None:
+    from roastmesh.index import repository as repo
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_file
+    from roastmesh.usernames import default_display_name
+
+    db_path = tmp_path / "cli.sqlite3"
+    publisher_pubkey = "aa" * 32
+    favorited_no_roasts_pubkey = "bb" * 32
+
+    conn = connect(db_path)
+    ingest_file(
+        conn, FIXTURES_DIR / "kaleido_1.alog", source_type="p2p", source_ref=f"{publisher_pubkey}:00000000"
+    )
+    repo.ensure_user(conn, favorited_no_roasts_pubkey)
+    repo.set_user_favorite(conn, favorited_no_roasts_pubkey, True)
+    conn.close()
+
+    runner = CliRunner()
+    with_roasts = json.loads(runner.invoke(main, ["--db", str(db_path), "user", "list", "--json"]).output)
+    pubkeys_with_roasts = {u["pubkey_hex"] for u in with_roasts}
+    assert publisher_pubkey in pubkeys_with_roasts
+    assert favorited_no_roasts_pubkey not in pubkeys_with_roasts  # has no roasts -- hidden by default
+
+    all_users = json.loads(runner.invoke(main, ["--db", str(db_path), "user", "list", "--all", "--json"]).output)
+    pubkeys_all = {u["pubkey_hex"] for u in all_users}
+    assert publisher_pubkey in pubkeys_all
+    assert favorited_no_roasts_pubkey in pubkeys_all  # --all surfaces it too
+
+    publisher_row = next(u for u in with_roasts if u["pubkey_hex"] == publisher_pubkey)
+    assert publisher_row["display_name"] == default_display_name(publisher_pubkey)  # never-synced fallback
+    assert publisher_row["roast_count"] == 1
+
+
+def test_user_favorite_and_unfavorite(tmp_path: Path) -> None:
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_file
+
+    db_path = tmp_path / "cli.sqlite3"
+    pubkey = "cc" * 32
+    conn = connect(db_path)
+    ingest_file(conn, FIXTURES_DIR / "hottop_1.alog", source_type="p2p", source_ref=f"{pubkey}:00000000")
+    conn.close()
+
+    runner = CliRunner()
+    fav_result = runner.invoke(main, ["--db", str(db_path), "user", "favorite", pubkey[:8]])
+    assert fav_result.exit_code == 0, fav_result.output
+
+    shown = json.loads(runner.invoke(main, ["--db", str(db_path), "user", "show", pubkey[:8], "--json"]).output)
+    assert shown["is_favorite"] is True
+
+    unfav_result = runner.invoke(main, ["--db", str(db_path), "user", "unfavorite", pubkey[:8]])
+    assert unfav_result.exit_code == 0, unfav_result.output
+    shown2 = json.loads(runner.invoke(main, ["--db", str(db_path), "user", "show", pubkey[:8], "--json"]).output)
+    assert shown2["is_favorite"] is False
+
+
+def test_user_show_reports_no_match_for_an_unknown_id(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+    result = runner.invoke(main, ["--db", str(db_path), "user", "show", "00000000"])
+    assert result.exit_code != 0
+    assert "no user found" in result.output
+
+
+def test_user_like_and_unlike_resign_profile_and_update_like_count(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_file
+    from roastmesh.profile import default_profile_path, load_profile, verify_profile
+
+    _isolate_home(monkeypatch, tmp_path)
+    db_path = tmp_path / "cli.sqlite3"
+    subject_pubkey = "dd" * 32
+    conn = connect(db_path)
+    ingest_file(conn, FIXTURES_DIR / "kaleido_2.alog", source_type="p2p", source_ref=f"{subject_pubkey}:00000000")
+    conn.close()
+
+    runner = CliRunner()
+    like_result = runner.invoke(main, ["--db", str(db_path), "user", "like", subject_pubkey[:8]])
+    assert like_result.exit_code == 0, like_result.output
+
+    saved = load_profile(default_profile_path())
+    assert saved is not None
+    assert subject_pubkey in saved.likes
+    assert verify_profile(saved.to_dict()) is True  # re-signed, still verifies
+
+    shown = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "user", "show", subject_pubkey[:8], "--json"]).output
+    )
+    assert shown["like_count"] == 1
+
+    unlike_result = runner.invoke(main, ["--db", str(db_path), "user", "unlike", subject_pubkey[:8]])
+    assert unlike_result.exit_code == 0, unlike_result.output
+
+    saved2 = load_profile(default_profile_path())
+    assert saved2 is not None
+    assert subject_pubkey not in saved2.likes
+    assert verify_profile(saved2.to_dict()) is True
+
+    shown2 = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "user", "show", subject_pubkey[:8], "--json"]).output
+    )
+    assert shown2["like_count"] == 0
+
+
+def test_search_user_and_favorites_only_filters(tmp_path: Path) -> None:
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_file
+
+    db_path = tmp_path / "cli.sqlite3"
+    pubkey_a = "ee" * 32
+    pubkey_b = "ff" * 32
+    conn = connect(db_path)
+    ingest_file(conn, FIXTURES_DIR / "kaleido_3.alog", source_type="p2p", source_ref=f"{pubkey_a}:00000000")
+    ingest_file(conn, FIXTURES_DIR / "hottop_2.alog", source_type="p2p", source_ref=f"{pubkey_b}:00000000")
+    conn.close()
+
+    runner = CliRunner()
+    user_rows = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "search", "--user", pubkey_a[:8], "--json"]).output
+    )
+    assert len(user_rows) == 1
+    assert user_rows[0]["author_pubkey"] == pubkey_a
+
+    runner.invoke(main, ["--db", str(db_path), "user", "favorite", pubkey_b[:8]])
+    fav_rows = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "search", "--favorites-only", "--json"]).output
+    )
+    assert {r["author_pubkey"] for r in fav_rows} == {pubkey_b}
+
+
+def test_machines_list_and_used(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+
+    catalogue = json.loads(runner.invoke(main, ["--db", str(db_path), "machines", "list", "--json"]).output)
+    assert any(m["key"] == "aillio_bullet" for m in catalogue)
+
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR)])
+    used = json.loads(
+        runner.invoke(main, ["--db", str(db_path), "machines", "list", "--used", "--json"]).output
+    )
+    assert isinstance(used, list)
+    assert len(used) > 0
+
+
 def test_refresh_updates_stale_entries_and_is_a_fast_noop_second_time(tmp_path: Path) -> None:
     import roastmesh
 
@@ -373,3 +574,45 @@ def test_refresh_preserves_hidden_status(tmp_path: Path) -> None:
 
     payload = json.loads(runner.invoke(main, ["--db", str(db_path), "show", roast_id, "--json"]).output)
     assert payload["hidden"] is True
+
+
+def test_declaring_your_machine_makes_your_blank_roastertype_roasts_findable(tmp_path: Path, monkeypatch) -> None:
+    """The owner-machine fallback, end to end through the CLI.
+
+    `search --machine X` matches a roast whose own machine_key is X, OR one
+    whose machine is 'unknown' but whose owner declared X -- which is what
+    makes the facet useful at all, since 5 of the 9 sample .alog files carry
+    a blank `roastertype`.
+
+    Regression: this was dead on arrival. `profile set` wrote profile.json but
+    never mirrored the declared machine into the index's `users` table, and
+    the fallback is a SQL join onto that table -- so declaring a machine and
+    then searching for it returned "no matches". Each phase's unit tests
+    exercised one side of that join and neither crossed it.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    db_path = tmp_path / "index.sqlite3"
+    runner = CliRunner()
+
+    # philstyle_1.alog has roastertype == "" -> machine_key "unknown".
+    ingested = runner.invoke(main, ["--db", str(db_path), "ingest",
+                                    str(FIXTURES_DIR / "philstyle_1.alog")])
+    assert ingested.exit_code == 0, ingested.output
+
+    assert runner.invoke(main, ["--db", str(db_path), "search", "--machine", "hottop"]
+                         ).output.strip() == "no matches"
+
+    declared = runner.invoke(main, ["--db", str(db_path), "profile", "set", "--machine", "hottop"])
+    assert declared.exit_code == 0, declared.output
+
+    found = runner.invoke(main, ["--db", str(db_path), "search", "--machine", "hottop", "--json"])
+    assert found.exit_code == 0, found.output
+    rows = json.loads(found.output)
+    assert len(rows) == 1, rows
+    assert rows[0]["machine_key"] == "unknown"  # matched via its owner, not its own key
+
+    # A machine nobody declared and no roast carries must still match nothing.
+    other = runner.invoke(main, ["--db", str(db_path), "search", "--machine", "giesen_w6a", "--json"])
+    assert json.loads(other.output) == []

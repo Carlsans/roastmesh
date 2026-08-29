@@ -17,7 +17,10 @@ from roastmesh.identity import load_or_create_identity
 from roastmesh.index import repository as repo
 from roastmesh.index.db import connect, get_meta, set_meta
 from roastmesh.index.ingest import ingest_feed, ingest_file, ingest_path, refresh_known_sources
+from roastmesh.machines import list_machines, slugify
 from roastmesh.peers import Peer, default_peers_path, load_peers, node_id_from_ticket, prune_stale, save_peers, upsert_peer
+from roastmesh.profile import load_or_default_profile, update_and_sign
+from roastmesh.usernames import default_display_name
 from roastmesh.watch_folder import default_watch_dir
 from roastmesh import asyncio_policy
 
@@ -142,8 +145,9 @@ def _filter_lan_only(rows: list, peers_file: Path) -> list:
     `added_via` is "lan" (peer discovered by LAN broadcast, not the
     internet-wide DHT, a manual paste, or gossip); drop everything else.
     Provenance for a p2p row lives in peers.json, not the SQLite index --
-    source_ref for those rows is "<pubkey_hex>:<seq>" (see
-    ingest.ingest_feed), so the pubkey is its part before the colon.
+    matched against `sources.author_pubkey` (row.author_pubkey), populated
+    at ingest time from the same "<pubkey_hex>:<seq>" convention this used
+    to split by hand (see ingest.ingest_file/ingest_feed).
     A peer no longer in peers.json (e.g. pruned since) is treated as
     unknown provenance and dropped too -- can't confirm "lan" for it."""
     added_via_by_pubkey = {p.feed_pubkey_hex: p.added_via for p in load_peers(peers_file)}
@@ -152,15 +156,18 @@ def _filter_lan_only(rows: list, peers_file: Path) -> list:
         if row.source_type != "p2p":
             kept.append(row)
             continue
-        pubkey = row.source_ref.split(":", 1)[0]
-        if added_via_by_pubkey.get(pubkey) == "lan":
+        if added_via_by_pubkey.get(row.author_pubkey) == "lan":
             kept.append(row)
     return kept
 
 
 @main.command()
 @click.argument("text", required=False)
-@click.option("--machine", "machine_key", help="Filter by machine_key, e.g. kaleido_m2.")
+@click.option("--machine", "machine_key",
+              help="Filter by machine_key, e.g. kaleido_m2. Also matches a roast whose own "
+                   "machine is unknown but whose owner has declared that machine in their "
+                   "profile (see `roastmesh profile set --machine`) -- this only ever widens "
+                   "results, never narrows an existing --machine match.")
 @click.option("--roast-type", help="Filter by roast_type, e.g. 'full city'.")
 @click.option("--dtr-min", type=float, help="Minimum development time ratio (%).")
 @click.option("--dtr-max", type=float, help="Maximum development time ratio (%).")
@@ -180,6 +187,11 @@ def _filter_lan_only(rows: list, peers_file: Path) -> list:
               help="Only show your own roasts -- hide everything synced from any peer.")
 @click.option("--show-hidden", is_flag=True,
               help="Also include roasts you've hidden (see `roastmesh hide`).")
+@click.option("--user", "user_id", default=None,
+              help="Only show roasts from one user (pubkey prefix, resolved like a roast id -- "
+                   "see `roastmesh user show`).")
+@click.option("--favorites-only", is_flag=True,
+              help="Only show roasts from users you've favorited (see `roastmesh user favorite`).")
 @click.option("--json", "as_json", is_flag=True, help="Output matches as a JSON array instead of text.")
 @click.pass_context
 def search(
@@ -195,14 +207,18 @@ def search(
     peers_file: Path | None,
     own_only: bool,
     show_hidden: bool,
+    user_id: str | None,
+    favorites_only: bool,
     as_json: bool,
 ) -> None:
     """Search the local index. TEXT is matched against beans/notes/roast type."""
     conn = connect(ctx.obj["db_path"])
+    user_pubkey = _resolve_user_id(conn, user_id) if user_id else None
     rows = repo.search_roasts(
         conn, text=text, machine_key=machine_key, roast_type=roast_type,
         dtr_min=dtr_min, dtr_max=dtr_max, drop_bt_min=drop_bt_min,
         after_second_crack=after_second_crack, own_only=own_only, include_hidden=show_hidden,
+        user_pubkey=user_pubkey, favorites_only=favorites_only,
     )
     if own_only:
         lan_only = False  # own roasts are never peer-sourced -- nothing left for it to filter
@@ -237,6 +253,18 @@ def _resolve_roast_id(conn, roast_id_prefix: str) -> str:
         raise click.ClickException(f"no roast found matching {roast_id_prefix!r}")
     if len(matches) > 1:
         raise click.ClickException(f"{roast_id_prefix!r} matches {len(matches)} roasts -- use more characters")
+    return matches[0]
+
+
+def _resolve_user_id(conn, pubkey_prefix: str) -> str:
+    """Same shape as _resolve_roast_id, for a user's pubkey prefix -- used
+    by `search --user`, `user show`, `user favorite`/`unfavorite`, and
+    `user like`/`unlike`."""
+    matches = repo.find_user_pubkeys_by_prefix(conn, pubkey_prefix)
+    if not matches:
+        raise click.ClickException(f"no user found matching {pubkey_prefix!r}")
+    if len(matches) > 1:
+        raise click.ClickException(f"{pubkey_prefix!r} matches {len(matches)} users -- use more characters")
     return matches[0]
 
 
@@ -591,6 +619,12 @@ def _sync_and_ingest(ctx: click.Context, ticket: str, added_via: str) -> None:
     conn = connect(ctx.obj["db_path"])
     results = ingest_feed(conn, mirror_dir, expected_pubkey_hex=report.peer_pubkey_hex)
     _report_ingest_results(results)
+    if report.profile is not None:
+        # Persisted regardless of whether ingest_feed found anything new --
+        # a peer who has already published everything they ever will still
+        # deserves a name (see net.py's _auto_sync_discovered_peer, which
+        # follows the same rule for LAN/WAN auto-sync).
+        net.persist_peer_profile(conn, report.profile)
 
 
 @peer.command("sync")
@@ -622,6 +656,244 @@ def peer_bootstrap(ctx: click.Context) -> None:
         return
     for ticket in BOOTSTRAP_TICKETS:
         _sync_and_ingest(ctx, ticket, added_via="bootstrap")
+
+
+@main.group()
+def profile() -> None:
+    """Manage your own signed profile: display name, declared machine, likes."""
+
+
+@profile.command("show")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON instead of text.")
+def profile_show(as_json: bool) -> None:
+    """Show your own profile -- a fresh (unsaved) default one, seeded from
+    your identity, if you've never set anything yet."""
+    ident, created = load_or_create_identity()
+    _remind_backup_if_new(ident, created)
+    prof = load_or_default_profile(ident)
+    if as_json:
+        click.echo(json.dumps(prof.to_dict()))
+        return
+    click.echo(f"name: {prof.name}")
+    click.echo(f"pubkey: {prof.pubkey}")
+    click.echo(f"machine: {prof.machine_display or prof.machine_key or '(not set)'}")
+    click.echo(f"likes: {len(prof.likes)}")
+
+
+@profile.command("set")
+@click.option("--name", "name", default=None,
+              help="Display name shown to peers -- cosmetic only, never trusted for uniqueness.")
+@click.option("--machine", "machine_key", default=None,
+              help="Machine catalogue key, e.g. aillio_bullet_r1 (see `roastmesh machines list`).")
+@click.option("--machine-custom", "machine_custom", default=None,
+              help="Free-text machine name if yours isn't in the catalogue (e.g. a home-built rig).")
+@click.pass_context
+def profile_set(ctx: click.Context, name: str | None, machine_key: str | None,
+                machine_custom: str | None) -> None:
+    """Update your own display name and/or declared machine, then re-sign
+    profile.json. Any field left unset keeps its previous value."""
+    if machine_key and machine_custom:
+        raise click.ClickException("--machine and --machine-custom are mutually exclusive")
+
+    ident, created = load_or_create_identity()
+    _remind_backup_if_new(ident, created)
+
+    kwargs: dict = {}
+    if name is not None:
+        kwargs["name"] = name
+    if machine_custom is not None:
+        kwargs["machine_key"] = slugify(machine_custom)
+        kwargs["machine_display"] = machine_custom
+    elif machine_key is not None:
+        match = next((m for m in list_machines() if m.key == machine_key), None)
+        if match is None:
+            raise click.ClickException(
+                f"unknown machine key {machine_key!r} -- see `roastmesh machines list`, "
+                "or use --machine-custom for a machine not in the catalogue"
+            )
+        kwargs["machine_key"] = match.key
+        kwargs["machine_display"] = match.display_name
+
+    updated = update_and_sign(ident, **kwargs)
+
+    # Mirror your own profile into the index's `users` table. Without this the
+    # owner-machine fallback in `search --machine` is dead on arrival for your
+    # own roasts: that filter is a LEFT JOIN from sources.author_pubkey onto
+    # users, so a machine you declared but that the index has never heard of
+    # matches nothing. profile.json alone is not enough -- it is not a table
+    # SQL can join against. Caught end to end (declare a machine, search for
+    # it, get "no matches"), not by either phase's unit tests, which each
+    # exercised one side of the join.
+    conn = connect(ctx.obj["db_path"])
+    try:
+        repo.upsert_user_from_profile(
+            conn,
+            pubkey_hex=updated.pubkey,
+            display_name=updated.name,
+            machine_key=updated.machine_key,
+            machine_display=updated.machine_display,
+            profile_updated_at=updated.updated_at,
+        )
+        repo.claim_orphan_local_sources(conn, updated.pubkey)
+    finally:
+        conn.close()
+
+    machine_note = f" ({updated.machine_display})" if updated.machine_display else ""
+    click.echo(f"profile updated: {updated.name}{machine_note}")
+
+
+@main.group()
+def user() -> None:
+    """Browse the users behind the pubkeys in your index: names, machines,
+    favorites, and likes."""
+
+
+@user.command("list")
+@click.option("--machine", "machine_key", default=None, help="Only users who declared this machine_key.")
+@click.option("--favorites", is_flag=True, help="Only users you've favorited.")
+@click.option("--with-roasts/--all", "with_roasts", default=True, show_default=True,
+              help="--with-roasts (the default) shows only users who have actually published a "
+                   "roast into your index. --all also lists every other known peer, even one "
+                   "that has never published anything.")
+@click.option("--json", "as_json", is_flag=True, help="Output users as a JSON array instead of text.")
+@click.pass_context
+def user_list(ctx: click.Context, machine_key: str | None, favorites: bool, with_roasts: bool, as_json: bool) -> None:
+    """List known users."""
+    conn = connect(ctx.obj["db_path"])
+    rows = repo.list_users(conn, machine_key=machine_key, favorites_only=favorites, with_roasts_only=with_roasts)
+    for row in rows:
+        if not row.display_name:
+            # Every user renders with a name -- even one whose profile has
+            # never synced -- via the same deterministic fallback the GUI
+            # and profile.py itself use (see usernames.py).
+            row.display_name = default_display_name(row.pubkey_hex)
+    if as_json:
+        click.echo(json.dumps([asdict(row) for row in rows]))
+        return
+    if not rows:
+        click.echo("no users")
+        return
+    for row in rows:
+        machine = row.machine_display or row.machine_key or "?"
+        fav = " *favorite" if row.is_favorite else ""
+        click.echo(f"{row.pubkey_hex[:8]}  {row.display_name:<20} {machine:<24} "
+                   f"roasts={row.roast_count} likes={row.like_count}{fav}")
+
+
+@user.command("show")
+@click.argument("id_prefix")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON instead of text.")
+@click.pass_context
+def user_show(ctx: click.Context, id_prefix: str, as_json: bool) -> None:
+    """Show one user's detail. ID_PREFIX may be a prefix of their pubkey."""
+    conn = connect(ctx.obj["db_path"])
+    pubkey = _resolve_user_id(conn, id_prefix)
+    row = next((r for r in repo.list_users(conn, with_roasts_only=False) if r.pubkey_hex == pubkey), None)
+    if row is None:
+        raise click.ClickException(f"no user found matching {id_prefix!r}")
+    if not row.display_name:
+        row.display_name = default_display_name(row.pubkey_hex)
+    if as_json:
+        click.echo(json.dumps(asdict(row)))
+        return
+    click.echo(f"name: {row.display_name}")
+    click.echo(f"pubkey: {row.pubkey_hex}")
+    click.echo(f"machine: {row.machine_display or row.machine_key or '(unknown)'}")
+    click.echo(f"roasts: {row.roast_count}")
+    click.echo(f"likes: {row.like_count}")
+    click.echo(f"favorite: {'yes' if row.is_favorite else 'no'}")
+    click.echo(f"last seen: {row.last_seen or '?'}")
+
+
+@user.command("favorite")
+@click.argument("id_prefix")
+@click.pass_context
+def user_favorite(ctx: click.Context, id_prefix: str) -> None:
+    """Favorite a user -- local only, never seen by peers (see schema.sql's
+    users.is_favorite)."""
+    conn = connect(ctx.obj["db_path"])
+    pubkey = _resolve_user_id(conn, id_prefix)
+    repo.ensure_user(conn, pubkey)
+    repo.set_user_favorite(conn, pubkey, True)
+    click.echo(f"favorited {pubkey[:8]}...")
+
+
+@user.command("unfavorite")
+@click.argument("id_prefix")
+@click.pass_context
+def user_unfavorite(ctx: click.Context, id_prefix: str) -> None:
+    """Un-favorite a previously favorited user."""
+    conn = connect(ctx.obj["db_path"])
+    pubkey = _resolve_user_id(conn, id_prefix)
+    repo.set_user_favorite(conn, pubkey, False)
+    click.echo(f"unfavorited {pubkey[:8]}...")
+
+
+@user.command("like")
+@click.argument("id_prefix")
+@click.pass_context
+def user_like(ctx: click.Context, id_prefix: str) -> None:
+    """Like a user -- public and attributable: recorded in your own signed
+    profile.json, so any peer who syncs with you can see who you liked."""
+    conn = connect(ctx.obj["db_path"])
+    pubkey = _resolve_user_id(conn, id_prefix)
+    ident, created = load_or_create_identity()
+    _remind_backup_if_new(ident, created)
+    current = load_or_default_profile(ident)
+    likes = list(current.likes)
+    if pubkey not in likes:
+        likes.append(pubkey)
+    update_and_sign(ident, likes=likes)
+    repo.ensure_user(conn, pubkey)
+    repo.add_user_like(conn, ident.public_key_hex, pubkey)
+    click.echo(f"liked {pubkey[:8]}...")
+
+
+@user.command("unlike")
+@click.argument("id_prefix")
+@click.pass_context
+def user_unlike(ctx: click.Context, id_prefix: str) -> None:
+    """Undo a previous like."""
+    conn = connect(ctx.obj["db_path"])
+    pubkey = _resolve_user_id(conn, id_prefix)
+    ident, created = load_or_create_identity()
+    _remind_backup_if_new(ident, created)
+    current = load_or_default_profile(ident)
+    likes = [p for p in current.likes if p != pubkey]
+    update_and_sign(ident, likes=likes)
+    repo.remove_user_like(conn, ident.public_key_hex, pubkey)
+    click.echo(f"unliked {pubkey[:8]}...")
+
+
+@main.group()
+def machines() -> None:
+    """The roaster machine catalogue -- a search facet and the profile's machine picker."""
+
+
+@machines.command("list")
+@click.option("--used", is_flag=True,
+              help="List only the machine_keys actually present in your index (for an "
+                   "autocomplete), instead of the full catalogue.")
+@click.option("--json", "as_json", is_flag=True, help="Output as a JSON array instead of text.")
+@click.pass_context
+def machines_list(ctx: click.Context, used: bool, as_json: bool) -> None:
+    """List the machine catalogue, or (--used) the machine_keys already in your index."""
+    if used:
+        conn = connect(ctx.obj["db_path"])
+        keys = repo.find_distinct_machine_keys(conn)
+        if as_json:
+            click.echo(json.dumps(keys))
+            return
+        for key in keys:
+            click.echo(key)
+        return
+
+    catalogue = list_machines()
+    if as_json:
+        click.echo(json.dumps([asdict(m) for m in catalogue]))
+        return
+    for m in catalogue:
+        click.echo(f"{m.key:<28} {m.display_name} ({m.manufacturer})")
 
 
 @main.group()

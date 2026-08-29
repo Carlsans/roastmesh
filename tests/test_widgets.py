@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("tkinter")
 
 from roastmesh.gui import widgets
-from roastmesh.gui.widgets import ResultsTable
+from roastmesh.gui.widgets import AutocompleteField, ResultsTable
 
 
 class _FakeScreen:
@@ -96,6 +96,21 @@ def test_sort_key_text_values_sort_case_insensitively() -> None:
 def test_sort_key_mixed_numeric_and_text_groups_numbers_first() -> None:
     values = ["hottop", "9", "kaleido", "2"]
     assert sorted(values, key=ResultsTable._sort_key) == ["2", "9", "hottop", "kaleido"]
+
+
+def test_autocomplete_field_filter_values_is_case_insensitive_substring_match() -> None:
+    values = ["kaleido_serial", "hottop", "aillio_bullet", "Kaleido_M2"]
+    assert AutocompleteField._filter_values(values, "kal") == ["kaleido_serial", "Kaleido_M2"]
+    assert AutocompleteField._filter_values(values, "TOP") == ["hottop"]
+
+
+def test_autocomplete_field_filter_values_with_empty_typed_text_returns_everything() -> None:
+    values = ["a", "b", "c"]
+    assert AutocompleteField._filter_values(values, "") == values
+
+
+def test_autocomplete_field_filter_values_with_no_match_returns_empty_list() -> None:
+    assert AutocompleteField._filter_values(["hottop", "kaleido"], "zzz") == []
 
 
 def _has_display() -> bool:

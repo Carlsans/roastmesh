@@ -353,6 +353,187 @@ print("OK")
     assert "--own-only" in [line for line in r.stdout.splitlines() if line.startswith("CHECKED_ARGS")][0]
 
 
+def test_search_tab_favorites_only_checkbox_is_unchecked_by_default_and_toggles_the_flag(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.update()
+tab = app.tabs[0]
+print("DEFAULT_CHECKED", tab.favorites_only.get())
+print("DEFAULT_ARGS", tab._build_args())
+tab.favorites_only.set(True)
+print("CHECKED_ARGS", tab._build_args())
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "DEFAULT_CHECKED False" in r.stdout, r.stdout
+    assert "--favorites-only" not in [line for line in r.stdout.splitlines() if line.startswith("DEFAULT_ARGS")][0]
+    assert "--favorites-only" in [line for line in r.stdout.splitlines() if line.startswith("CHECKED_ARGS")][0]
+
+
+def test_search_tab_mode_selector_changes_build_args(tmp_path: Path) -> None:
+    """Default mode is "all users" (existing tests above rely on this).
+    Switching to "one user" and selecting a pubkey swaps --machine/
+    --favorites-only (the all-users filters) for --user."""
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.update()
+tab = app.tabs[0]
+print("MODE_ALL", tab.MODE_ALL)
+print("MODE_ONE", tab.MODE_ONE)
+print("DEFAULT_MODE", tab.mode.get())
+tab.machine.set("kaleido_serial")
+tab.favorites_only.set(True)
+print("ALL_ARGS", tab._build_args())
+tab.mode.set(tab.MODE_ONE)
+tab.selected_user_pubkey = "deadbeef" * 8
+print("ONE_ARGS", tab._build_args())
+tab.selected_user_pubkey = None
+print("ONE_ARGS_NO_SELECTION", tab._build_args())
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    lines = {line.split(" ", 1)[0]: line.split(" ", 1)[1] for line in r.stdout.splitlines() if " " in line}
+    assert lines["DEFAULT_MODE"] == lines["MODE_ALL"]
+    assert "'--machine', 'kaleido_serial'" in lines["ALL_ARGS"]
+    assert "--favorites-only" in lines["ALL_ARGS"]
+    # In "one user" mode the all-users filters (machine/favorites-only) are
+    # replaced by --user -- they must not leak through.
+    assert "'--user', 'deadbeef" in lines["ONE_ARGS"]
+    assert "--machine" not in lines["ONE_ARGS"]
+    assert "--favorites-only" not in lines["ONE_ARGS"]
+    # With no user selected yet, --user must not appear (there's nothing to
+    # search for -- _on_run guards this case separately).
+    assert "--user" not in lines["ONE_ARGS_NO_SELECTION"]
+
+
+def test_search_tab_selecting_a_user_emits_user_flag_and_lists_their_roast(tmp_path: Path) -> None:
+    """Real end-to-end drive of "one user" mode: ingest a roast under a real
+    identity, list users, select the row, and confirm both _build_args()
+    and the actual search results reflect that one user."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    fixture = FIXTURES_DIR / "kaleido_1.alog"
+    env = {**os.environ, "HOME": str(home)}
+    subprocess.run(
+        [sys.executable, "-m", "roastmesh.cli", "--db", str(db_path), "ingest", str(fixture), "--user-log"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "roastmesh.cli", "--db", str(db_path), "profile", "set", "--name", "Test Roaster"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    show = subprocess.run(
+        [sys.executable, "-m", "roastmesh.cli", "--db", str(db_path), "profile", "show", "--json"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    pubkey = json.loads(show.stdout)["pubkey"]
+
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[0]
+tab.mode.set(tab.MODE_ONE)
+tab._on_mode_changed()
+for _ in range(150):
+    app.update()
+    if tab.user_table.tree.get_children():
+        break
+    time.sleep(0.02)
+print("USER_ROWS", len(tab.user_table.tree.get_children()))
+
+tab.user_table.tree.selection_set({pubkey!r})
+for _ in range(150):
+    app.update()
+    if tab.selected_user_pubkey == {pubkey!r}:
+        break
+    time.sleep(0.02)
+print("SELECTED", tab.selected_user_pubkey)
+print("BUILD_ARGS", tab._build_args())
+
+for _ in range(200):
+    app.update()
+    if tab.task is not None and not tab.task.running and tab.table.count_var.get() not in ("", "running..."):
+        break
+    time.sleep(0.02)
+print("RESULT_ROWS", len(tab.table.tree.get_children()))
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "USER_ROWS 1" in r.stdout, r.stdout
+    assert f"SELECTED {pubkey}" in r.stdout, r.stdout
+    build_args_line = [line for line in r.stdout.splitlines() if line.startswith("BUILD_ARGS")][0]
+    assert "'--user'" in build_args_line and pubkey in build_args_line
+    assert "RESULT_ROWS 1" in r.stdout, r.stdout
+
+
+def test_settings_tab_name_and_machine_round_trip_through_profile(tmp_path: Path) -> None:
+    """Settings' "You" fields save on focus-out/Return (via `profile set`),
+    never through the per-keystroke trace_add auto-save the other Settings
+    fields use -- and the value shown is seeded from `profile show`."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    env = {**os.environ, "HOME": str(home)}
+
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[3]
+for _ in range(150):
+    app.update()
+    time.sleep(0.02)
+print("LOADED_NAME", repr(tab.app.display_name.get()))
+tab.app.display_name.set("Amber Chaff")
+tab.app.own_machine.set("Some Custom Rig")
+tab._on_profile_field_changed()
+for _ in range(100):
+    app.update()
+    if tab.you_status.get():
+        break
+    time.sleep(0.02)
+print("STATUS", tab.you_status.get())
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    # A default (deterministic) name was already there before we typed
+    # anything -- confirms the field is seeded from `profile show`, not left
+    # blank.
+    loaded_line = [line for line in r.stdout.splitlines() if line.startswith("LOADED_NAME")][0]
+    assert loaded_line != "LOADED_NAME ''"
+    assert "STATUS Saved." in r.stdout, r.stdout
+
+    show = subprocess.run(
+        [sys.executable, "-m", "roastmesh.cli", "--db", str(db_path), "profile", "show", "--json"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    profile = json.loads(show.stdout)
+    assert profile["name"] == "Amber Chaff"
+    assert profile["machine_display"] == "Some Custom Rig"
+
+
 def test_publish_tab_publishes_a_real_entry(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

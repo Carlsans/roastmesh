@@ -67,14 +67,48 @@ def insert_source(
     source_url: str | None,
     raw_path: str,
     content_sha256: str,
+    author_pubkey: str | None = None,
 ) -> None:
     conn.execute(
         """INSERT INTO sources (source_id, source_type, source_ref, source_url,
-                                 fetched_at, raw_path, content_sha256)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                 fetched_at, raw_path, content_sha256, author_pubkey)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (source_id, source_type, source_ref, source_url,
-         datetime.now(timezone.utc).isoformat(), raw_path, content_sha256),
+         datetime.now(timezone.utc).isoformat(), raw_path, content_sha256, author_pubkey),
     )
+
+
+def set_source_author_pubkey(conn: sqlite3.Connection, source_id: str, author_pubkey: str | None) -> None:
+    """Used by ingest.ingest_file's dedup/refresh path: a source row that
+    already existed before author_pubkey was introduced (or whose author
+    simply needs recomputing) gets it filled in on the next time that same
+    content happens to be (re-)ingested -- the same self-healing pattern
+    already used for `roasts`' derived fields (see insert_roast)."""
+    conn.execute("UPDATE sources SET author_pubkey = ? WHERE source_id = ?", (author_pubkey, source_id))
+
+
+def claim_orphan_local_sources(conn: sqlite3.Connection, author_pubkey: str) -> int:
+    """Attribute local sources that have no author yet to `author_pubkey`,
+    returning how many rows were claimed.
+
+    A local source is one ingested from this machine's own filesystem, so it
+    is yours by construction. It ends up with a NULL author when it was
+    ingested *before* an identity existed -- entirely normal, since `ingest`
+    deliberately never creates a key as a side effect, and pointing the tool
+    at a folder of .alog files is a plausible very first thing to do. Without
+    this, those roasts stay unattributable until the next version-gated
+    refresh, so they are invisible to `search --user` and to the
+    owner-machine fallback.
+
+    p2p rows are never touched: their author is whoever signed the feed.
+    """
+    cursor = conn.execute(
+        "UPDATE sources SET author_pubkey = ? "
+        "WHERE author_pubkey IS NULL AND source_type = 'local'",
+        (author_pubkey,),
+    )
+    conn.commit()
+    return cursor.rowcount
 
 
 def insert_roast(conn: sqlite3.Connection, record: RoastRecord, source_id: str) -> None:
@@ -164,6 +198,7 @@ class RoastSearchRow:
     raw_path: str
     is_user_log: bool
     hidden: bool
+    author_pubkey: str | None
 
 
 def _fts_query(text: str) -> str:
@@ -186,17 +221,25 @@ def search_roasts(
     after_second_crack: bool | None = None,
     own_only: bool = False,
     include_hidden: bool = False,
+    user_pubkey: str | None = None,
+    favorites_only: bool = False,
 ) -> list[RoastSearchRow]:
     sql = """
         SELECT r.roast_id, r.machine_key, r.mechanism_family, r.roast_type,
                r.batch_weight_in_g, r.density_g_per_l, r.title, r.beans_text, r.roast_date,
-               r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, p.dtr_pct, p.total_time_s,
+               r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, s.author_pubkey,
+               p.dtr_pct, p.total_time_s,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'DROP') AS drop_bt_c,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'SC_START') AS sc_start_bt_c
         FROM roasts r
         JOIN sources s ON s.source_id = r.source_id
         LEFT JOIN phase_profiles p ON p.roast_id = r.roast_id
+        LEFT JOIN users u ON u.pubkey_hex = s.author_pubkey
     """
+    # ^ Must be joined here, ahead of the `if text:` block below -- that one
+    # string-concatenates the FTS join onto `sql` right before `WHERE` gets
+    # appended, so any join added after this point would land after WHERE
+    # and produce malformed SQL.
     conditions: list[str] = []
     params: list = []
 
@@ -205,8 +248,23 @@ def search_roasts(
         conditions.append("roasts_fts MATCH ?")
         params.append(_fts_query(text))
     if machine_key:
-        conditions.append("r.machine_key = ?")
+        # Widens, never narrows, an existing --machine call: a roast whose
+        # own .alog recorded no machine (machine_key == "unknown") is still
+        # found by matching its owner's declared machine instead -- chosen
+        # over requiring both to differ, since "unknown" AND a real owner
+        # machine_key is the only case with no signal to lose.
+        conditions.append("(r.machine_key = ? OR (r.machine_key = 'unknown' AND u.machine_key = ?))")
         params.append(machine_key)
+        params.append(machine_key)
+    if user_pubkey:
+        # s.author_pubkey (not u.pubkey_hex) is the source of truth for who
+        # published a roast -- a `users` row might not exist yet for a
+        # never-synced author, and that must not silently hide their roasts
+        # from a direct --user lookup by their own pubkey.
+        conditions.append("s.author_pubkey = ?")
+        params.append(user_pubkey)
+    if favorites_only:
+        conditions.append("u.is_favorite = 1")
     if roast_type:
         conditions.append("r.roast_type = ?")
         params.append(roast_type)
@@ -249,6 +307,7 @@ def search_roasts(
             raw_path=row["raw_path"],
             is_user_log=bool(row["is_user_log"]),
             hidden=bool(row["hidden"]),
+            author_pubkey=row["author_pubkey"],
         )
         for row in cur.fetchall()
         # after_second_crack can't be expressed as a plain SQL predicate
@@ -284,3 +343,221 @@ def find_raw_path(conn: sqlite3.Connection, roast_id: str) -> str | None:
     )
     row = cur.fetchone()
     return row["raw_path"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Users, favorites, likes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UserRow:
+    pubkey_hex: str
+    display_name: str | None
+    machine_key: str | None
+    machine_display: str | None
+    profile_updated_at: str | None
+    is_favorite: bool
+    first_seen: str | None
+    last_seen: str | None
+    roast_count: int
+    like_count: int
+
+
+def upsert_user_from_profile(
+    conn: sqlite3.Connection,
+    *,
+    pubkey_hex: str,
+    display_name: str | None,
+    machine_key: str | None,
+    machine_display: str | None,
+    profile_updated_at: str | None,
+    seen_at: str | None = None,
+) -> None:
+    """Insert or refresh a peer's row from a *signature-verified* profile --
+    the caller (profile.verify_profile) is trusted to have already checked
+    that before this is called; this function itself does no verification.
+
+    `is_favorite` is deliberately never set here: it's local-only (see
+    schema.sql's comment on users.is_favorite) and never arrives from a
+    peer. `first_seen` is likewise left alone on a conflict -- only a brand
+    new row gets it -- while `last_seen` always advances.
+    """
+    seen_at = seen_at or datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO users (pubkey_hex, display_name, machine_key, machine_display,
+                               profile_updated_at, is_favorite, first_seen, last_seen)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(pubkey_hex) DO UPDATE SET
+               display_name = excluded.display_name,
+               machine_key = excluded.machine_key,
+               machine_display = excluded.machine_display,
+               profile_updated_at = excluded.profile_updated_at,
+               last_seen = excluded.last_seen""",
+        (pubkey_hex, display_name, machine_key, machine_display, profile_updated_at, seen_at, seen_at),
+    )
+    conn.commit()
+
+
+def find_user(conn: sqlite3.Connection, pubkey_hex: str) -> sqlite3.Row | None:
+    cur = conn.execute("SELECT * FROM users WHERE pubkey_hex = ?", (pubkey_hex,))
+    return cur.fetchone()
+
+
+def find_user_pubkeys_by_prefix(conn: sqlite3.Connection, pubkey_prefix: str) -> list[str]:
+    """Resolve a (possibly truncated, e.g. the 8-character prefix the CLI
+    and GUI display) pubkey back to full pubkey(s) -- same shape as
+    find_ids_by_prefix for roast ids, so the CLI's `user show`/`favorite`/
+    `like` commands can accept a prefix the way roast commands accept a
+    roast_id prefix. Spans the same two sources as list_users(with_roasts_only
+    =False): a `users` row (a synced profile, or one created bare by
+    favoriting/liking) and `sources.author_pubkey` (an ingested roast from
+    someone whose profile has never synced) -- a pubkey known only from one
+    of the two must still resolve."""
+    cur = conn.execute(
+        """
+        SELECT DISTINCT pubkey_hex FROM (
+            SELECT pubkey_hex FROM users
+            UNION
+            SELECT DISTINCT author_pubkey AS pubkey_hex FROM sources WHERE author_pubkey IS NOT NULL
+        )
+        WHERE pubkey_hex LIKE ? || '%'
+        """,
+        (pubkey_prefix,),
+    )
+    return [row["pubkey_hex"] for row in cur.fetchall()]
+
+
+def ensure_user(conn: sqlite3.Connection, pubkey_hex: str) -> None:
+    """Create a bare `users` row for `pubkey_hex` if one doesn't already
+    exist; a no-op (never overwrites) if it does. Needed because
+    set_user_favorite/add_user_like never create a row themselves (a pubkey
+    known only from an ingested roast's sources.author_pubkey has no
+    `users` row yet) -- this is what makes list_users' documented "or
+    created bare by favoriting" actually true. Called by the CLI's
+    `user favorite`/`user like` before the real mutation."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT OR IGNORE INTO users
+               (pubkey_hex, display_name, machine_key, machine_display,
+                profile_updated_at, is_favorite, first_seen, last_seen)
+           VALUES (?, NULL, NULL, NULL, NULL, 0, ?, ?)""",
+        (pubkey_hex, now, now),
+    )
+    conn.commit()
+
+
+def set_user_favorite(conn: sqlite3.Connection, pubkey_hex: str, is_favorite: bool) -> bool:
+    """Favorite/unfavorite a user this index already knows about -- local-
+    only (schema.sql's comment on users.is_favorite: never leaves this
+    machine), same style as roasts.hidden's set_hidden. Unlike
+    upsert_user_from_profile this never creates a row: favoriting only
+    makes sense for a pubkey already known from a synced profile or an
+    ingested roast. Returns whether a row was actually found and updated."""
+    cur = conn.execute(
+        "UPDATE users SET is_favorite = ? WHERE pubkey_hex = ?", (int(is_favorite), pubkey_hex)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def add_user_like(
+    conn: sqlite3.Connection, liker_pubkey: str, subject_pubkey: str, liked_at: str | None = None
+) -> None:
+    """A `user_likes` row is only ever written from the local user's own
+    like action or from a signature-verified profile's `likes` list
+    (profile.py) -- never from an unverified claim (see this table's
+    invariant in the plan). Likes are public and attributable by design, so
+    this is a plain replace-on-conflict rather than a toggle."""
+    liked_at = liked_at or datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO user_likes (liker_pubkey, subject_pubkey, liked_at) VALUES (?, ?, ?)",
+        (liker_pubkey, subject_pubkey, liked_at),
+    )
+    conn.commit()
+
+
+def remove_user_like(conn: sqlite3.Connection, liker_pubkey: str, subject_pubkey: str) -> bool:
+    cur = conn.execute(
+        "DELETE FROM user_likes WHERE liker_pubkey = ? AND subject_pubkey = ?",
+        (liker_pubkey, subject_pubkey),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def list_users(
+    conn: sqlite3.Connection,
+    *,
+    machine_key: str | None = None,
+    favorites_only: bool = False,
+    with_roasts_only: bool = True,
+) -> list[UserRow]:
+    """Every known user, with roast and like counts.
+
+    "Known" spans two sources that don't always overlap: a `users` row
+    (learned from a synced profile, or created bare by favoriting) and a
+    `sources.author_pubkey` (someone whose roast got ingested before their
+    profile ever synced -- expected, since profiles are self-served and not
+    relayed). `with_roasts_only=True` (the user's chosen default -- "Only
+    users with roasts, with a toggle to show all known peers") restricts
+    the candidate set to the second; False unions in the first as well, so
+    a favorited-but-not-yet-publishing peer still shows up.
+    """
+    if with_roasts_only:
+        candidates_sql = "SELECT DISTINCT author_pubkey AS pubkey_hex FROM sources WHERE author_pubkey IS NOT NULL"
+    else:
+        candidates_sql = """
+            SELECT pubkey_hex FROM users
+            UNION
+            SELECT DISTINCT author_pubkey AS pubkey_hex FROM sources WHERE author_pubkey IS NOT NULL
+        """
+
+    sql = f"""
+        SELECT c.pubkey_hex, u.display_name, u.machine_key, u.machine_display,
+               u.profile_updated_at, COALESCE(u.is_favorite, 0) AS is_favorite,
+               u.first_seen, u.last_seen,
+               COUNT(DISTINCT r.roast_id) AS roast_count,
+               COUNT(DISTINCT l.liker_pubkey) AS like_count
+        FROM ({candidates_sql}) c
+        LEFT JOIN users u ON u.pubkey_hex = c.pubkey_hex
+        LEFT JOIN sources s ON s.author_pubkey = c.pubkey_hex
+        LEFT JOIN roasts r ON r.source_id = s.source_id AND r.hidden = 0
+        LEFT JOIN user_likes l ON l.subject_pubkey = c.pubkey_hex
+    """
+    conditions: list[str] = []
+    params: list = []
+    if machine_key:
+        conditions.append("u.machine_key = ?")
+        params.append(machine_key)
+    if favorites_only:
+        conditions.append("COALESCE(u.is_favorite, 0) = 1")
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " GROUP BY c.pubkey_hex"
+
+    cur = conn.execute(sql, params)
+    return [
+        UserRow(
+            pubkey_hex=row["pubkey_hex"],
+            display_name=row["display_name"],
+            machine_key=row["machine_key"],
+            machine_display=row["machine_display"],
+            profile_updated_at=row["profile_updated_at"],
+            is_favorite=bool(row["is_favorite"]),
+            first_seen=row["first_seen"],
+            last_seen=row["last_seen"],
+            roast_count=row["roast_count"],
+            like_count=row["like_count"],
+        )
+        for row in cur.fetchall()
+    ]
+
+
+def find_distinct_machine_keys(conn: sqlite3.Connection) -> list[str]:
+    """Every machine_key currently present among ingested roasts, sorted,
+    for a search/settings autocomplete -- there is no DISTINCT query
+    anywhere else in this codebase today."""
+    cur = conn.execute(
+        "SELECT DISTINCT machine_key FROM roasts WHERE machine_key IS NOT NULL ORDER BY machine_key"
+    )
+    return [row["machine_key"] for row in cur.fetchall()]

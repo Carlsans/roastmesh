@@ -245,6 +245,78 @@ class Choice(ttk.Frame):
         return self.var.get().strip()
 
 
+class AutocompleteField(ttk.Frame):
+    """A labelled, editable dropdown that narrows its own list as you type,
+    same label/help-text contract as Field.
+
+    Choice (above) can't serve this need: it is `state="readonly"` (blocks
+    typing a value that isn't already in the list -- e.g. a machine not in
+    the catalogue), takes no external `variable=` (so Settings and Search
+    can't share one value the way Field's `variable=` lets a setting be
+    read from more than one place), has no `.set()`, and never keeps a
+    reference to its own Combobox, so `values` can never be refreshed once
+    a background `machines list` (or `machines list --used`) command
+    returns. This class keeps `self.combo` for exactly that, and stays
+    editable (never readonly) since a caller (Settings' machine field) must
+    accept a value that isn't in the catalogue at all.
+    """
+
+    def __init__(self, parent: tk.Widget, label: str, values: list[str] | None = None,
+                 default: str = "", help_text: str = "", width: int = 26,
+                 variable: tk.StringVar | None = None) -> None:
+        super().__init__(parent)
+        self.pack(fill="x", padx=10, pady=(6, 2))
+        row = ttk.Frame(self)
+        row.pack(fill="x")
+        tk.Label(row, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=22,
+                 anchor="w").pack(side="left")
+        self._all_values: list[str] = list(values or [])
+        if variable is not None:
+            self.var = variable
+            if default and not self.var.get():
+                self.var.set(default)
+        else:
+            self.var = tk.StringVar(value=default)
+        self.combo = ttk.Combobox(row, textvariable=self.var, values=self._all_values, width=width)
+        self.combo.pack(side="left", fill="x", expand=True)
+        # Editable (unlike Choice's readonly state), plus live filtering:
+        # typing narrows the dropdown to values containing what's typed
+        # anywhere in the string, not just as a prefix -- and never blocks
+        # a value that isn't in the list at all (e.g. a custom machine).
+        self.combo.bind("<KeyRelease>", self._on_key_release)
+        if help_text:
+            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=MUTED,
+                     bg=BG, wraplength=sp(840), justify="left", anchor="w").pack(
+                fill="x", padx=(sp(224), 0), pady=(1, 0))
+
+    def set_values(self, values: list[str]) -> None:
+        self._all_values = list(values)
+        self.combo.configure(values=self._all_values)
+
+    def _on_key_release(self, event: tk.Event) -> None:
+        # Navigation/editing keys must not re-filter -- e.g. pressing Down
+        # to browse the (already-filtered) dropdown shouldn't immediately
+        # recompute it from whatever partial text happens to be typed.
+        if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Tab", "Escape"):
+            return
+        self.combo.configure(values=self._filter_values(self._all_values, self.var.get()))
+
+    @staticmethod
+    def _filter_values(values: list[str], typed: str) -> list[str]:
+        """Pure filter logic, kept separate from _on_key_release so it can
+        be unit-tested without a live display (see tests/test_widgets.py)."""
+        if not typed:
+            return list(values)
+        typed_lower = typed.lower()
+        return [v for v in values if typed_lower in v.lower()]
+
+    def get(self) -> str:
+        return self.var.get().strip()
+
+    def set(self, value: str) -> None:
+        self.var.set(value)
+
+
 class Console(ttk.Frame):
     """Scrolling output area with the command that produced it shown above.
 
@@ -496,4 +568,60 @@ class PeerTable(ttk.Frame):
         for row in rows:
             self.tree.insert("", "end", values=(
                 row.get("feed_pubkey_hex") or t("?"), row.get("last_seen") or "", row.get("added_via") or "",
+            ))
+
+
+_USER_COLUMNS = [
+    ("display_name", "Name", 160),
+    ("pubkey", "Pubkey", 90),
+    ("machine", "Machine", 140),
+    ("roast_count", "Roasts", 70),
+    ("like_count", "Likes", 60),
+    ("favorite", "Favorite", 60),
+]
+
+
+class UserTable(ttk.Frame):
+    """The user list for SearchTab's "one user" mode: display name, an
+    8-character pubkey prefix (names are cosmetic and never unique --
+    ARCHITECTURE.md -- the prefix is what actually disambiguates), declared
+    machine, roast and like counts, and a favorite marker.
+
+    Rows are keyed by the user's full pubkey_hex as the Treeview iid --
+    ResultsTable's approach, not PeerTable's (above): PeerTable sets no
+    iid, so its rows can never be mapped back to the data that produced
+    them, which is exactly what's needed here to drive Favorite/Like on
+    whichever row is selected.
+    """
+
+    def __init__(self, parent: tk.Widget, height: int = 8) -> None:
+        super().__init__(parent)
+        self.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            wrap, columns=[c[0] for c in _USER_COLUMNS], show="headings", height=height,
+            selectmode="browse",
+        )
+        for key, label, width in _USER_COLUMNS:
+            self.tree.heading(key, text=t(label))
+            self.tree.column(key, width=sp(width), anchor="w")
+        ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ybar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ybar.pack(side="right", fill="y")
+
+    def set_rows(self, rows: list[dict]) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for row in rows:
+            pubkey = row.get("pubkey_hex") or ""
+            machine = row.get("machine_display") or row.get("machine_key") or ""
+            self.tree.insert("", "end", iid=pubkey, values=(
+                row.get("display_name") or t("?"),
+                pubkey[:8],
+                machine,
+                row.get("roast_count", 0),
+                row.get("like_count", 0),
+                "★" if row.get("is_favorite") else "",
             ))

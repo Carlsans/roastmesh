@@ -7,7 +7,7 @@ sync exchange. Storage is a plain JSON list (`peers.json`), same pattern as
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,11 +28,23 @@ def default_peers_path() -> Path:
     return data_dir() / "peers.json"
 
 
+def peer_from_dict(d: dict) -> Peer:
+    """Build a `Peer` from an untrusted dict -- one loaded from disk, or one
+    handed over the wire by a peer during sync (net.sync_with_peer's
+    get_peers gossip). Filters to this version's own known dataclass fields
+    first: a plain `Peer(**d)` raises TypeError the moment a newer peer (or
+    a future version of this file) adds a field this version doesn't know
+    about yet, which would abort a whole peers.json load or an entire sync
+    over one extra, harmless key. Unknown keys are just dropped."""
+    known = {f.name for f in fields(Peer)}
+    return Peer(**{k: v for k, v in d.items() if k in known})
+
+
 def load_peers(path: Path | None = None) -> list[Peer]:
     path = path or default_peers_path()
     if not path.exists():
         return []
-    return [Peer(**d) for d in json.loads(path.read_text(encoding="utf-8"))]
+    return [peer_from_dict(d) for d in json.loads(path.read_text(encoding="utf-8"))]
 
 
 def save_peers(peers: list[Peer], path: Path | None = None) -> None:

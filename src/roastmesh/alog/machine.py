@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import re
 
+from roastmesh.machines import find_by_roastertype
+
 # roastertype substring (case-insensitive) -> (machine_key, mechanism_family, display_name)
 # Seeded from what's actually observed in real corpora; extend as more
 # roastertype strings are seen. First matching substring wins. Kaleido is
@@ -22,6 +24,40 @@ MACHINE_ALIASES: list[tuple[str, str, str, str]] = [
     ("roaster scope", "unknown", "unknown", "Unspecified/generic profile"),
 ]
 
+# Brand substrings already handled above (and by the Kaleido special case
+# below) with their own, more specific machine_key/mechanism_family. Any
+# roastmesh.machines catalogue entry whose own display_name contains one of
+# these must NOT be offered to the catalogue lookup: Artisan's own catalogue
+# happens to contain the literal strings "Kaleido Serial", "Kaleido Network",
+# "Kaleido Legacy" and "Hottop 2K+" (the fixture-observed value for
+# Hottop's KN-8828B-2K+), and a naive catalogue-first exact match on those
+# would rename existing keys out from under already-ingested data --
+# confirmed as a real break: "Hottop 2K+" slugifies to "hottop_2k" in the
+# catalogue but the pinned, already-shipped key is "hottop" (test_record.py).
+# Filtering the catalogue lookup to exclude these keeps every one of this
+# project's existing machine_key outputs byte-identical while still gaining
+# catalogue coverage for the other ~250 machines Artisan knows about that
+# aren't already special-cased here.
+_CATALOGUE_CONFLICT_SUBSTRINGS = ("kaleido", "hottop", "behmor", "bullet", "roaster scope")
+
+
+def _catalogue_lookup(text: str) -> tuple[str, str, str] | None:
+    """Exact (case-insensitive) match against roastmesh.machines' catalogue,
+    skipping any entry whose own text overlaps a brand already handled by
+    the Kaleido special case or MACHINE_ALIASES above (see the comment on
+    _CATALOGUE_CONFLICT_SUBSTRINGS). mechanism_family is "unknown" for a
+    catalogue-only match -- the catalogue has no trustworthy drum/fluidbed
+    data for the other ~250 machines it lists, and inventing it would
+    poison an existing search facet.
+    """
+    machine = find_by_roastertype(text)
+    if machine is None:
+        return None
+    if any(s in machine.display_name.lower() for s in _CATALOGUE_CONFLICT_SUBSTRINGS):
+        return None
+    return machine.key, "unknown", machine.display_name
+
+
 _KALEIDO_MODEL_RE = re.compile(r"\bm(\d+)\b")
 
 
@@ -30,6 +66,10 @@ def normalize_machine_key(roastertype: str | None) -> tuple[str, str, str]:
     text = (roastertype or "").strip().lower()
     if not text:
         return "unknown", "unknown", "Unknown"
+
+    catalogue_hit = _catalogue_lookup(text)
+    if catalogue_hit is not None:
+        return catalogue_hit
 
     if "kaleido" in text:
         model = _KALEIDO_MODEL_RE.search(text)

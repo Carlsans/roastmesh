@@ -43,6 +43,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     ("roasts", "title", "TEXT"),
     ("roasts", "hidden", "INTEGER NOT NULL DEFAULT 0"),
+    ("sources", "author_pubkey", "TEXT"),
 ]
 
 
@@ -57,6 +58,12 @@ def migrate(conn: sqlite3.Connection) -> None:
     schema_sql = resources.files("roastmesh.index").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(schema_sql)
     _apply_added_columns(conn)
+    # Indexes on a column that only exists because of _apply_added_columns
+    # (not one schema.sql's own CREATE TABLE IF NOT EXISTS could have
+    # created for an already-existing table) have to be created here,
+    # after that column is guaranteed to exist on both a fresh and an
+    # upgraded database -- see schema.sql's comment by `sources`.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_author ON sources(author_pubkey)")
     conn.commit()
 
 
