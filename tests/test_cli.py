@@ -724,3 +724,44 @@ def test_doctor_reports_a_failed_read_back_as_a_failure() -> None:
     text = _render(_doctor_report(readback=False))
     assert "read-back: FAILED" in text
     assert "will not find us" in text
+
+
+def test_peer_sync_reports_an_unreachable_peer_instead_of_crashing(tmp_path, monkeypatch) -> None:
+    """An unreachable peer is an ordinary outcome, not a crash.
+
+    Left unhandled this printed a PyInstaller traceback ending in a bare
+    `iroh.iroh_ffi.IrohError` -- seen for real on a Raspberry Pi whose DNS was
+    dead, so iroh could not resolve a relay to connect through. Nothing in that
+    output told the user what had happened or what to do next.
+    """
+    from roastmesh import cli as cli_mod
+
+    class _IrohishError(Exception):
+        pass
+
+    async def _boom(*_a, **_kw):
+        raise _IrohishError("connection timed out")
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))   # Path.home() on Windows
+    monkeypatch.setattr(cli_mod.net, "sync_with_peer", _boom)
+
+    result = CliRunner().invoke(main, ["peer", "sync", "endpointabcdef"])
+
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "could not connect to that peer" in result.output
+    assert "_IrohishError" in result.output
+    assert "check DNS first" in result.output
+
+
+def test_doctor_does_not_promise_reachability_from_a_stable_mapping() -> None:
+    """A consistent NAT mapping says the address is stable. It says nothing
+    about whether the router accepts a stranger's first packet -- measured:
+    the machine this was developed on reports a stable mapping and silently
+    drops unsolicited datagrams, so a peer that found it still could not
+    reach it. Claiming "other nodes can reach this port" sent the diagnosis
+    in the wrong direction."""
+    text = _render(_doctor_report())
+    assert "other nodes can reach this port" not in text
+    assert "filtering" in text

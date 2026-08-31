@@ -49,7 +49,24 @@ case "$ARCH" in
         ;;
 esac
 
-docker build "${PLATFORM_ARGS[@]}" -f packaging/Dockerfile.build -t "$IMAGE" .
+# Docker gives a container the *host's* resolv.conf, which is wrong whenever
+# the host resolves through a VPN-local address: a Tailscale machine has
+# nameserver 100.100.100.100, the container's bridge network cannot route to
+# the tailscale0 interface, and so every apt/pip call inside the build dies
+# with "Temporary failure in name resolution" while the host itself resolves
+# perfectly. Nothing about the build is broken and nothing in the Dockerfile
+# is wrong, which makes it a genuinely confusing failure to land on.
+#
+#   ROASTMESH_DOCKER_NETWORK=host packaging/build-docker.sh
+#
+# is the fix; left opt-in because host networking is otherwise worth avoiding.
+NETWORK_ARGS=()
+if [ -n "${ROASTMESH_DOCKER_NETWORK:-}" ]; then
+    NETWORK_ARGS=(--network "$ROASTMESH_DOCKER_NETWORK")
+fi
+
+docker build "${PLATFORM_ARGS[@]}" "${NETWORK_ARGS[@]}" \
+    -f packaging/Dockerfile.build -t "$IMAGE" .
 
 mkdir -p "$DIST_DIR"
 rm -rf "$SCRATCH"

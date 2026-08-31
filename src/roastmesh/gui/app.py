@@ -1096,7 +1096,9 @@ class NetworkTab(Tab):
                             "connection to you, so internet discovery cannot work here. "
                             "LAN peers and pasted tickets still work."))
         elif nat == "consistent":
-            v["nat"].set(t("consistent mapping -- other nodes can reach this port"))
+            v["nat"].set(t("stable address. Whether a stranger's first packet gets through "
+                            "depends on your router's filtering, which this cannot measure -- "
+                            "a stable address that still drops unsolicited packets is common."))
         else:
             v["nat"].set(t("not known yet"))
 

@@ -615,7 +615,12 @@ def _print_doctor_report(r: dict) -> None:
                        "this is a network limitation, not a DHT fault. LAN discovery "
                        "and pasted tickets still work.")
         else:
-            click.echo("  NAT: consistent mapping -- other nodes can reach this port.")
+            click.echo("  NAT: consistent mapping -- your address is stable, which is the "
+                       "half\n       of the problem this can measure. Whether a stranger's "
+                       "first packet is\n       accepted depends on your router's filtering, "
+                       "which nothing here can\n       tell you: a stable mapping that still "
+                       "drops unsolicited packets is\n       common, and was exactly the case "
+                       "on the machine this was tested from.")
 
     t = r["routing_table"]
     click.echo(f"\nrouting table: {t['good']} good of {t['total']} "
@@ -714,9 +719,25 @@ def peer_list(ctx: click.Context, as_json: bool) -> None:
 def _sync_and_ingest(ctx: click.Context, ticket: str, added_via: str) -> None:
     ident, created = load_or_create_identity()
     _remind_backup_if_new(ident, created)
-    report = asyncio.run(net.sync_with_peer(
-        ticket, ident, ctx.obj["peer_feeds_root"], ctx.obj["peers_file"], added_via=added_via,
-    ))
+    try:
+        report = asyncio.run(net.sync_with_peer(
+            ticket, ident, ctx.obj["peer_feeds_root"], ctx.obj["peers_file"], added_via=added_via,
+        ))
+    except Exception as exc:  # noqa: BLE001 -- iroh raises its own error type
+        # A peer that is offline, unreachable, or behind a NAT we cannot punch
+        # is an ordinary outcome, not a crash. Left unhandled this printed a
+        # PyInstaller traceback ending in a bare `iroh.iroh_ffi.IrohError` --
+        # observed on a Raspberry Pi whose DNS was dead, so iroh could not
+        # resolve a relay to connect through. Nothing in that output tells the
+        # user what happened or what to do about it.
+        raise click.ClickException(
+            f"could not connect to that peer: {type(exc).__name__}"
+            f"{': ' + str(exc) if str(exc) else ''}\n"
+            "They may be offline, or neither side can reach the other. If this "
+            "machine cannot resolve hostnames, connecting through a relay will "
+            "always fail -- check DNS first (`roastmesh node doctor` says so "
+            "outright when no bootstrap name resolves)."
+        ) from exc
     verify_msg = "OK" if report.verify.ok else f"INVALID: {report.verify.error}"
     click.echo(f"synced with {report.peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, "
                f"feed {verify_msg}, {report.peers_known} peers known")
