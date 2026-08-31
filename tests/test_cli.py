@@ -668,6 +668,7 @@ def _doctor_report(**over) -> dict:
                    "rejected_bep42": 29},
         "announce_set": [{"addr": "1.2.3.4:6881", "bits": 140, "bep42": True}],
         "readback": True, "peers": ["5.6.7.8:41890"],
+        "public_port": None, "needs_public_port": False,
         "swarm_info_hash": "22" * 20,
     }
     report.update(over)
@@ -765,3 +766,30 @@ def test_doctor_does_not_promise_reachability_from_a_stable_mapping() -> None:
     text = _render(_doctor_report())
     assert "other nodes can reach this port" not in text
     assert "filtering" in text
+
+
+def test_doctor_tells_a_symmetric_nat_exactly_what_to_do() -> None:
+    """"Not findable" on its own leaves the user nowhere. The report has to
+    name the fix, and the command that applies it."""
+    text = _render(_doctor_report(nat="symmetric", readback=False,
+                                  needs_public_port=True))
+    assert "needs a forwarded port" in text
+    assert "--public-port N" in text
+    assert "piactl get portforward" in text          # the VPN route out of CGNAT
+    assert "can still find others and sync" in text  # what still works meanwhile
+
+
+def test_doctor_does_not_nag_a_node_whose_forwarded_port_works() -> None:
+    text = _render(_doctor_report(public_port=26513, readback=True,
+                                  needs_public_port=False))
+    assert "needs a forwarded port" not in text
+
+
+def test_doctor_says_a_configured_port_is_not_actually_open() -> None:
+    """Configured but still unreachable is a different problem from having no
+    port at all, and repeating the generic advice would send the user back to
+    a step they already did."""
+    text = _render(_doctor_report(nat="symmetric", public_port=26513,
+                                  readback=False, needs_public_port=True))
+    assert "26513 is configured but the read-back still failed" in text
+    assert "--public-port N" not in text

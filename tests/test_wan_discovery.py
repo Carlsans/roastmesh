@@ -22,6 +22,7 @@ from roastmesh.wan_discovery import (
     diagnostics_payload,
     _resolve_named,
     external_address,
+    needs_public_port,
     run_wan_discovery,
 )
 
@@ -252,7 +253,7 @@ async def test_diagnostics_payload_is_the_shape_both_producers_promise() -> None
         assert set(payload) == {
             "external_ip", "external_port", "nat", "ip_votes", "node_id",
             "node_id_bep42", "routing_table", "warm", "lookup", "announce_set",
-            "readback", "peers", "swarm_info_hash",
+            "readback", "public_port", "needs_public_port", "peers", "swarm_info_hash",
         }
         assert set(payload["lookup"]) == {
             "rounds", "queried", "replied", "closest_bits", "announced",
@@ -388,3 +389,35 @@ async def test_dns_is_preferred_over_the_baked_in_address() -> None:
     finally:
         loop.getaddrinfo = real
     assert named == [("dht.transmissionbt.com", ("203.0.113.9", 6881))]
+
+
+# --- when to tell the user to forward a port --------------------------------
+
+def test_a_symmetric_nat_is_told_to_configure_a_forwarded_port() -> None:
+    """Announcing an implied port behind a symmetric NAT publishes a number
+    nobody can use -- the reachable port and the outbound source port are
+    simply different. Nothing inside the DHT can fix that, so the honest
+    move is to say so."""
+    assert needs_public_port("symmetric", readback=None, public_port=None) is True
+
+
+def test_a_failed_read_back_asks_for_a_forwarded_port_too() -> None:
+    # We announced and then could not find ourselves. Whatever the NAT
+    # measurement said, the published address demonstrably does not work.
+    assert needs_public_port("consistent", readback=False, public_port=None) is True
+
+
+def test_a_working_forwarded_port_stops_the_advice() -> None:
+    assert needs_public_port("symmetric", readback=True, public_port=26513) is False
+
+
+def test_a_forwarded_port_that_still_fails_keeps_the_advice() -> None:
+    # Configured but not actually reachable -- the wrong number, or the
+    # forward is not really in place. Staying quiet here would be the
+    # unhelpful half of "we told you once".
+    assert needs_public_port("symmetric", readback=False, public_port=26513) is True
+
+
+def test_a_healthy_node_is_not_nagged() -> None:
+    assert needs_public_port("consistent", readback=True, public_port=None) is False
+    assert needs_public_port("unknown", readback=None, public_port=None) is False

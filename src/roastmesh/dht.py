@@ -1267,7 +1267,8 @@ class DhtClient:
             addr, "get_peers", {b"id": self.own_id, b"info_hash": info_hash}, timeout=timeout,
         )
 
-    async def announce_peer(self, addr: Addr, info_hash: bytes, token: bytes, *, timeout: float = 4.0) -> dict | None:
+    async def announce_peer(self, addr: Addr, info_hash: bytes, token: bytes, *,
+                            timeout: float = 4.0, public_port: int | None = None) -> dict | None:
         """Announce under this socket's address.
 
         `implied_port=1` asks the storing node to use the packet's source port,
@@ -1284,6 +1285,18 @@ class DhtClient:
             local_port = int(self._transport.get_extra_info("sockname")[1])
         except (AttributeError, IndexError, TypeError, ValueError):
             pass
+        if public_port is not None:
+            # `implied_port=0` means "store the port I am telling you", which is
+            # the only correct answer when a router or VPN forwards a fixed port
+            # to us. Behind such a forward the source port is *not* the reachable
+            # one: measured on a Raspberry Pi with PIA port forwarding, inbound
+            # to the forwarded port arrived perfectly while outbound packets from
+            # that same socket left with a fresh random source port every time.
+            # implied_port there publishes an address nobody can use.
+            return await self._query(addr, "announce_peer", {
+                b"id": self.own_id, b"info_hash": info_hash, b"port": int(public_port),
+                b"implied_port": 0, b"token": token,
+            }, timeout=timeout)
         return await self._query(addr, "announce_peer", {
             b"id": self.own_id, b"info_hash": info_hash, b"port": local_port,
             b"implied_port": 1, b"token": token,
@@ -1378,6 +1391,7 @@ class DhtClient:
         seed_ids: dict[Addr, bytes] | None = None,
         stats: LookupStats | None = None,
         announce_if: Callable[[LookupStats], bool] | None = None,
+        public_port: int | None = None,
     ) -> set[Addr]:
         """A thin wrapper over `Search`, kept so `wan_discovery.py` and
         `cli.py`'s existing call sites -- both call this as a bound method
@@ -1442,7 +1456,8 @@ class DhtClient:
                 if n.token is None:
                     stats.no_token += 1
                     continue
-                if await self.announce_peer(n.addr, info_hash, n.token, timeout=timeout) is not None:
+                if await self.announce_peer(n.addr, info_hash, n.token, timeout=timeout,
+                                            public_port=public_port) is not None:
                     n.acked = True
                     stats.announced += 1
 

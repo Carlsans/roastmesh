@@ -440,6 +440,12 @@ def node() -> None:
               help="UDP port for internet-wide discovery (default: 41890). Only needs "
                    "changing to run two nodes on one machine, or if something else "
                    "already holds that port.")
+@click.option("--public-port", default=None, type=int,
+              help="The port other machines can reach this one on, when your router or "
+                   "VPN forwards one to you. Set it and internet discovery publishes that "
+                   "port instead of the one your NAT happened to use, which is the only "
+                   "thing that works behind a port forward. Run `node doctor` -- it says "
+                   "outright when you need this.")
 @click.option("--publish-watch-dir", default=None, type=click.Path(path_type=Path),
               help="Folder to auto-publish any .alog files dropped into it "
                    "(default: ~/RoastMeshShare).")
@@ -449,7 +455,8 @@ def node() -> None:
 def node_serve(
     ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
     no_relay: bool, no_lan_discovery: bool, wan_discovery: bool,
-    wan_port: int | None, publish_watch_dir: Path | None, no_publish_watch: bool,
+    wan_port: int | None, public_port: int | None,
+    publish_watch_dir: Path | None, no_publish_watch: bool,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
@@ -475,6 +482,7 @@ def node_serve(
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
         enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
         **({"wan_discovery_port": wan_port} if wan_port else {}),
+        **({"wan_public_port": public_port} if public_port else {}),
     ))
 
 
@@ -483,7 +491,10 @@ def node_serve(
               help="Also publish this node to the DHT swarm while diagnosing.")
 @click.option("--json", "as_json", is_flag=True,
               help="Emit the full diagnostic report as JSON (used by the GUI).")
-def node_doctor(announce: bool, as_json: bool) -> None:
+@click.option("--public-port", default=None, type=int,
+              help="Test a forwarded port: announce it and check whether a fresh lookup "
+                   "can then find this node. Implies --announce.")
+def node_doctor(announce: bool, as_json: bool, public_port: int | None) -> None:
     """Diagnose internet-wide (DHT) peer discovery, step by step.
 
     Internet discovery is the one part of roastmesh that can fail completely
@@ -504,8 +515,11 @@ def node_doctor(announce: bool, as_json: bool) -> None:
         _resolve_named,
         default_state_path,
         diagnostics_payload,
+        needs_public_port,
         external_address,
     )
+
+    announce_now = announce or public_port is not None
 
     async def run() -> None:
         ident, _created = load_or_create_identity()
@@ -535,17 +549,20 @@ def node_doctor(announce: bool, as_json: bool) -> None:
                 seeds = list(dict.fromkeys([*resolved, *state]))
                 peers = await client.discover_and_announce_peers(
                     SWARM_INFO_HASH, seeds, seed_ids=dict(state),
-                    announce=announce, stats=stats,
+                    announce=announce_now, stats=stats, public_port=public_port,
                 )
                 state.update({n.addr: n.id for n in client.routing_table.good_nodes()})
                 save_node_cache(state_path, state)
 
             external, nat, votes = external_address(client)
             readback: bool | None = None
-            if announce and stats.announced > 0 and external is not None:
+            if announce_now and stats.announced > 0 and external is not None:
                 # The only question that matters, asked directly: having just
-                # published ourselves, does a fresh lookup find us?
-                readback = external in await client.discover_and_announce_peers(
+                # published ourselves, does a fresh lookup find us? With a
+                # forwarded port that is the address we published, not the one
+                # we were seen from -- those differ, which is the whole point.
+                published = (external[0], public_port) if public_port else external
+                readback = published in await client.discover_and_announce_peers(
                     SWARM_INFO_HASH, list(dict.fromkeys([*resolved, *state])),
                     seed_ids=dict(state), announce=False, stats=LookupStats(),
                 )
@@ -553,14 +570,14 @@ def node_doctor(announce: bool, as_json: bool) -> None:
             report = diagnostics_payload(
                 client, stats, info_hash=SWARM_INFO_HASH, external=external, nat=nat,
                 votes=votes, warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
-                readback=readback, addrs=peers,
+                readback=readback, addrs=peers, public_port=public_port,
             )
             report["identity"] = ident.public_key_hex
             report["state_path"] = str(state_path)
             report["state_nodes"] = len(state)
             report["bootstrap"] = routers
             report["bootstrap_unresolved"] = unresolved
-            report["announced_this_run"] = announce
+            report["announced_this_run"] = announce_now
 
             if as_json:
                 click.echo(json.dumps(report))
@@ -657,6 +674,9 @@ def _print_doctor_report(r: dict) -> None:
         click.echo("\n  read-back: FAILED -- we announced, but a fresh lookup could not "
                    "find our own address. Other nodes will not find us either.")
 
+    if r.get("needs_public_port"):
+        _print_public_port_advice(r)
+
     if r["peers"]:
         click.echo(f"\n  {len(r['peers'])} address(es) advertised on the roastmesh swarm:")
         for addr in r["peers"]:
@@ -667,6 +687,42 @@ def _print_doctor_report(r: dict) -> None:
         click.echo("\n  no roastmesh peers currently advertised. If another node is "
                    "serving with --wan-discovery right now, re-run in a minute -- "
                    "announcements take a round to propagate.")
+
+
+def _print_public_port_advice(r: dict) -> None:
+    """Tell the user the one thing that will actually fix this.
+
+    Reached when the address we publish is provably useless: a NAT that hands
+    out a different port per destination, or an announce we could not find
+    afterwards. Neither is fixable from inside the DHT, and without this the
+    report just says "not findable" and leaves the user nowhere.
+    """
+    port = r.get("public_port")
+    click.echo("\n  WHAT TO DO: this node needs a forwarded port.")
+    if r["nat"] == "symmetric":
+        click.echo("  Your NAT gives every destination a different port, so the port "
+                   "others\n  see is never the port they can reach you on. Publishing it "
+                   "is useless.")
+    if port is not None:
+        click.echo(f"  Port {port} is configured but the read-back still failed, so it is "
+                   "not\n  actually open. Check the forward really points at this machine, "
+                   "and that\n  roastmesh is listening on it (--wan-port).")
+        return
+    click.echo("  Get a port forwarded to this machine, then run:")
+    click.echo("      roastmesh node serve --wan-discovery --wan-port N --public-port N")
+    click.echo("  where N is the forwarded port. Test it first with:")
+    click.echo("      roastmesh node doctor --public-port N")
+    click.echo("  Where N comes from:")
+    click.echo("   * your router's port-forwarding page (forward a UDP port to this "
+               "machine);")
+    click.echo("   * or your VPN, if it offers port forwarding -- Private Internet "
+               "Access\n     does, and `piactl get portforward` prints the port it gave "
+               "you;")
+    click.echo("   * on carrier-grade NAT you cannot forward anything yourself, and a "
+               "VPN with\n     port forwarding is the usual way out.")
+    click.echo("  Without one, this node can still find others and sync with them -- it "
+               "just\n  cannot be found first. Pasted tickets and LAN discovery are "
+               "unaffected.")
 
 
 @main.group()

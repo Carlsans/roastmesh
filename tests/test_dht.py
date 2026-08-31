@@ -662,3 +662,58 @@ async def test_the_echoed_ip_field_is_top_level_on_the_wire() -> None:
     finally:
         sock.close()
         server.close()
+
+
+async def test_announcing_a_forwarded_port_publishes_that_port_not_the_source_port() -> None:
+    """The whole point of `--public-port`, pinned at the wire level.
+
+    Behind a port forward the reachable port and the outbound source port are
+    different numbers -- measured on a Raspberry Pi with PIA port forwarding,
+    inbound to the forwarded port worked perfectly while packets leaving that
+    same socket got a fresh random source port every time. BEP 5's
+    `implied_port` says "use the port you saw", which there publishes an
+    address nobody can reach. Sending `implied_port=0` with an explicit port
+    is the only thing that works, and this is what proves we do it.
+    """
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = _loopback_addr(server)
+        source_port = client._transport.get_extra_info("sockname")[1]
+        forwarded = 26513
+        assert forwarded != source_port
+
+        info_hash = secrets.token_bytes(20)
+        token = (await client.get_peers(server_addr, info_hash, timeout=2.0))[b"token"]
+        assert await client.announce_peer(server_addr, info_hash, token, timeout=2.0,
+                                          public_port=forwarded) is not None
+
+        stored = decode_compact_peers(b"".join(
+            (await client.get_peers(server_addr, info_hash, timeout=2.0))[b"values"]))
+        assert ("127.0.0.1", forwarded) in stored, stored
+        assert ("127.0.0.1", source_port) not in stored, (
+            "the source port was published anyway -- implied_port was not switched off")
+    finally:
+        server.close()
+        client.close()
+
+
+async def test_without_a_forwarded_port_the_source_port_is_still_what_gets_published() -> None:
+    """The default must not change: an ordinary NAT rewrites the source port,
+    so `implied_port` -- "use the port you saw" -- is the only correct answer
+    there, and it is what almost every node should keep sending."""
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = _loopback_addr(server)
+        source_port = client._transport.get_extra_info("sockname")[1]
+        info_hash = secrets.token_bytes(20)
+        token = (await client.get_peers(server_addr, info_hash, timeout=2.0))[b"token"]
+        await client.announce_peer(server_addr, info_hash, token, timeout=2.0)
+
+        stored = decode_compact_peers(b"".join(
+            (await client.get_peers(server_addr, info_hash, timeout=2.0))[b"values"]))
+        assert ("127.0.0.1", source_port) in stored, stored
+    finally:
+        server.close()
+        client.close()

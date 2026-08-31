@@ -917,6 +917,7 @@ class NetworkTab(Tab):
             ("announce", t("Published to")),
             ("findable", t("Findable by others")),
             ("peers", t("Peers on the swarm")),
+            ("advice", t("What to do")),
         )):
             tk.Label(grid, text=label + ":", font=FONT_BOLD, bg=BG, fg=FG).grid(
                 row=row, column=0, sticky="nw", padx=(0, 8), pady=1)
@@ -979,6 +980,12 @@ class NetworkTab(Tab):
                               "--publish-watch-dir", self.app.watch_dir.get())
         if self.app.wan_discovery_enabled.get():
             argv.append("--wan-discovery")
+            # Both, and the same number: --wan-port is the socket we listen on,
+            # --public-port is what we tell other nodes to use. A forward is
+            # only useful if the port it delivers to is the one we are on.
+            port = self.app.public_port.get().strip()
+            if port.isdigit():
+                argv += ["--wan-port", port, "--public-port", port]
         self.serve_console.clear()
         self.serve_console.set_command(describe(argv))
         self.ticket_var.set("")
@@ -1133,6 +1140,21 @@ class NetworkTab(Tab):
         peers = r.get("peers") or []
         v["peers"].set(", ".join(peers) if peers else t("none advertised right now"))
 
+        if r.get("needs_public_port"):
+            port = r.get("public_port")
+            if port:
+                v["advice"].set(t("Port {port} is set, but a fresh lookup still could not "
+                                   "find this machine -- so it is not actually open. Check "
+                                   "the forward really points here.", port=port))
+            else:
+                v["advice"].set(t("This machine cannot be found by others until a port is "
+                                   "forwarded to it. Put that port in Settings under "
+                                   "\"Forwarded port\". Your router's port-forwarding page "
+                                   "has it, or your VPN if it offers one. You can still find "
+                                   "and sync with other people meanwhile."))
+        else:
+            v["advice"].set("")
+
         if nat == "symmetric":
             status = t("blocked by this network")
         elif readback is True:
@@ -1231,6 +1253,18 @@ class SettingsTab(Tab):
                   "tab will change."))
         ttk.Checkbutton(wan_section, text=t("Find peers over the whole internet, not just my LAN"),
                          variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
+        port_field = Field(wan_section, t("Forwarded port (optional)"), variable=self.app.public_port,
+              help_text=t("Leave empty unless your router or VPN forwards a port to this "
+                          "machine. Some networks give every outgoing connection a different "
+                          "port, so the address other people see is not one they can reach -- "
+                          "then you need a forwarded port to be findable at all. The Network "
+                          "tab says so outright when that is the case, and 'Run a full check' "
+                          "will tell you whether the port you entered actually works."))
+        # On commit, not on every keystroke: this restarts the serving process,
+        # and the auto-save trace every other Settings field uses fires per
+        # character -- typing "26513" would have restarted the node five times.
+        for event in ("<FocusOut>", "<Return>"):
+            port_field.entry.bind(event, lambda *_e: self.app._apply_discovery_change())
 
         unit_section = section(container, t("Temperature unit"))
         explain(unit_section,
@@ -1414,9 +1448,10 @@ class RoastmeshApp(tk.Tk):
         self.db_path = tk.StringVar(value=cfg.db_path)
         self.watch_dir = tk.StringVar(value=cfg.watch_dir)
         self.wan_discovery_enabled = tk.BooleanVar(value=cfg.wan_discovery_enabled)
+        self.public_port = tk.StringVar(value=cfg.public_port)
         self.temp_unit = tk.StringVar(value=cfg.temp_unit)
         self.language = tk.StringVar(value=i18n.current_language())
-        for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled,
+        for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled, self.public_port,
                     self.temp_unit, self.language):
             var.trace_add("write", lambda *_args: self._save_config())
 
@@ -1528,6 +1563,7 @@ class RoastmeshApp(tk.Tk):
         gui_config.save_config(gui_config.GuiConfig(
             db_path=self.db_path.get(), watch_dir=self.watch_dir.get(),
             wan_discovery_enabled=self.wan_discovery_enabled.get(),
+            public_port=self.public_port.get().strip(),
             temp_unit=self.temp_unit.get(),
             language=self.language.get(),
             ui_scale=self._ui_scale_override,

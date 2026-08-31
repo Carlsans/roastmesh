@@ -1125,3 +1125,96 @@ app.destroy()
     assert "3" in r.stdout and "29" in r.stdout
     assert "could not find us" in r.stdout
     assert "5.6.7.8:41890" in r.stdout
+
+
+def test_a_forwarded_port_setting_reaches_the_serve_command(tmp_path: Path) -> None:
+    """The setting is worthless unless it lands on both flags: --wan-port is
+    the socket we listen on, --public-port is what we tell other nodes. A
+    forward only helps if the port it delivers to is the one we are on."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+os.environ["USERPROFILE"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+from roastmesh.gui.runner import describe
+app = RoastmeshApp()
+app.update()
+tab = app.network_tab
+app.wan_discovery_enabled.set(True)
+
+def restart(label, value):
+    # _on_start_serve refuses while a task is still running, and a just-stopped
+    # one lingers -- without clearing it the second call is a no-op and the
+    # test reads the *previous* argv, passing for the wrong reason.
+    tab._on_stop_serve()
+    tab.serve_task = None
+    app.public_port.set(value)
+    tab._on_start_serve()
+    print(label, describe(tab.serve_task.argv))
+
+restart("NOPORT", "")
+restart("PORT", "26513")
+restart("JUNK", "not-a-port")
+tab._on_stop_serve()
+app.destroy()
+""")
+    assert r.returncode == 0, r.stdout + r.stderr
+    noport = next(l for l in r.stdout.splitlines() if l.startswith("NOPORT"))
+    port = next(l for l in r.stdout.splitlines() if l.startswith("PORT"))
+    junk = next(l for l in r.stdout.splitlines() if l.startswith("JUNK"))
+
+    assert "--public-port" not in noport      # empty means "no forward", not a flag
+    assert "--wan-port 26513" in port and "--public-port 26513" in port
+    assert "--public-port" not in junk        # junk must not produce a serve that won't start
+
+
+def test_the_network_panel_says_what_to_do_about_an_unreachable_node(tmp_path: Path) -> None:
+    """"Not findable" with no next step is where a user gives up. When the
+    diagnosis is settled -- symmetric NAT, or an announce we could not find
+    afterwards -- the panel has to name the fix."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    base = {
+        "external_ip": "1.2.3.4", "external_port": 5, "nat": "symmetric", "ip_votes": 9,
+        "node_id": "cd" * 20, "node_id_bep42": True,
+        "routing_table": {"total": 40, "good": 30, "verified": 21}, "warm": True,
+        "lookup": {"rounds": 9, "queried": 30, "replied": 12, "closest_bits": 140,
+                   "announced": 8, "no_token": 0, "peers_found": 0,
+                   "rejected_martian": 0, "rejected_impossible_proximity": 0,
+                   "rejected_bep42": 12},
+        "announce_set": [], "readback": False, "peers": [],
+        "swarm_info_hash": "22" * 20,
+    }
+    needs = json.dumps({**base, "public_port": None, "needs_public_port": True})
+    configured = json.dumps({**base, "public_port": 26513, "needs_public_port": True})
+    healthy = json.dumps({**base, "nat": "consistent", "readback": True,
+                          "public_port": 26513, "needs_public_port": False})
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+os.environ["USERPROFILE"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.update()
+tab = app.network_tab
+tab._on_serve_output("wan-stats: " + {needs!r} + chr(10))
+print("NEEDS", tab.diag_vars["advice"].get())
+tab._on_serve_output("wan-stats: " + {configured!r} + chr(10))
+print("CONFIGURED", tab.diag_vars["advice"].get())
+tab._on_serve_output("wan-stats: " + {healthy!r} + chr(10))
+print("HEALTHY", repr(tab.diag_vars["advice"].get()))
+app.destroy()
+""")
+    assert r.returncode == 0, r.stdout + r.stderr
+    needs_line = next(l for l in r.stdout.splitlines() if l.startswith("NEEDS"))
+    conf_line = next(l for l in r.stdout.splitlines() if l.startswith("CONFIGURED"))
+    healthy_line = next(l for l in r.stdout.splitlines() if l.startswith("HEALTHY"))
+
+    assert "port is forwarded" in needs_line and "Settings" in needs_line
+    assert "26513 is set" in conf_line          # a different problem, a different sentence
+    assert healthy_line == "HEALTHY ''"         # nothing to say when it works

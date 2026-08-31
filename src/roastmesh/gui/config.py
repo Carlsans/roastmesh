@@ -36,6 +36,11 @@ class GuiConfig:
     # in the GUI, at which point it sticks across restarts and screens
     # until reset (Ctrl+0).
     ui_scale: float | None = None
+    # "" means none. The port other machines can reach this one on, when a
+    # router or VPN forwards one here -- see wan_discovery.needs_public_port
+    # for when it is required. Kept as text because it comes straight from an
+    # entry box and an empty box has to survive a round trip unchanged.
+    public_port: str = ""
 
 
 def default_config() -> GuiConfig:
@@ -46,6 +51,7 @@ def default_config() -> GuiConfig:
         temp_unit="C",
         language=DEFAULT_LANGUAGE,
         ui_scale=None,
+        public_port="",
     )
 
 
@@ -65,7 +71,22 @@ def load_config() -> GuiConfig:
         temp_unit=data.get("temp_unit") if data.get("temp_unit") in ("C", "F") else defaults.temp_unit,
         language=data.get("language") if data.get("language") in LANGUAGES else defaults.language,
         ui_scale=_valid_ui_scale(data.get("ui_scale")),
+        public_port=_valid_port(data.get("public_port")),
     )
+
+
+def _valid_port(value: object) -> str:
+    """A port, or "" -- never anything that would become a bad CLI argument.
+
+    Whatever survives here is handed straight to `node serve --public-port`,
+    so junk in the config file must not turn into a serve process that
+    refuses to start; an unusable value is simply no value.
+    """
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return ""
+    return str(port) if 1 <= port <= 65535 else ""
 
 
 def _valid_ui_scale(value: object) -> float | None:

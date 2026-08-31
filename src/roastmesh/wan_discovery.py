@@ -216,9 +216,24 @@ def external_address(client: DhtClient) -> tuple[Addr | None, str, int]:
     return best, ("symmetric" if len({p for _ip, p in votes}) > 1 else "consistent"), total
 
 
+def needs_public_port(nat: str, readback: bool | None, public_port: int | None) -> bool:
+    """Whether this node should be told to configure a forwarded port.
+
+    Two independent symptoms, either of which means our published address is
+    not one anyone can use: a NAT that hands out a different port per
+    destination (so the port we are seen from is meaningless), or an announce
+    that we then could not find ourselves. Both are settled facts by the time
+    they are reported, not guesses -- and neither can be fixed from inside the
+    DHT, which is why this points at configuration instead.
+    """
+    if public_port is not None and readback is True:
+        return False
+    return nat == "symmetric" or readback is False
+
+
 def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: bytes,
                         external: Addr | None, nat: str, votes: int, warm: bool,
-                        readback: bool | None, addrs) -> dict:
+                        readback: bool | None, addrs, public_port: int | None = None) -> dict:
     """The single definition of the diagnostics contract.
 
     Both producers use it -- the `wan-stats:` line `node serve` emits every
@@ -259,6 +274,8 @@ def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: byt
         },
         "announce_set": announce_set,
         "readback": readback,
+        "public_port": public_port,
+        "needs_public_port": needs_public_port(nat, readback, public_port),
         "peers": sorted(f"{a[0]}:{a[1]}" for a in addrs),
         "swarm_info_hash": info_hash.hex(),
     }
@@ -278,6 +295,7 @@ async def run_wan_discovery(
     node_cache_path=None,
     on_round: Callable[[object], None] | None = None,
     allow_loopback: bool = False,
+    public_port: int | None = None,
 ) -> None:
     """Announce on the public DHT and react to other roastmesh nodes found
     there, until cancelled. `on_peer_discovered(pubkey, ticket)` is
@@ -290,6 +308,13 @@ async def run_wan_discovery(
     production: `dht.is_martian` rejects 127.x precisely so that a hostile
     node cannot put loopback addresses in a `nodes` blob and aim our queries
     at whatever is listening on this machine.
+    `public_port` is the port other nodes can reach this machine on, when a
+    router or VPN forwards one to us. Without it we announce with BEP 5's
+    `implied_port`, which asks storing nodes to record the source port they
+    saw -- correct behind an ordinary NAT, and exactly wrong behind a port
+    forward, where the reachable port and the outbound source port are
+    different numbers.
+
     `on_round` receives each round's LookupStats (used by the logs and by
     `roastmesh net doctor`) -- without it a failing round is invisible.
     """
@@ -446,6 +471,10 @@ async def run_wan_discovery(
         """
         if external is None:
             return None
+        # What we published, which is not always where we were seen from: with
+        # a forwarded port the announce carries that port explicitly, so that
+        # is the address other nodes hold for us and the one to look for.
+        published = (external[0], public_port) if public_port is not None else external
         seeds = await _seeds()
         if not seeds:
             return None
@@ -455,7 +484,7 @@ async def run_wan_discovery(
             )
         except Exception:  # noqa: BLE001 -- a failed probe is "unknown", not a crash
             return None
-        return external in found
+        return published in found
 
     bootstrap_task = asyncio.create_task(_bootstrap_loop())
     next_announce_at = 0.0
@@ -483,6 +512,7 @@ async def run_wan_discovery(
                         info_hash, seeds, seed_ids=dict(state), stats=stats, announce=announce,
                         announce_if=lambda st: (st.closest_bits is not None
                                                 and st.closest_bits <= ANNOUNCE_MAX_BITS),
+                        public_port=public_port,
                     )
             except Exception as exc:  # noqa: BLE001 -- a bad DHT round shouldn't kill serve()
                 # Previously swallowed silently, which is how a permanently
@@ -514,7 +544,7 @@ async def run_wan_discovery(
                 # what fills the routing table, so reporting the count from
                 # before it makes a healthy node read as permanently cold.
                 warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
-                readback=readback, addrs=addrs)), flush=True)
+                readback=readback, addrs=addrs, public_port=public_port)), flush=True)
             if on_round is not None:
                 on_round(stats)
             for addr in addrs:
