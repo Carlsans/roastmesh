@@ -501,7 +501,7 @@ def node_doctor(announce: bool, as_json: bool) -> None:
         DEFAULT_DHT_BOOTSTRAP,
         SWARM_INFO_HASH,
         WARM_GOOD_NODES,
-        _resolve,
+        _resolve_named,
         default_state_path,
         diagnostics_payload,
         external_address,
@@ -512,20 +512,21 @@ def node_doctor(announce: bool, as_json: bool) -> None:
         state_path = default_state_path()
         state = load_node_cache(state_path)
 
-        resolved = await _resolve(DEFAULT_DHT_BOOTSTRAP)
-        resolved_set = set(resolved)
+        named = await _resolve_named(DEFAULT_DHT_BOOTSTRAP)
+        resolved = [addr for _h, addr in named if addr is not None]
         client = await DhtClient.bind(
             port=0, own_id=hashlib.sha1(bytes.fromhex(ident.public_key_hex)).digest())
         routers: list[dict] = []
         try:
-            for (host, _port), addr in zip(DEFAULT_DHT_BOOTSTRAP, resolved):
-                if addr not in resolved_set:
+            for host, addr in named:
+                if addr is None:
+                    routers.append({"host": host, "addr": None, "ok": False})
                     continue
                 # bootstrap_ping, not ping: a reply should seed the routing
                 # table, which is what the lookup below wants to start from.
                 ok = await client.bootstrap_ping(addr, timeout=4.0)
                 routers.append({"host": host, "addr": f"{addr[0]}:{addr[1]}", "ok": ok})
-            unresolved = len(DEFAULT_DHT_BOOTSTRAP) - len(resolved)
+            unresolved = sum(1 for _h, addr in named if addr is None)
             reachable = sum(1 for r in routers if r["ok"])
 
             stats = LookupStats()
@@ -582,9 +583,18 @@ def _print_doctor_report(r: dict) -> None:
 
     click.echo("\nbootstrap routers:")
     for row in r["bootstrap"]:
-        host, addr = row["host"], row["addr"].rsplit(":", 1)[0]
-        click.echo(f"  {host:26} {addr:>15}  {'ok' if row['ok'] else 'no reply'}")
-    if r["bootstrap_unresolved"]:
+        if row["addr"] is None:
+            click.echo(f"  {row['host']:26} {'-':>15}  did not resolve")
+            continue
+        addr = row["addr"].rsplit(":", 1)[0]
+        click.echo(f"  {row['host']:26} {addr:>15}  {'ok' if row['ok'] else 'no reply'}")
+    if r["bootstrap_unresolved"] == len(r["bootstrap"]):
+        click.echo("  none of the router names resolved -- this machine's DNS is not\n"
+                   "  answering for public names. That is a DNS problem, not a DHT one;\n"
+                   "  roastmesh falls back to known addresses for the two live routers,\n"
+                   "  so discovery can still work, but everything else on this machine\n"
+                   "  that needs DNS will be broken too.")
+    elif r["bootstrap_unresolved"]:
         click.echo(f"  ({r['bootstrap_unresolved']} did not resolve)")
     if not any(row["ok"] for row in r["bootstrap"]) and not r["state_nodes"]:
         click.echo("\nno bootstrap router answered and no known nodes -- "

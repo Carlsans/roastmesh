@@ -106,6 +106,24 @@ SWARM_INFO_HASH = hashlib.sha1(b"roastnet-swarm-v1").digest()
 # and `router.bitcomet.com` no longer resolves at all. They are kept (last,
 # cheap when dead) only in case they come back; the two live ones plus the
 # persisted node cache are what actually bootstrap a lookup.
+# Literal addresses for the routers below, used only when DNS cannot answer.
+# Not a micro-optimisation: measured on a real deployment (a Raspberry Pi
+# reached over Tailscale) where getaddrinfo failed for *every* public name and
+# outbound port 53 was refused outright -- while UDP to the DHT itself worked
+# perfectly, replying to a ping on the first try. A node like that has no way
+# into the network at all once its state file is empty, and it reports exactly
+# the same "no bootstrap router answered" as a machine with no internet, so the
+# diagnosis points at the wrong thing entirely. Transmission ships a
+# dht.bootstrap file of literal addresses for the same reason.
+#
+# A fallback, never a preference: DNS wins whenever it works (these addresses
+# will go stale eventually), and the persisted state file supersedes both after
+# one successful round.
+DHT_BOOTSTRAP_FALLBACK_IPS: dict[str, str] = {
+    "dht.transmissionbt.com": "87.98.162.88",
+    "dht.libtorrent.org": "185.157.221.247",
+}
+
 DEFAULT_DHT_BOOTSTRAP: list[Addr] = [
     ("dht.transmissionbt.com", 6881),
     ("dht.libtorrent.org", 25401),
@@ -147,19 +165,36 @@ async def _resolve(bootstrap_nodes: list[Addr]) -> list[Addr]:
     while looking exactly like a firewall problem.
 
     A host that fails to resolve (no A record, offline DNS, transient failure)
-    is skipped rather than aborting the whole round.
+    falls back to a literal address if we ship one for it (see
+    DHT_BOOTSTRAP_FALLBACK_IPS), and is otherwise skipped rather than aborting
+    the whole round.
+    """
+    return [addr for _host, addr in await _resolve_named(bootstrap_nodes) if addr is not None]
+
+
+async def _resolve_named(bootstrap_nodes: list[Addr]) -> list[tuple[str, Addr | None]]:
+    """`_resolve`, but keeping each result beside the host it came from.
+
+    `node doctor` needs the pairing to report which router did what, and
+    zipping the two lists is wrong the moment one fails to resolve: every
+    later row then reports the wrong host's result, which is worse than no
+    report at all on the one machine where several fail.
     """
     loop = asyncio.get_running_loop()
-    resolved = []
+    out: list[tuple[str, Addr | None]] = []
     for host, port in bootstrap_nodes:
+        addr: Addr | None = None
         try:
             infos = await loop.getaddrinfo(host, port, family=socket.AF_INET,
                                             type=socket.SOCK_DGRAM)
         except OSError:
-            continue
+            infos = []
         if infos:
-            resolved.append((infos[0][4][0], port))
-    return resolved
+            addr = (infos[0][4][0], port)
+        elif host in DHT_BOOTSTRAP_FALLBACK_IPS:
+            addr = (DHT_BOOTSTRAP_FALLBACK_IPS[host], port)
+        out.append((host, addr))
+    return out
 
 
 def external_address(client: DhtClient) -> tuple[Addr | None, str, int]:

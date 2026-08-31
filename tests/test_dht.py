@@ -48,6 +48,17 @@ from roastmesh.dht import (
 )
 
 
+def _loopback_addr(client) -> tuple[str, int]:
+    """Where to send so an in-process node actually receives it.
+
+    `udp_socket` binds 0.0.0.0, so `sockname` reports 0.0.0.0 -- and sending
+    to that happens to reach localhost on Linux while Windows rejects it
+    outright with WinError 10049. Caught by the Windows CI run, which is the
+    only thing that executes these paths on the target platform.
+    """
+    return ("127.0.0.1", client._transport.get_extra_info("sockname")[1])
+
+
 def test_bencode_bdecode_roundtrip_scalars() -> None:
     assert bdecode(bencode(42)) == 42
     assert bdecode(bencode(b"hello")) == b"hello"
@@ -361,7 +372,7 @@ async def test_ip_votes_are_parsed_from_the_top_level_ip_field_of_replies() -> N
     server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     try:
-        server_addr = server._transport.get_extra_info("sockname")
+        server_addr = _loopback_addr(server)
         client_port = client._transport.get_extra_info("sockname")[1]
 
         assert client.ip_votes == {}
@@ -380,7 +391,7 @@ async def test_serves_ping_find_node_get_peers_announce_peer() -> None:
     server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     try:
-        server_addr = server._transport.get_extra_info("sockname")
+        server_addr = _loopback_addr(server)
 
         pong = await client.ping(server_addr, timeout=2.0)
         assert pong is not None and pong[b"id"] == server.own_id
@@ -421,7 +432,7 @@ async def test_announce_peer_with_a_bad_token_is_refused() -> None:
     server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     try:
-        server_addr = server._transport.get_extra_info("sockname")
+        server_addr = _loopback_addr(server)
         info_hash = secrets.token_bytes(20)
         result = await client.announce_peer(server_addr, info_hash, b"not-a-real-tok", timeout=2.0)
         assert result is None  # BEP 5 error reply -- treated the same as no answer
@@ -466,7 +477,7 @@ async def test_rate_limiter_caps_incoming_requests() -> None:
     server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
     try:
-        server_addr = server._transport.get_extra_info("sockname")
+        server_addr = _loopback_addr(server)
         assert await client.ping(server_addr, timeout=2.0) is not None
 
         server._rate_limiter._tokens = 0
@@ -638,7 +649,7 @@ async def test_the_echoed_ip_field_is_top_level_on_the_wire() -> None:
     sock.settimeout(2.0)
     try:
         sock.bind(("127.0.0.1", 0))
-        server_addr = server._transport.get_extra_info("sockname")
+        server_addr = _loopback_addr(server)
         query = bencode({b"t": b"aa", b"y": b"q", b"q": b"ping",
                          b"a": {b"id": secrets.token_bytes(20)}})
         await asyncio.get_running_loop().run_in_executor(None, sock.sendto, query, server_addr)

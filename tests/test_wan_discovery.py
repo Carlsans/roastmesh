@@ -14,10 +14,13 @@ import pytest
 from roastmesh.dht import bdecode, bencode, encode_compact_addr
 from roastmesh.dht import DhtClient, LookupStats, encode_compact_addr as _eca
 from roastmesh.wan_discovery import (
+    DEFAULT_DHT_BOOTSTRAP,
+    DHT_BOOTSTRAP_FALLBACK_IPS,
     IP_VOTE_QUORUM,
     SWARM_INFO_HASH,
     default_state_path,
     diagnostics_payload,
+    _resolve_named,
     external_address,
     run_wan_discovery,
 )
@@ -342,3 +345,46 @@ async def test_a_cold_node_does_not_announce_itself(tmp_path) -> None:
         except asyncio.CancelledError:
             pass
         transport.close()
+
+
+# --- bootstrapping without DNS ----------------------------------------------
+
+async def test_a_router_that_will_not_resolve_falls_back_to_a_literal_address(monkeypatch) -> None:
+    """A machine with no working DNS must still be able to enter the network.
+
+    Measured on a real Raspberry Pi: every public name failed to resolve and
+    outbound port 53 was refused, while UDP to the DHT answered on the first
+    try. Without a fallback that node has no entry point at all once its state
+    file is empty -- and it reports the same "no bootstrap router answered" as
+    a machine with no internet at all, so the diagnosis lands on the wrong
+    thing entirely.
+    """
+    async def _no_dns(*_a, **_kw):
+        raise OSError("Temporary failure in name resolution")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _no_dns, raising=False)
+    named = await _resolve_named(DEFAULT_DHT_BOOTSTRAP)
+
+    by_host = dict(named)
+    for host, ip in DHT_BOOTSTRAP_FALLBACK_IPS.items():
+        assert by_host[host] is not None, f"{host} had no fallback"
+        assert by_host[host][0] == ip
+    # Only the routers we actually ship an address for; the dead ones stay
+    # unresolved rather than gaining a made-up address.
+    assert [h for h, a in named if a is None] == [
+        h for h, _p in DEFAULT_DHT_BOOTSTRAP if h not in DHT_BOOTSTRAP_FALLBACK_IPS]
+
+
+async def test_dns_is_preferred_over_the_baked_in_address() -> None:
+    """The literals go stale; DNS must win whenever it answers."""
+    async def _dns(host, port, **_kw):
+        return [(socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("203.0.113.9", port))]
+
+    loop = asyncio.get_running_loop()
+    real = loop.getaddrinfo
+    loop.getaddrinfo = _dns
+    try:
+        named = await _resolve_named([("dht.transmissionbt.com", 6881)])
+    finally:
+        loop.getaddrinfo = real
+    assert named == [("dht.transmissionbt.com", ("203.0.113.9", 6881))]
