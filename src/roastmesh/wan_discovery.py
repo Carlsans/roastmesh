@@ -34,11 +34,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import random
 import socket
 import time
 from collections.abc import Awaitable, Callable
 
-from roastmesh.dht import Addr, DhtClient, LookupStats, load_node_cache, save_node_cache
+from roastmesh.dht import (
+    Addr,
+    DhtClient,
+    LookupStats,
+    bep42_node_id,
+    bep42_valid,
+    load_node_cache,
+    save_node_cache,
+)
 from roastmesh.hello import decode_hello, encode_hello
 from roastmesh.paths import data_dir
 
@@ -47,6 +57,40 @@ DHT_LOOKUP_INTERVAL_S = 120.0
 HELLO_RESYNC_S = 60.0  # minimum time between (re-)helloing the same address/peer
 HELLO_RETRIES = (0.0, 2.0, 6.0)  # see _hello_with_retries
 RETRY_INTERVAL_S = 20.0  # after a round that announced to nobody; see run_wan_discovery
+
+# Announce cadence. Storing nodes drop an announced peer after ~32 minutes
+# (dht.c's expire_storage), so re-announcing every 15 keeps us continuously
+# present with a wide margin, and the jitter stops every node on the network
+# re-announcing in lockstep.
+ANNOUNCE_INTERVAL_S = 900.0
+ANNOUNCE_JITTER = 0.1
+
+# Transmission gates its first announce on a warm routing table
+# (tr-dht.cc: is_ready) and so do we. Announcing from a cold table is how a
+# node ends up publishing itself to whichever handful of strangers answered
+# first, rather than to the k nodes actually closest to the swarm.
+WARM_GOOD_NODES = 8
+
+# Don't publish ourselves from a lookup that never reached the swarm's
+# neighbourhood. Transmission gates on its routing table because its searches
+# seed from it; ours seed from the routers and the persisted state, so the
+# equivalent -- and more direct -- condition is that the walk actually got
+# close. Measured on the live DHT, a healthy lookup lands at 2^138-2^143 and a
+# starved one stops in the 2^150s, so this sits just above the healthy band.
+ANNOUNCE_MAX_BITS = 150
+
+# Bootstrap drip, from tr-dht.cc's bootstrap_interval: ping the first few
+# quickly, then slow down. The routers rate-limit per source IP, and firing
+# all of them on every round is what earned us that limiting.
+BOOTSTRAP_FAST_COUNT = 8
+BOOTSTRAP_FAST_INTERVAL_S = 2.0
+BOOTSTRAP_SLOW_INTERVAL_S = 15.0
+
+# BEP 42: "Since a single node can not be trusted, there should be some
+# mechanism to determine whether or not the node has a correct understanding
+# of its external IP". Ours is a plain majority across distinct responders,
+# and we refuse to act on fewer than this many.
+IP_VOTE_QUORUM = 3
 
 # Deliberately still "roastnet", the project's former name. This string is not
 # a label -- it is the rendezvous point every node looks itself up under, so
@@ -70,8 +114,19 @@ DEFAULT_DHT_BOOTSTRAP: list[Addr] = [
 ]
 
 
-def default_node_cache_path():
-    return data_dir() / "dht_nodes.json"
+def default_state_path():
+    """Deliberately a new filename.
+
+    The old `dht_nodes.json` cannot be reused, and not for a format reason:
+    it was written from `stats.live_nodes`, i.e. the k nodes closest to the
+    swarm hash that answered -- which under the sybil capture this rewrite
+    fixes meant it filled up with the attacking fleet and re-seeded every
+    subsequent lookup straight back into it. Measured on this machine before
+    the fix: 36 cached nodes, 26 of them failing BEP 42. A poisoned cache
+    that survives restarts is worse than no cache, so the old file is
+    abandoned rather than migrated.
+    """
+    return data_dir() / "dht_state.json"
 
 
 async def _resolve(bootstrap_nodes: list[Addr]) -> list[Addr]:
@@ -107,6 +162,73 @@ async def _resolve(bootstrap_nodes: list[Addr]) -> list[Addr]:
     return resolved
 
 
+def external_address(client: DhtClient) -> tuple[Addr | None, str, int]:
+    """Our public address, and what the spread of answers says about the NAT.
+
+    BEP 42 asks every node to echo the querier's address back in the reply's
+    top-level `ip` field, and enough of them do: 17 independent votes on a
+    single measured lookup. Two nodes reporting two different *ports* for one
+    socket is the signature of a symmetric NAT or CGNAT -- worth surfacing
+    loudly, because it means an unsolicited hello can never arrive and no
+    amount of DHT correctness will change that. A single node is never
+    enough; the spec is explicit that one node cannot be trusted here.
+    """
+    votes = client.ip_votes
+    total = sum(votes.values())
+    if not votes or total < IP_VOTE_QUORUM:
+        return None, "unknown", total
+    best = max(votes, key=lambda claim: votes[claim])
+    return best, ("symmetric" if len({p for _ip, p in votes}) > 1 else "consistent"), total
+
+
+def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: bytes,
+                        external: Addr | None, nat: str, votes: int, warm: bool,
+                        readback: bool | None, addrs) -> dict:
+    """The single definition of the diagnostics contract.
+
+    Both producers use it -- the `wan-stats:` line `node serve` emits every
+    round, and `node doctor --json` -- so the GUI panel cannot be reading one
+    shape from one and a different shape from the other.
+    """
+    target = int.from_bytes(info_hash, "big")
+    announce_set = []
+    for addr, node_id in stats.live_nodes:
+        d = int.from_bytes(node_id, "big") ^ target
+        announce_set.append({
+            "addr": f"{addr[0]}:{addr[1]}",
+            "bits": max(d.bit_length() - 1, 0),
+            "bep42": bep42_valid(node_id, addr[0]),
+        })
+    table = client.routing_table
+    good = table.good_nodes()
+    return {
+        "external_ip": external[0] if external else None,
+        "external_port": external[1] if external else None,
+        "nat": nat,
+        "ip_votes": votes,
+        "node_id": client.own_id.hex(),
+        "node_id_bep42": bep42_valid(client.own_id, external[0]) if external else None,
+        "routing_table": {
+            "total": len(table),
+            "good": len(good),
+            "verified": sum(1 for n in good if bep42_valid(n.id, n.addr[0]) is True),
+        },
+        "warm": warm,
+        "lookup": {
+            "rounds": stats.rounds, "queried": stats.queried, "replied": stats.replied,
+            "closest_bits": stats.closest_bits, "announced": stats.announced,
+            "no_token": stats.no_token, "peers_found": stats.peers_found,
+            "rejected_martian": stats.rejected_martian,
+            "rejected_impossible_proximity": stats.rejected_impossible_proximity,
+            "rejected_bep42": stats.rejected_bep42,
+        },
+        "announce_set": announce_set,
+        "readback": readback,
+        "peers": sorted(f"{a[0]}:{a[1]}" for a in addrs),
+        "swarm_info_hash": info_hash.hex(),
+    }
+
+
 async def run_wan_discovery(
     own_pubkey_hex: str,
     own_ticket: str,
@@ -120,6 +242,7 @@ async def run_wan_discovery(
     info_hash: bytes = SWARM_INFO_HASH,
     node_cache_path=None,
     on_round: Callable[[object], None] | None = None,
+    allow_loopback: bool = False,
 ) -> None:
     """Announce on the public DHT and react to other roastmesh nodes found
     there, until cancelled. `on_peer_discovered(pubkey, ticket)` is
@@ -127,15 +250,23 @@ async def run_wan_discovery(
     same as lan_discovery.run_beacon.
 
     `bootstrap_nodes`/`port`/interval params are overridable so tests can
-    point this at a fake in-process DHT instead of the real public one.
+    point this at a fake in-process DHT instead of the real public one --
+    `allow_loopback` is there for the same reason. It must stay False in
+    production: `dht.is_martian` rejects 127.x precisely so that a hostile
+    node cannot put loopback addresses in a `nodes` blob and aim our queries
+    at whatever is listening on this machine.
     `on_round` receives each round's LookupStats (used by the logs and by
     `roastmesh net doctor`) -- without it a failing round is invisible.
     """
     bootstrap_nodes = bootstrap_nodes if bootstrap_nodes is not None else DEFAULT_DHT_BOOTSTRAP
-    cache_path = node_cache_path if node_cache_path is not None else default_node_cache_path()
-    own_id = hashlib.sha1(bytes.fromhex(own_pubkey_hex)).digest()
-    client = await DhtClient.bind(port=port, own_id=own_id)
-    node_cache = load_node_cache(cache_path)
+    state_path = node_cache_path if node_cache_path is not None else default_state_path()
+    own_seed = bytes.fromhex(own_pubkey_hex)
+    # Provisional: a conforming ID needs an external IP we have not learned
+    # yet, so we start with this and adopt the real one once the votes agree
+    # (see _maybe_adopt_node_id).
+    own_id = hashlib.sha1(own_seed).digest()
+    client = await DhtClient.bind(port=port, own_id=own_id, allow_loopback=allow_loopback)
+    state = load_node_cache(state_path)
     failed_rounds = 0
 
     last_helloed: dict[Addr, float] = {}
@@ -175,8 +306,18 @@ async def run_wan_discovery(
         for delay in HELLO_RETRIES:
             if delay:
                 await asyncio.sleep(delay)
-            if addr in _acked:
-                return
+                # Only *retries* are cancelled by an ack. The first send is
+                # unconditional, and that distinction is load-bearing: this
+                # runs as a task, so a hello from the peer can land between
+                # `_maybe_hello` recording the attempt and this coroutine
+                # first running. Checking `_acked` before the initial send
+                # then skipped it entirely -- and the reciprocal send in
+                # `_on_foreign` was already suppressed by the `last_helloed`
+                # debounce the caller had just set. The result was a node that
+                # never introduced itself to a peer whose hello arrived first,
+                # so discovery worked in exactly one direction.
+                if addr in _acked:
+                    return
             try:
                 client.send_datagram(payload, addr)
             except OSError:
@@ -205,24 +346,140 @@ async def run_wan_discovery(
 
     client.on_foreign_datagram = _on_foreign
 
+    adopted_for_ip: str | None = None
+
+    def _maybe_adopt_node_id(external: Addr | None) -> None:
+        nonlocal adopted_for_ip
+        if external is None or external[0] == adopted_for_ip:
+            return
+        adopted_for_ip = external[0]
+        if bep42_valid(client.own_id, external[0]) is True:
+            return
+        if client.adopt_node_id(bep42_node_id(external[0], own_seed)):
+            print(f"wan: adopted a BEP 42 node id for external ip {external[0]}", flush=True)
+
+    async def _bootstrap_loop() -> None:
+        """Feed the routing table from the routers, slowly.
+
+        tr-dht.cc drips its bootstrap queue in rather than firing the whole
+        list at once, and the reason applies here with force: the surviving
+        routers rate-limit per source IP, and hammering all four on every
+        round is what earns that limiting. Stops entirely once the table is
+        warm, which after the first successful search it always is.
+        """
+        added = 0
+        queue: list[Addr] = []
+        while True:
+            if client._transport.is_closing():
+                return
+            if len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES:
+                await asyncio.sleep(BOOTSTRAP_SLOW_INTERVAL_S)
+                continue
+            if not queue:
+                queue = list(dict.fromkeys([*await _resolve(bootstrap_nodes), *state]))
+            if not queue:
+                await asyncio.sleep(BOOTSTRAP_SLOW_INTERVAL_S)
+                continue
+            try:
+                await client.bootstrap_ping(queue.pop(0))
+            except OSError:
+                pass
+            # Adopt here, not only at the top of a lookup round. Taking up a
+            # BEP 42 identity rebuilds the routing table (its bucket boundaries
+            # are all relative to the old ID), so it wants to happen while the
+            # table is still nearly empty. Rounds are minutes apart, and by the
+            # time one comes around there is a warm table to throw away --
+            # whereas the routers answering this drip supply the votes within
+            # seconds of startup.
+            _maybe_adopt_node_id(external_address(client)[0])
+            added += 1
+            await asyncio.sleep(BOOTSTRAP_FAST_INTERVAL_S if added < BOOTSTRAP_FAST_COUNT
+                                else BOOTSTRAP_SLOW_INTERVAL_S)
+
+    async def _seeds() -> list[Addr]:
+        return list(dict.fromkeys([*await _resolve(bootstrap_nodes), *state]))
+
+    async def _readback(external: Addr | None) -> bool | None:
+        """Ground truth: having announced, can a fresh lookup actually find us?
+
+        Every other signal here can read green while discovery is completely
+        broken -- which is exactly how the sybil capture survived several
+        releases, with `node doctor` reporting a converged lookup and a
+        successful announce into a black hole. This asks the only question
+        that actually matters, and it is the check whose absence let all of
+        that go unnoticed.
+        """
+        if external is None:
+            return None
+        seeds = await _seeds()
+        if not seeds:
+            return None
+        try:
+            found = await client.discover_and_announce_peers(
+                info_hash, seeds, seed_ids=dict(state), stats=LookupStats(), announce=False,
+            )
+        except Exception:  # noqa: BLE001 -- a failed probe is "unknown", not a crash
+            return None
+        return external in found
+
+    bootstrap_task = asyncio.create_task(_bootstrap_loop())
+    next_announce_at = 0.0
+
     try:
         while True:
             stats = LookupStats()
+            readback: bool | None = None
+            external, nat, votes = external_address(client)
+            _maybe_adopt_node_id(external)
+            warm = len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES
+            # "Due" is all the caller can judge up front; whether the lookup
+            # actually got near the swarm is only known once it has run, so
+            # that half is `announce_if` below. Gating on the routing table
+            # instead looked right and was not: measured live, a node whose
+            # lookups were converging perfectly to 2^140 sat there for five
+            # minutes refusing to announce, because the table it was being
+            # judged on is not what those lookups seed from.
+            announce = time.monotonic() >= next_announce_at
+            addrs: set = set()
             try:
-                resolved = await _resolve(bootstrap_nodes)
-                seeds = list(dict.fromkeys([*resolved, *node_cache]))
-                addrs = await client.discover_and_announce_peers(
-                    info_hash, seeds, seed_ids=dict(node_cache), stats=stats,
-                ) if seeds else set()
+                seeds = await _seeds()
+                if seeds:
+                    addrs = await client.discover_and_announce_peers(
+                        info_hash, seeds, seed_ids=dict(state), stats=stats, announce=announce,
+                        announce_if=lambda st: (st.closest_bits is not None
+                                                and st.closest_bits <= ANNOUNCE_MAX_BITS),
+                    )
             except Exception as exc:  # noqa: BLE001 -- a bad DHT round shouldn't kill serve()
                 # Previously swallowed silently, which is how a permanently
                 # broken feature stayed invisible through several releases.
                 print(f"wan: DHT round failed: {exc!r}", flush=True)
-                addrs = set()
             else:
-                node_cache.update(dict(stats.live_nodes))
-                save_node_cache(cache_path, node_cache)
+                # Persist good, *diverse* routing-table nodes -- not the k
+                # closest to the swarm hash, which is what the old cache saved
+                # and precisely what a sybil fleet controls.
+                state.update({n.addr: n.id for n in client.routing_table.good_nodes()})
+                save_node_cache(state_path, state)
+                if announce and stats.announced > 0:
+                    next_announce_at = time.monotonic() + ANNOUNCE_INTERVAL_S * (
+                        1.0 + random.uniform(-ANNOUNCE_JITTER, ANNOUNCE_JITTER))
+                    # Re-read the address here rather than reusing the one from
+                    # the top of the round: the lookup we just ran is usually
+                    # what pushed the vote count over the quorum, so the value
+                    # captured beforehand is still None on exactly the round
+                    # that first announces -- and the check would quietly never
+                    # run at all. Measured: announced to 5, read-back "None".
+                    external, _nat, _votes = external_address(client)
+                    readback = await _readback(external)
                 print(f"wan: {stats.summary()}", flush=True)
+
+            external, nat, votes = external_address(client)
+            print("wan-stats: " + json.dumps(diagnostics_payload(
+                client, stats, info_hash=info_hash, external=external, nat=nat, votes=votes,
+                # Recomputed, not the pre-lookup value: the round we just ran is
+                # what fills the routing table, so reporting the count from
+                # before it makes a healthy node read as permanently cold.
+                warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
+                readback=readback, addrs=addrs)), flush=True)
             if on_round is not None:
                 on_round(stats)
             for addr in addrs:
@@ -231,13 +488,11 @@ async def run_wan_discovery(
             # Retry sooner when a round achieved nothing, instead of sitting
             # out the full interval. Measured: a healthy first round makes a
             # brand-new node discoverable by a stranger in under 15 seconds --
-            # but a round where no node accepted the announcement (the routers
-            # answer `get_peers` without a token, so a cold start can land
-            # there) left the node invisible for the whole 120s until the next
-            # one. The average was never the problem; that worst case was.
-            # Backs off to the normal interval as soon as a round succeeds, so
-            # steady-state traffic is unchanged.
-            if stats.announced > 0:
+            # but a round that reached nobody left the node invisible for the
+            # whole 120s until the next one. The average was never the problem;
+            # that worst case was. Backs off to the normal interval as soon as
+            # a round succeeds, so steady-state traffic is unchanged.
+            if stats.replied > 0:
                 failed_rounds = 0
                 delay = lookup_interval_s
             else:
@@ -245,4 +500,11 @@ async def run_wan_discovery(
                 delay = min(retry_interval_s * (2 ** (failed_rounds - 1)), lookup_interval_s)
             await asyncio.sleep(delay)
     finally:
+        # Cancelled, never awaited. Awaiting it here deadlocks: this coroutine
+        # is itself usually being cancelled at this point, so the await raises
+        # CancelledError, and catching that to "clean up tidily" means the task
+        # silently refuses to die -- `node serve` then hangs forever on
+        # shutdown. The race that made awaiting tempting (a drip mid-send when
+        # the socket closes) is handled in DhtClient.send_datagram instead.
+        bootstrap_task.cancel()
         client.close()

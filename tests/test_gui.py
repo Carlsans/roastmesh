@@ -1066,3 +1066,62 @@ print("OK")
     unbound = [line for line in r.stdout.splitlines()
                if line.startswith("BOUND") and line.endswith("False")]
     assert not unbound, f"scale shortcuts not bound at startup: {unbound}"
+
+
+def test_network_tab_renders_a_wan_stats_line_from_the_serve_stream(tmp_path: Path) -> None:
+    """The live half of the diagnostics panel.
+
+    `wan-stats:` is the second CLI->GUI text contract after `ticket: `, and it
+    is what makes the panel free: the serving process has already computed
+    these numbers every round, so the GUI reads them off its output instead of
+    spawning a process per refresh. If the prefix or the key names drift, the
+    panel silently shows "waiting..." forever -- which is precisely the kind of
+    quiet nothing this whole feature exists to eliminate.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+
+    payload = json.dumps({
+        "external_ip": "209.227.189.65", "external_port": 48973,
+        "nat": "symmetric", "ip_votes": 17, "node_id": "cd" * 20,
+        "node_id_bep42": True,
+        "routing_table": {"total": 40, "good": 30, "verified": 21},
+        "warm": True,
+        "lookup": {"rounds": 14, "queried": 47, "replied": 15, "closest_bits": 140,
+                   "announced": 8, "no_token": 0, "peers_found": 1,
+                   "rejected_martian": 0, "rejected_impossible_proximity": 3,
+                   "rejected_bep42": 29},
+        "announce_set": [{"addr": "1.2.3.4:6881", "bits": 140, "bep42": True}],
+        "readback": False, "peers": ["5.6.7.8:41890"],
+        "swarm_info_hash": "22" * 20,
+    })
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+os.environ["USERPROFILE"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.update()
+tab = app.network_tab
+assert tab.diag_vars["status"].get(), "no placeholder text"
+tab._on_serve_output("wan-stats: " + {payload!r} + chr(10))
+app.update()
+print("STATUS", tab.diag_vars["status"].get())
+print("EXTERNAL", tab.diag_vars["external"].get())
+print("NAT", tab.diag_vars["nat"].get())
+print("REJECTED", tab.diag_vars["rejected"].get())
+print("FINDABLE", tab.diag_vars["findable"].get())
+print("PEERS", tab.diag_vars["peers"].get())
+app.destroy()
+""")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "209.227.189.65:48973" in r.stdout
+    assert "17" in r.stdout
+    # A symmetric NAT outranks everything else in the status line: it is the
+    # one condition no DHT fix can rescue.
+    assert "blocked by this network" in r.stdout
+    assert "carrier-grade" in r.stdout
+    assert "3" in r.stdout and "29" in r.stdout
+    assert "could not find us" in r.stdout
+    assert "5.6.7.8:41890" in r.stdout

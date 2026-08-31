@@ -869,6 +869,7 @@ class NetworkTab(Tab):
         super().__init__(parent, app)
         self.serve_task: Task | None = None
         self.sync_task: Task | None = None
+        self.diag_task: Task | None = None
         self._closed = False
 
         heading(self, t("Network"), t("Serve your feed to peers, and pull theirs."))
@@ -897,6 +898,36 @@ class NetworkTab(Tab):
         self.sync_runbar = RunBar(sync_section, t("Sync"), self._on_sync, self._on_cancel_sync)
         self.sync_console = Console(sync_section, height=4)
 
+        diag_section = section(self, t("Internet discovery"))
+        explain(diag_section, t(
+            "Finding peers beyond your local network relies on the public BitTorrent DHT, "
+            "and it is the one part of roastmesh that can fail completely while looking "
+            "like it is working. These numbers update on their own while serving; "
+            "\"Run a full check\" does a deeper one-off test that takes about a minute."))
+        grid = ttk.Frame(diag_section)
+        grid.pack(fill="x", padx=10, pady=(0, 6))
+        self.diag_vars: dict[str, tk.StringVar] = {}
+        for row, (key, label) in enumerate((
+            ("status", t("Status")),
+            ("external", t("This node, from outside")),
+            ("nat", t("Your network")),
+            ("table", t("Known DHT nodes")),
+            ("lookup", t("Last lookup")),
+            ("rejected", t("Forged nodes turned away")),
+            ("announce", t("Published to")),
+            ("findable", t("Findable by others")),
+            ("peers", t("Peers on the swarm")),
+        )):
+            tk.Label(grid, text=label + ":", font=FONT_BOLD, bg=BG, fg=FG).grid(
+                row=row, column=0, sticky="nw", padx=(0, 8), pady=1)
+            var = tk.StringVar(value=t("waiting..."))
+            self.diag_vars[key] = var
+            tk.Label(grid, textvariable=var, bg=BG, fg=MUTED, anchor="w",
+                     justify="left", wraplength=520).grid(row=row, column=1, sticky="w", pady=1)
+        self.diag_runbar = RunBar(diag_section, t("Run a full check"),
+                                  self._on_diag, self._on_cancel_diag)
+        self.diag_console = Console(diag_section, height=3)
+
         peers_section = section(self, t("Known peers"))
         self.peers_table = PeerTable(peers_section)
 
@@ -909,6 +940,8 @@ class NetworkTab(Tab):
             self.serve_task.cancel()
         if self.sync_task is not None:
             self.sync_task.cancel()
+        if self.diag_task is not None:
+            self.diag_task.cancel()
 
     # Every tick shells out to a whole new `roastmesh peer list` process (see
     # gui/runner.py's docstring for why the GUI shells out at all) -- cheap
@@ -972,6 +1005,16 @@ class NetworkTab(Tab):
             if line.startswith("ticket: "):
                 self.ticket_var.set(line[len("ticket: "):].strip())
                 self.serve_runbar.set_running(True, t("serving"))
+            # The second CLI->GUI text contract, same shape as "ticket: " and
+            # for the same reason: the diagnostics are already computed inside
+            # the serving process every round, so reading them off its output
+            # costs nothing, where polling would mean a whole extra process
+            # per refresh (see _refresh_peers' note on that cost).
+            elif line.startswith("wan-stats: "):
+                try:
+                    self._apply_diagnostics(json.loads(line[len("wan-stats: "):]))
+                except (ValueError, TypeError, KeyError):
+                    pass
 
     def _on_stop_serve(self) -> None:
         if self.serve_task is not None:
@@ -1005,6 +1048,102 @@ class NetworkTab(Tab):
     def _on_sync_finished(self, code: int) -> None:
         self.sync_runbar.set_running(False, t("done") if code == 0 else _exited_with_code(code))
         self._refresh_peers()
+
+    def _on_diag(self) -> None:
+        if self.diag_task is not None and self.diag_task.running:
+            return
+        argv = roastmesh_argv("node", "doctor", "--json")
+        self.diag_console.clear()
+        self.diag_console.set_command(describe(argv))
+        buf: list[str] = []
+        self.diag_task = Task(argv=argv)
+        self.diag_runbar.set_running(True, t("checking..."))
+        self.diag_task.start()
+        stream_into(self.diag_task, buf.append,
+                    lambda code: self._diag_finished(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_cancel_diag(self) -> None:
+        if self.diag_task is not None:
+            self.diag_task.cancel()
+
+    def _diag_finished(self, code: int, buf: list[str]) -> None:
+        self.diag_runbar.set_running(False, t("done") if code == 0 else _exited_with_code(code))
+        try:
+            self._apply_diagnostics(parse_json_output("".join(buf)))
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+            self.diag_console.append(t("could not read the diagnostic report") + "\n")
+
+    def _apply_diagnostics(self, r: dict) -> None:
+        """Render one diagnostics payload -- from the live `wan-stats:` line or
+        from `node doctor --json`, which emit the same keys by construction
+        (wan_discovery.diagnostics_payload)."""
+        v = self.diag_vars
+        lookup = r.get("lookup") or {}
+        closest = lookup.get("closest_bits")
+        readback = r.get("readback")
+        nat = r.get("nat")
+
+        if r.get("external_ip"):
+            v["external"].set("{}:{}  {}".format(
+                r["external_ip"], r.get("external_port"),
+                t("({n} independent reports agree)", n=r.get("ip_votes", 0))))
+        else:
+            v["external"].set(t("unknown -- not enough nodes have reported it back yet"))
+
+        if nat == "symmetric":
+            v["nat"].set(t("symmetric or carrier-grade NAT -- other nodes cannot open a "
+                            "connection to you, so internet discovery cannot work here. "
+                            "LAN peers and pasted tickets still work."))
+        elif nat == "consistent":
+            v["nat"].set(t("consistent mapping -- other nodes can reach this port"))
+        else:
+            v["nat"].set(t("not known yet"))
+
+        table = r.get("routing_table") or {}
+        v["table"].set(t("{good} good of {total}, {verified} identity-verified",
+                          good=table.get("good", 0), total=table.get("total", 0),
+                          verified=table.get("verified", 0)))
+
+        v["lookup"].set(t("{rounds} rounds, {replied} of {queried} answered, closest {closest}",
+                           rounds=lookup.get("rounds", 0), replied=lookup.get("replied", 0),
+                           queried=lookup.get("queried", 0),
+                           closest=("-" if closest is None else "2^{}".format(closest))))
+
+        v["rejected"].set(t("{forged} forging closeness, {bep42} unverifiable, {martian} unroutable",
+                             forged=lookup.get("rejected_impossible_proximity", 0),
+                             bep42=lookup.get("rejected_bep42", 0),
+                             martian=lookup.get("rejected_martian", 0)))
+
+        announce_set = r.get("announce_set") or []
+        verified = sum(1 for a in announce_set if a.get("bep42") is True)
+        v["announce"].set(t("{announced} node(s); {verified} of the {total} closest are verified",
+                             announced=lookup.get("announced", 0), verified=verified,
+                             total=len(announce_set)))
+
+        if readback is True:
+            v["findable"].set(t("yes -- a fresh lookup found this node's own address"))
+        elif readback is False:
+            v["findable"].set(t("NO -- we published, but a fresh lookup could not find us"))
+        else:
+            v["findable"].set(t("not checked yet"))
+
+        peers = r.get("peers") or []
+        v["peers"].set(", ".join(peers) if peers else t("none advertised right now"))
+
+        if nat == "symmetric":
+            status = t("blocked by this network")
+        elif readback is True:
+            status = t("healthy -- reachable and findable")
+        elif readback is False:
+            status = t("published, but not findable")
+        elif closest is not None and closest > 150:
+            status = t("not converging -- cannot reach the swarm")
+        elif not r.get("warm", True):
+            status = t("warming up")
+        else:
+            status = t("running")
+        v["status"].set(status)
 
     def _refresh_peers(self) -> None:
         buf: list[str] = []

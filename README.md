@@ -221,14 +221,26 @@ Two independent, both opt-out-able, layers on top of manual ticket-pasting:
   Finding the swarm is an *iterative* lookup: peers for an identifier are held only by the
   handful of DHT nodes numerically closest to it, so each round asks the closest nodes known so
   far and repeats until it can get no closer, then publishes to exactly those. Nodes that answer
-  are remembered in `~/.local/share/roastmesh/dht_nodes.json`, which matters more than it sounds —
+  are remembered in `~/.local/share/roastmesh/dht_state.json`, which matters more than it sounds —
   most of the historically-cited bootstrap routers no longer answer at all, so after the first
   successful round a node stops depending on them. Expect the first lookup after a fresh install
   to be the weakest one.
 
-  **If it isn't working, ask it why**: `roastmesh node doctor` reports which routers answered, how
-  close the lookup got, and how many nodes accepted the announcement, instead of leaving you to
-  guess.
+  **Not every node that answers is honest.** The neighbourhood of any given identifier is
+  occupied by nodes that forge their IDs to sit next to whatever is being looked up, answer
+  instantly, and hand back invented peer addresses — measured live, they filled all eight of the
+  closest slots and were the entire reason internet discovery did not work. roastmesh verifies
+  that a node's ID is derived from its own IP ([BEP 42][bep42]) before it can join a lookup near
+  the target or receive an announcement, and refuses any claim of closeness no honest node could
+  hold. Filtered, the same lookup reaches the genuine neighbourhood instead.
+
+  [bep42]: https://www.bittorrent.org/beps/bep_0042.html
+
+  **If it isn't working, ask it why**: `roastmesh node doctor` reports which routers answered,
+  your address as other nodes see it, whether your NAT will let anyone reach you at all, how
+  close the lookup got, how many forged nodes were turned away, and — the only question that
+  really matters — whether a fresh lookup can actually find this node after it publishes itself.
+  `--json` emits the same report for tooling; the GUI's Network tab shows it live.
 
   **The trade-off, worth knowing**: a LAN broadcast never leaves your local network, but
   announcing on the public DHT makes your node's public IP address (and the fact that it's

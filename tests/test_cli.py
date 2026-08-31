@@ -648,3 +648,79 @@ def test_json_output_is_pure_json_even_on_the_run_that_creates_the_identity(
 
     # the notice still has to reach the user -- on stderr, where it belongs
     assert "created new identity" in result.stderr
+
+
+# --- node doctor's rendering ------------------------------------------------
+
+def _doctor_report(**over) -> dict:
+    report = {
+        "identity": "ab" * 32, "node_id": "cd" * 20, "node_id_bep42": True,
+        "state_path": "/tmp/dht_state.json", "state_nodes": 12,
+        "bootstrap": [{"host": "dht.transmissionbt.com", "addr": "87.98.162.88:6881",
+                       "ok": True}],
+        "bootstrap_unresolved": 0, "announced_this_run": True,
+        "external_ip": "209.227.189.65", "external_port": 48973,
+        "nat": "consistent", "ip_votes": 17,
+        "routing_table": {"total": 40, "good": 30, "verified": 21}, "warm": True,
+        "lookup": {"rounds": 14, "queried": 47, "replied": 15, "closest_bits": 140,
+                   "announced": 8, "no_token": 0, "peers_found": 1,
+                   "rejected_martian": 0, "rejected_impossible_proximity": 0,
+                   "rejected_bep42": 29},
+        "announce_set": [{"addr": "1.2.3.4:6881", "bits": 140, "bep42": True}],
+        "readback": True, "peers": ["5.6.7.8:41890"],
+        "swarm_info_hash": "22" * 20,
+    }
+    report.update(over)
+    return report
+
+
+def _render(report: dict) -> str:
+    from click.testing import CliRunner
+
+    from roastmesh.cli import _print_doctor_report
+
+    runner = CliRunner()
+    with runner.isolation() as out:
+        _print_doctor_report(report)
+        return out[0].getvalue().decode()
+
+
+def test_doctor_reports_a_healthy_node_without_warnings() -> None:
+    text = _render(_doctor_report())
+    assert "209.227.189.65:48973" in text
+    assert "consistent mapping" in text
+    assert "read-back: OK" in text
+    assert "WARNING" not in text
+
+
+def test_doctor_calls_out_a_symmetric_nat_as_a_network_limit_not_a_dht_fault() -> None:
+    """The single most useful thing this command can tell a user who has
+    "connected but finds nobody": no amount of DHT correctness will help,
+    because nothing can send them a first packet."""
+    text = _render(_doctor_report(nat="symmetric"))
+    assert "carrier-grade NAT" in text
+    assert "not a DHT fault" in text
+
+
+def test_doctor_warns_when_the_announce_set_contains_an_unverified_node() -> None:
+    text = _render(_doctor_report(
+        announce_set=[{"addr": "1.2.3.4:6881", "bits": 40, "bep42": False}]))
+    assert "UNVERIFIED" in text
+    assert "WARNING" in text
+
+
+def test_doctor_warns_when_the_lookup_reaches_an_impossible_distance() -> None:
+    """A lookup that lands closer than any honest node can be is the exact
+    signature of the sybil capture this release fixes -- if it ever shows up
+    again, the filters have been defeated and the report must say so rather
+    than presenting a suspiciously excellent convergence as good news."""
+    report = _doctor_report()
+    report["lookup"]["closest_bits"] = 38
+    text = _render(report)
+    assert "no honest node can occupy" in text
+
+
+def test_doctor_reports_a_failed_read_back_as_a_failure() -> None:
+    text = _render(_doctor_report(readback=False))
+    assert "read-back: FAILED" in text
+    assert "will not find us" in text

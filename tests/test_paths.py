@@ -70,7 +70,12 @@ def test_the_real_modules_route_through_the_resolver(monkeypatch, tmp_path: Path
     assert peers.default_peers_path() == legacy / "peers.json"
     assert db.default_db_path() == legacy / "index.sqlite3"
     assert gui_config.config_path() == legacy / "gui_config.json"
-    assert wan_discovery.default_node_cache_path() == legacy / "dht_nodes.json"
+    # dht_state.json, deliberately not the old dht_nodes.json: that file was
+    # filled from the k-closest-to-the-swarm responders, so a sybil fleet
+    # ended up owning it and re-seeding every lookup back into itself.
+    assert wan_discovery.default_state_path() == legacy / "dht_state.json"
+    assert not hasattr(wan_discovery, "default_node_cache_path"), (
+        "the poisoned cache path must not come back")
     assert identity.default_identity_path() == home / ".config" / "roastnet" / "identity.json"
     # watch_folder has no legacy dir here, so it should take the new name
     assert watch_folder.default_watch_dir() == home / "RoastMeshShare"

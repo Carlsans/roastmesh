@@ -7,17 +7,44 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import secrets
 import socket
+import time
 
 import pytest
 
 from roastmesh.dht import (
+    ANNOUNCE_LIVE_COUNT,
+    BEP42_CONTESTED_ZONE_THRESHOLD,
+    BUCKET_MAX_COUNT,
+    IMPOSSIBLE_PROXIMITY_THRESHOLD,
+    K,
+    NODE_EVICT_IDLE_S,
+    NODE_EVICT_PINGED,
+    PEER_EXPIRY_S,
+    RATE_LIMIT_CAPACITY,
+    SEARCH_NODES,
+    TOKEN_SIZE,
+    Blacklist,
     DhtClient,
+    Node,
+    PeerStore,
+    RoutingTable,
+    Search,
+    TokenBucket,
+    TokenSecrets,
     bdecode,
     bencode,
+    bep42_node_id,
+    bep42_valid,
+    crc32c,
     decode_compact_nodes,
     decode_compact_peers,
+    distance,
     encode_compact_addr,
+    is_martian,
+    make_token,
+    token_valid,
 )
 
 
@@ -55,6 +82,402 @@ def test_compact_peer_and_node_roundtrip() -> None:
     node_id = b"x" * 20
     nodes_blob = node_id + encode_compact_addr(addr)
     assert decode_compact_nodes(nodes_blob) == [(node_id, addr)]
+
+
+# =============================================================================
+# Phase A: pure functions -- BEP 42 node IDs, address hygiene, tokens.
+# =============================================================================
+
+# The spec's own published test vectors (BEP 42), not anything derived from
+# our own implementation -- bold prefix is crc-derived, last byte is `rand`.
+_BEP42_VECTORS = [
+    ("124.31.75.21", 1, "5fbfbff10c5d6a4ec8a88e4c6ab4c28b95eee401"),
+    ("21.75.31.124", 86, "5a3ce9c14e7a08645677bbd1cfe7d8f956d53256"),
+    ("65.23.51.170", 22, "a5d43220bc8f112a3d426c84764f8c2a1150e616"),
+    ("84.124.73.14", 65, "1b0321dd1bb1fe518101ceef99462b947a01ff41"),
+    ("43.213.53.83", 90, "e56f6cbf5b7c4be0237986d5243b87aa6d51305a"),
+]
+
+
+@pytest.mark.parametrize("ip, rand, expected_hex", _BEP42_VECTORS)
+def test_bep42_spec_vectors_verify(ip, rand, expected_hex) -> None:
+    node_id = bytes.fromhex(expected_hex)
+    assert node_id[19] == rand
+    assert bep42_valid(node_id, ip) is True
+
+
+@pytest.mark.parametrize("ip, rand, expected_hex", _BEP42_VECTORS)
+def test_bep42_flipping_a_bit_in_the_first_21_bits_invalidates(ip, rand, expected_hex) -> None:
+    node_id = bytearray(bytes.fromhex(expected_hex))
+    node_id[0] ^= 0x01  # id[0] is entirely inside the checked 21 bits
+    assert bep42_valid(bytes(node_id), ip) is False
+
+
+@pytest.mark.parametrize("ip, rand, expected_hex", _BEP42_VECTORS)
+def test_bep42_changing_only_the_random_middle_bytes_stays_valid(ip, rand, expected_hex) -> None:
+    node_id = bytearray(bytes.fromhex(expected_hex))
+    node_id[5] ^= 0xFF   # inside id[3..18] -- the spec leaves these unconstrained
+    node_id[10] ^= 0xFF
+    assert bep42_valid(bytes(node_id), ip) is True
+
+
+def test_bep42_exempt_for_private_and_loopback_addresses() -> None:
+    # None (exempt), not False -- the spec exempts non-routable addresses,
+    # and a caller that conflates the two would wrongly reject every RFC1918
+    # peer instead of just not requiring conformance from them.
+    random_id = secrets.token_bytes(20)
+    for ip in ("10.1.2.3", "172.20.0.5", "192.168.1.1", "127.0.0.1", "0.1.2.3"):
+        assert bep42_valid(random_id, ip) is None
+
+
+def test_bep42_node_id_round_trips_and_is_stable() -> None:
+    seed = b"a roastmesh identity's ed25519 pubkey (36-byte stand-in)"
+    ip = "198.51.100.42"
+    node_id = bep42_node_id(ip, seed)
+    assert bep42_valid(node_id, ip) is True
+    assert bep42_node_id(ip, seed) == node_id          # stable across calls
+    assert bep42_node_id(ip, seed + b"x") != node_id   # different identity -> different id
+
+
+def test_is_martian_matches_dht_c_rules() -> None:
+    assert is_martian(("203.0.113.5", 0)) is True          # port 0
+    assert is_martian(("0.1.2.3", 6881)) is True            # 0.x
+    assert is_martian(("127.0.0.1", 6881)) is True          # loopback
+    assert is_martian(("224.0.0.1", 6881)) is True          # multicast
+    assert is_martian(("255.255.255.255", 6881)) is True    # top 3 bits set (0xE0)
+    assert is_martian(("203.0.113.5", 6881)) is False       # an ordinary routable address
+    assert is_martian(("10.0.0.5", 6881)) is False           # RFC1918 -- BEP42-exempt, not martian
+
+
+def test_blacklist_is_an_lru_of_bounded_size() -> None:
+    bl = Blacklist(capacity=3)
+    addrs = [(f"203.0.113.{i}", 6881) for i in range(4)]
+    for a in addrs[:3]:
+        bl.add(a)
+    assert all(a in bl for a in addrs[:3])
+    bl.add(addrs[3])  # evicts the oldest (addrs[0])
+    assert addrs[0] not in bl
+    assert all(a in bl for a in addrs[1:])
+    assert len(bl) == 3
+
+
+def test_make_token_is_deterministic_and_address_bound() -> None:
+    secret = b"s3cr3t-0123456789"
+    addr = ("203.0.113.5", 6881)
+    t1 = make_token(addr, secret)
+    assert make_token(addr, secret) == t1 and len(t1) == TOKEN_SIZE
+    assert make_token(("203.0.113.6", 6881), secret) != t1
+    assert make_token(addr, b"a-different-secret") != t1
+
+
+def test_token_valid_accepts_current_and_previous_secret_only() -> None:
+    addr = ("203.0.113.5", 6881)
+    current, previous, stale = b"c" * 20, b"p" * 20, b"s" * 20
+    tok = make_token(addr, previous)
+    assert token_valid(tok, addr, current, previous) is True
+    assert token_valid(tok, addr, current, None) is False   # no grace secret offered
+    assert token_valid(tok, addr, current, stale) is False  # wrong previous secret
+
+
+def test_token_secrets_rotate_on_schedule_and_grant_grace() -> None:
+    owned = TokenSecrets(now=0.0)
+    addr = ("203.0.113.5", 6881)
+    tok = owned.make(addr, now=0.0)
+    assert owned.valid(tok, addr, now=100.0) is True  # well before rotation
+
+    rotated_at = owned._next_rotation
+    # Past the rotation boundary, the *old* token is still honoured once --
+    # this is the grace window; without it every token issued in the
+    # seconds before a rotation would be refused on the announce_peer it
+    # was meant to authorize.
+    assert owned.valid(tok, addr, now=rotated_at + 1.0) is True
+    fresh = owned.make(addr, now=rotated_at + 1.0)
+    assert fresh != tok
+
+    next_rotation = owned._next_rotation
+    assert next_rotation > rotated_at
+    # A second rotation retires the secret that granted the earlier grace.
+    assert owned.valid(tok, addr, now=next_rotation + 1.0) is False
+
+
+# =============================================================================
+# Phase B: RoutingTable admission.
+# =============================================================================
+
+def test_routing_table_rejects_self() -> None:
+    own_id = secrets.token_bytes(20)
+    table = RoutingTable(own_id)
+    assert table.new_node(own_id, ("203.0.113.1", 6881), confirm=2) is None
+    assert len(table) == 0
+
+
+def test_routing_table_dedupe_by_id_updates_address() -> None:
+    own_id = secrets.token_bytes(20)
+    table = RoutingTable(own_id)
+    node_id = secrets.token_bytes(20)
+    first = table.new_node(node_id, ("203.0.113.1", 6881), confirm=2, now=1000.0)
+    assert first is not None and first.addr == ("203.0.113.1", 6881)
+
+    moved = table.new_node(node_id, ("203.0.113.2", 6882), confirm=2, now=1001.0)
+    assert moved is first                        # same slot, not a duplicate
+    assert moved.addr == ("203.0.113.2", 6882)    # address updated in place
+    assert len(table) == 1
+
+
+def test_routing_table_rejects_martian_and_blacklisted_addresses() -> None:
+    own_id = secrets.token_bytes(20)
+    table = RoutingTable(own_id, allow_loopback=False)  # the real dht.c rule, loopback included
+    for addr in [("127.0.0.1", 6881), ("0.1.2.3", 6881), ("203.0.113.9", 0), ("224.0.0.1", 6881)]:
+        assert table.new_node(secrets.token_bytes(20), addr, confirm=2) is None
+    assert len(table) == 0
+
+    good_addr = ("203.0.113.9", 6881)
+    assert table.new_node(secrets.token_bytes(20), good_addr, confirm=2) is not None
+    table.blacklist.add(good_addr)
+    assert table.new_node(secrets.token_bytes(20), good_addr, confirm=2) is None  # blacklisted now
+
+
+def test_routing_table_full_bucket_pings_a_dubious_node_instead_of_evicting() -> None:
+    own_id = b"\x00" * 20
+    table = RoutingTable(own_id, allow_loopback=True)
+    # Fill the (only, own) bucket to capacity. The first one is planted with
+    # an old reply_time so it's gone dubious (node_good() false) by the time
+    # we probe the table again; the rest stay fresh/good.
+    ids = [secrets.token_bytes(20) for _ in range(BUCKET_MAX_COUNT)]
+    for i, node_id in enumerate(ids):
+        confirm_time = 1000.0 if i == 0 else 9000.0
+        table.new_node(node_id, ("203.0.113.1", 20000 + i), confirm=2, now=confirm_time)
+    assert len(table) == BUCKET_MAX_COUNT
+
+    pinged: list[Node] = []
+    table._on_dubious = pinged.append  # phase D's real UDP ping hooks in here
+    result = table.new_node(secrets.token_bytes(20), ("203.0.113.2", 30000), confirm=0, now=9000.0)
+
+    assert result is None                     # bucket stayed full -- newcomer not admitted
+    assert len(table) == BUCKET_MAX_COUNT     # nobody evicted
+    assert [n.id for n in pinged] == [ids[0]]  # exactly the stale one was chosen
+    assert pinged[0].pinged == 1
+
+
+def test_routing_table_splits_its_own_bucket_when_full_of_good_nodes() -> None:
+    own_id = b"\x00" * 20  # top bit 0
+    table = RoutingTable(own_id, allow_loopback=True)
+    # Every planted ID has its top bit set to 1 -- the opposite of our own --
+    # so the routing table's first-ever split (always at the MSB) puts all
+    # eight on the far side, deterministically freeing our own bucket for
+    # the newcomer rather than depending on random luck to avoid re-filling it.
+    for i in range(BUCKET_MAX_COUNT):
+        node_id = bytes([0x80]) + secrets.token_bytes(19)
+        table.new_node(node_id, ("203.0.113.1", 20000 + i), confirm=2, now=1000.0)
+    assert len(table._buckets) == 1
+    assert len(table) == BUCKET_MAX_COUNT
+
+    newcomer = bytes([0x00]) + secrets.token_bytes(19)  # top bit 0 -- our side
+    result = table.new_node(newcomer, ("203.0.113.2", 30000), confirm=2, now=1000.0)
+
+    assert result is not None and result.id == newcomer
+    assert len(table._buckets) == 2
+    assert len(table) == BUCKET_MAX_COUNT + 1
+    # Halved on the split, per dht.c: the space around our own ID is held to
+    # Kademlia's replication factor, not left at the coarse bucket's width.
+    assert [b.max_count for b in table._buckets] == [BUCKET_MAX_COUNT // 2] * 2
+
+
+# =============================================================================
+# Phase B: Search admission -- the filters that are the actual fix.
+# =============================================================================
+
+def test_search_keeps_at_most_search_nodes_slots_sorted_by_distance() -> None:
+    target = secrets.token_bytes(20)
+    search = Search(target)
+    for i in range(SEARCH_NODES + 5):
+        search.insert(secrets.token_bytes(20), ("203.0.113.1", 20000 + i), replied=False)
+    assert len(search._nodes) == SEARCH_NODES
+    dists = [search._dist(n.id) for n in search._nodes]
+    assert dists == sorted(dists)
+
+
+def test_search_rejects_martian_addresses_in_strict_mode() -> None:
+    """`allow_loopback` (default True -- see RoutingTable._martian) exists
+    only to let this repo's in-process test harnesses exercise real UDP
+    traffic over loopback; the underlying rule is still there and is what
+    a production node (which never opts into allow_loopback) actually
+    runs. `allow_loopback=False` here is what exercises it directly."""
+    target = secrets.token_bytes(20)
+    search = Search(target, allow_loopback=False)
+    assert search.insert(secrets.token_bytes(20), ("127.0.0.1", 6881), replied=True) is None
+    assert search.rejected_martian == 1
+
+
+def test_search_rejects_impossible_proximity_and_blacklists() -> None:
+    target = secrets.token_bytes(20)
+    search = Search(target)
+    forged_id = target[:15] + secrets.token_bytes(5)  # shares 15 bytes -- the live fleet's trick
+    addr = ("203.0.113.1", 6881)
+    assert distance(forged_id, target) < IMPOSSIBLE_PROXIMITY_THRESHOLD
+
+    assert search.insert(forged_id, addr, replied=True) is None
+    assert search.rejected_impossible_proximity == 1
+    assert addr in search.blacklist
+    # Blacklisted now -- even an otherwise-unremarkable claim from that
+    # address is refused without re-evaluating it.
+    assert search.insert(secrets.token_bytes(20), addr, replied=True) is None
+
+
+def test_search_requires_bep42_inside_the_contested_zone_but_not_outside() -> None:
+    target = secrets.token_bytes(20)
+    search = Search(target)
+
+    # Inside the zone (<2^145): only the top 21 bits are forced to agree
+    # with `target` (via a single flipped bit at that boundary), so this is
+    # still effectively a random, non-conforming BEP 42 claim.
+    near_id = bytearray(target)
+    near_id[3] ^= 0x04  # flips bit 29 (MSB-numbered) -> XOR distance == 2**130
+    near_id = bytes(near_id)
+    near_ip = "203.0.113.5"
+    assert IMPOSSIBLE_PROXIMITY_THRESHOLD <= distance(near_id, target) < BEP42_CONTESTED_ZONE_THRESHOLD
+    assert bep42_valid(near_id, near_ip) is False
+    assert search.insert(near_id, (near_ip, 6881), replied=True) is None
+    assert search.rejected_bep42 == 1
+
+    # Outside the zone: the *same kind* of non-conforming claim is only a
+    # ranking preference, not a hard requirement -- roughly half the honest
+    # network predates BEP 42, and this is what keeps it usable for routing.
+    far_id = secrets.token_bytes(20)
+    far_ip = "198.51.100.7"
+    assert distance(far_id, target) >= BEP42_CONTESTED_ZONE_THRESHOLD
+    node = search.insert(far_id, (far_ip, 6881), replied=True)
+    assert node is not None
+
+
+# =============================================================================
+# Phase C: serving -- find_node/get_peers/announce_peer, tokens, rate limits.
+# =============================================================================
+
+async def test_ip_votes_are_parsed_from_the_top_level_ip_field_of_replies() -> None:
+    """Phase D's external-address/NAT detection reads `ip_votes`; nothing
+    here acts on it yet, but the parsing itself -- and the "one vote per
+    distinct responder" dedupe -- has to work now."""
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = server._transport.get_extra_info("sockname")
+        client_port = client._transport.get_extra_info("sockname")[1]
+
+        assert client.ip_votes == {}
+        await client.ping(server_addr, timeout=2.0)
+        assert client.ip_votes == {("127.0.0.1", client_port): 1}
+
+        # A second reply from the *same* responder must not inflate the count.
+        await client.ping(server_addr, timeout=2.0)
+        assert client.ip_votes == {("127.0.0.1", client_port): 1}
+    finally:
+        server.close()
+        client.close()
+
+
+async def test_serves_ping_find_node_get_peers_announce_peer() -> None:
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = server._transport.get_extra_info("sockname")
+
+        pong = await client.ping(server_addr, timeout=2.0)
+        assert pong is not None and pong[b"id"] == server.own_id
+        # `ping()` hands back the "r" sub-dict, so the echoed address is not
+        # visible here at all -- it lives one level up. Asserting `b"ip" in
+        # pong` is what let the field sit in the wrong place unnoticed; the
+        # wire format is pinned by
+        # test_the_echoed_ip_field_is_top_level_on_the_wire instead, and the
+        # round trip by the ip_votes test below.
+        assert b"ip" not in pong
+
+        target = secrets.token_bytes(20)
+        fn = await client.find_node(server_addr, target, timeout=2.0)
+        assert fn is not None and b"nodes" in fn
+
+        info_hash = secrets.token_bytes(20)
+        gp = await client.get_peers(server_addr, info_hash, timeout=2.0)
+        assert gp is not None
+        token = gp[b"token"]
+        assert len(token) == TOKEN_SIZE
+        assert b"values" not in gp  # nothing announced yet -- closest nodes instead
+        assert b"nodes" in gp
+
+        ann = await client.announce_peer(server_addr, info_hash, token, timeout=2.0)
+        assert ann is not None
+
+        gp2 = await client.get_peers(server_addr, info_hash, timeout=2.0)
+        assert gp2 is not None and b"values" in gp2
+        client_port = client._transport.get_extra_info("sockname")[1]
+        peers = decode_compact_peers(b"".join(gp2[b"values"]))
+        assert ("127.0.0.1", client_port) in peers
+    finally:
+        server.close()
+        client.close()
+
+
+async def test_announce_peer_with_a_bad_token_is_refused() -> None:
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = server._transport.get_extra_info("sockname")
+        info_hash = secrets.token_bytes(20)
+        result = await client.announce_peer(server_addr, info_hash, b"not-a-real-tok", timeout=2.0)
+        assert result is None  # BEP 5 error reply -- treated the same as no answer
+
+        gp = await client.get_peers(server_addr, info_hash, timeout=2.0)
+        assert gp is not None and b"values" not in gp  # nothing was actually stored
+    finally:
+        server.close()
+        client.close()
+
+
+def test_token_bucket_caps_a_burst_then_refuses() -> None:
+    bucket = TokenBucket(capacity=5, refill_per_s=1.0, now=0.0)
+    for _ in range(5):
+        assert bucket.take(now=0.0) is True
+    assert bucket.take(now=0.0) is False  # exhausted, no time has passed
+    assert RATE_LIMIT_CAPACITY == 400     # dht.c's actual production figure, unmodified
+
+
+def test_token_bucket_refills_over_time() -> None:
+    bucket = TokenBucket(capacity=5, refill_per_s=2.0, now=0.0)
+    for _ in range(5):
+        assert bucket.take(now=0.0) is True
+    assert bucket.take(now=0.4) is False  # int(2.0 * 0.4) == 0 tokens -- too soon
+    assert bucket.take(now=1.4) is True   # int(2.0 * 1.0) == 2 tokens accrued since then
+
+
+def test_peer_store_expires_announced_peers_after_32_minutes() -> None:
+    store = PeerStore()
+    info_hash = secrets.token_bytes(20)
+    addr = ("203.0.113.9", 6881)
+    store.store(info_hash, addr, now=0.0)
+    assert store.get(info_hash, now=0.0) == [addr]
+    assert store.get(info_hash, now=PEER_EXPIRY_S - 1.0) == [addr]  # not expired yet
+    assert store.get(info_hash, now=PEER_EXPIRY_S + 1.0) == []      # expired
+
+
+async def test_rate_limiter_caps_incoming_requests() -> None:
+    """Direct manipulation rather than 400 real round trips (slow, and racy
+    under load) -- proves the same code path `_handle_message` actually
+    calls refuses a request once the bucket is empty."""
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = server._transport.get_extra_info("sockname")
+        assert await client.ping(server_addr, timeout=2.0) is not None
+
+        server._rate_limiter._tokens = 0
+        server._rate_limiter._last = time.monotonic()  # refill needs real elapsed time
+        assert await client.ping(server_addr, timeout=0.5) is None  # dropped, not refused
+
+        server._rate_limiter._tokens = 3  # restored -- e.g. a slice of real elapsed time later
+        assert await client.ping(server_addr, timeout=2.0) is not None
+    finally:
+        server.close()
+        client.close()
 
 
 def _real_dht_reachable() -> bool:
@@ -198,3 +621,33 @@ async def test_announce_then_find_it_again_on_the_real_public_dht(live_dht_optin
     finally:
         announcer.close()
         seeker.close()
+
+
+async def test_the_echoed_ip_field_is_top_level_on_the_wire() -> None:
+    """BEP 42's `ip` field must sit beside "t"/"y"/"r", not inside "r".
+
+    Pinned at the byte level, from a plain socket, because the mistake is
+    self-concealing: when this server wrote the field into "r" its own reader
+    looked there too, so both ends agreed and every test passed -- while the
+    field was invisible to every real client, and every real client's `ip` was
+    invisible to us. That silently disables the only way a node behind NAT can
+    learn its own external address.
+    """
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        server_addr = server._transport.get_extra_info("sockname")
+        query = bencode({b"t": b"aa", b"y": b"q", b"q": b"ping",
+                         b"a": {b"id": secrets.token_bytes(20)}})
+        await asyncio.get_running_loop().run_in_executor(None, sock.sendto, query, server_addr)
+        raw, _ = await asyncio.get_running_loop().run_in_executor(None, sock.recvfrom, 4096)
+        reply = bdecode(raw)
+
+        assert b"ip" in reply, "the ip field must be in the top-level dictionary"
+        assert b"ip" not in reply[b"r"], "the ip field must NOT be nested inside r"
+        assert reply[b"ip"] == encode_compact_addr(sock.getsockname())
+    finally:
+        sock.close()
+        server.close()

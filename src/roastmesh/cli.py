@@ -481,83 +481,177 @@ def node_serve(
 @node.command("doctor")
 @click.option("--announce/--no-announce", default=False, show_default=True,
               help="Also publish this node to the DHT swarm while diagnosing.")
-def node_doctor(announce: bool) -> None:
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit the full diagnostic report as JSON (used by the GUI).")
+def node_doctor(announce: bool, as_json: bool) -> None:
     """Diagnose internet-wide (DHT) peer discovery, step by step.
 
     Internet discovery is the one part of roastmesh that can fail completely
     while looking like it is running: the lookup happens in a background task,
     a failed round leaves no trace, and "no peers" is indistinguishable from
     "announced into the void". This prints what actually happened -- which
-    bootstrap routers answered, how close to the swarm the lookup converged,
-    how many nodes accepted the announcement -- so a report of "it doesn't
-    work" comes with evidence instead of a shrug.
+    bootstrap routers answered, what our external address looks like from
+    outside, how close to the swarm the lookup converged, how many forged
+    nodes were turned away, and whether anyone can actually find us.
     """
     import hashlib
 
-    from roastmesh.dht import DhtClient, LookupStats, load_node_cache, save_node_cache
+    from roastmesh.dht import DhtClient, LookupStats, bep42_valid, load_node_cache, save_node_cache
     from roastmesh.wan_discovery import (
         DEFAULT_DHT_BOOTSTRAP,
         SWARM_INFO_HASH,
+        WARM_GOOD_NODES,
         _resolve,
-        default_node_cache_path,
+        default_state_path,
+        diagnostics_payload,
+        external_address,
     )
 
     async def run() -> None:
         ident, _created = load_or_create_identity()
-        click.echo(f"this node: {ident.public_key_hex}")
+        state_path = default_state_path()
+        state = load_node_cache(state_path)
 
-        cache_path = default_node_cache_path()
-        cache = load_node_cache(cache_path)
-        click.echo(f"node cache: {len(cache)} known-live DHT node(s) at {cache_path}")
-
-        click.echo("\nbootstrap routers:")
         resolved = await _resolve(DEFAULT_DHT_BOOTSTRAP)
         resolved_set = set(resolved)
-        client = await DhtClient.bind(port=0, own_id=hashlib.sha1(bytes.fromhex(ident.public_key_hex)).digest())
+        client = await DhtClient.bind(
+            port=0, own_id=hashlib.sha1(bytes.fromhex(ident.public_key_hex)).digest())
+        routers: list[dict] = []
         try:
-            reachable = 0
-            for (host, port), addr in zip(DEFAULT_DHT_BOOTSTRAP, resolved):
+            for (host, _port), addr in zip(DEFAULT_DHT_BOOTSTRAP, resolved):
                 if addr not in resolved_set:
                     continue
-                reply = await client.ping(addr, timeout=4.0)
-                click.echo(f"  {host:26} {addr[0]:>15}  {'ok' if reply else 'no reply'}")
-                reachable += 1 if reply else 0
+                # bootstrap_ping, not ping: a reply should seed the routing
+                # table, which is what the lookup below wants to start from.
+                ok = await client.bootstrap_ping(addr, timeout=4.0)
+                routers.append({"host": host, "addr": f"{addr[0]}:{addr[1]}", "ok": ok})
             unresolved = len(DEFAULT_DHT_BOOTSTRAP) - len(resolved)
-            if unresolved:
-                click.echo(f"  ({unresolved} did not resolve)")
-            if not reachable and not cache:
-                click.echo("\nno bootstrap router answered and no cached nodes -- "
-                           "the DHT is unreachable from this network.")
-                return
+            reachable = sum(1 for r in routers if r["ok"])
 
-            click.echo("\nswarm lookup:")
-            seeds = list(dict.fromkeys([*resolved, *cache]))
             stats = LookupStats()
-            peers = await client.discover_and_announce_peers(
-                SWARM_INFO_HASH, seeds, seed_ids=dict(cache), announce=announce, stats=stats,
-            )
-            cache.update(dict(stats.live_nodes))
-            save_node_cache(cache_path, cache)
+            peers: set = set()
+            if reachable or state:
+                seeds = list(dict.fromkeys([*resolved, *state]))
+                peers = await client.discover_and_announce_peers(
+                    SWARM_INFO_HASH, seeds, seed_ids=dict(state),
+                    announce=announce, stats=stats,
+                )
+                state.update({n.addr: n.id for n in client.routing_table.good_nodes()})
+                save_node_cache(state_path, state)
 
-            click.echo(f"  {stats.summary()}")
-            if stats.closest_bits is not None and stats.closest_bits > 140:
-                click.echo("  WARNING: the lookup never got near the swarm -- it is not converging.")
-            if announce and stats.announced == 0:
-                click.echo("  WARNING: no node accepted the announcement, so nobody can find this node.")
-            if peers:
-                click.echo(f"\n  {len(peers)} address(es) advertised on the roastmesh swarm:")
-                for addr in sorted(peers):
-                    click.echo(f"    {addr[0]}:{addr[1]}")
-                click.echo("  (some may be unrelated DHT spam; each still has to pass the "
-                           "roastmesh handshake before it counts as a peer)")
-            else:
-                click.echo("\n  no roastmesh peers currently advertised. If another node is "
-                           "serving with --wan-discovery right now, re-run in a minute -- "
-                           "announcements take a round to propagate.")
+            external, nat, votes = external_address(client)
+            readback: bool | None = None
+            if announce and stats.announced > 0 and external is not None:
+                # The only question that matters, asked directly: having just
+                # published ourselves, does a fresh lookup find us?
+                readback = external in await client.discover_and_announce_peers(
+                    SWARM_INFO_HASH, list(dict.fromkeys([*resolved, *state])),
+                    seed_ids=dict(state), announce=False, stats=LookupStats(),
+                )
+
+            report = diagnostics_payload(
+                client, stats, info_hash=SWARM_INFO_HASH, external=external, nat=nat,
+                votes=votes, warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
+                readback=readback, addrs=peers,
+            )
+            report["identity"] = ident.public_key_hex
+            report["state_path"] = str(state_path)
+            report["state_nodes"] = len(state)
+            report["bootstrap"] = routers
+            report["bootstrap_unresolved"] = unresolved
+            report["announced_this_run"] = announce
+
+            if as_json:
+                click.echo(json.dumps(report))
+                return
+            _print_doctor_report(report)
         finally:
             client.close()
 
     asyncio.run(run())
+
+
+def _print_doctor_report(r: dict) -> None:
+    """The human rendering of `node doctor`'s report -- same data the GUI's
+    Network diagnostics panel shows, same keys, one source (see
+    wan_discovery.diagnostics_payload)."""
+    click.echo(f"this node: {r['identity']}")
+    click.echo(f"dht node id: {r['node_id']}"
+               f"{'  (BEP 42 verified)' if r['node_id_bep42'] else ''}")
+    click.echo(f"node state: {r['state_nodes']} known-good DHT node(s) at {r['state_path']}")
+
+    click.echo("\nbootstrap routers:")
+    for row in r["bootstrap"]:
+        host, addr = row["host"], row["addr"].rsplit(":", 1)[0]
+        click.echo(f"  {host:26} {addr:>15}  {'ok' if row['ok'] else 'no reply'}")
+    if r["bootstrap_unresolved"]:
+        click.echo(f"  ({r['bootstrap_unresolved']} did not resolve)")
+    if not any(row["ok"] for row in r["bootstrap"]) and not r["state_nodes"]:
+        click.echo("\nno bootstrap router answered and no known nodes -- "
+                   "the DHT is unreachable from this network.")
+        return
+
+    click.echo("\nthis node, seen from outside:")
+    if r["external_ip"] is None:
+        click.echo(f"  address: unknown ({r['ip_votes']} node(s) reported one; "
+                   "need more agreement)")
+    else:
+        click.echo(f"  address: {r['external_ip']}:{r['external_port']}  "
+                   f"({r['ip_votes']} independent report(s) agree)")
+        if r["nat"] == "symmetric":
+            click.echo("  WARNING: your NAT gives a different port to each destination "
+                       "(symmetric NAT or carrier-grade NAT). Other nodes cannot send "
+                       "you a first packet, so internet discovery cannot work here -- "
+                       "this is a network limitation, not a DHT fault. LAN discovery "
+                       "and pasted tickets still work.")
+        else:
+            click.echo("  NAT: consistent mapping -- other nodes can reach this port.")
+
+    t = r["routing_table"]
+    click.echo(f"\nrouting table: {t['good']} good of {t['total']} "
+               f"({t['verified']} BEP 42 verified)"
+               f"{'' if r['warm'] else '  -- still warming up'}")
+
+    lk = r["lookup"]
+    closest = "none" if lk["closest_bits"] is None else f"2^{lk['closest_bits']}"
+    click.echo("\nswarm lookup:")
+    click.echo(f"  {lk['rounds']} rounds, {lk['replied']}/{lk['queried']} replied, "
+               f"closest {closest}, announced to {lk['announced']} "
+               f"({lk['no_token']} gave no token)")
+    click.echo(f"  turned away: {lk['rejected_impossible_proximity']} forged-proximity, "
+               f"{lk['rejected_bep42']} failing BEP 42, {lk['rejected_martian']} unroutable")
+    if lk["closest_bits"] is not None and lk["closest_bits"] > 150:
+        click.echo("  WARNING: the lookup never got near the swarm -- it is not converging.")
+    if lk["closest_bits"] is not None and lk["closest_bits"] < 120:
+        click.echo("  WARNING: the lookup reached a distance no honest node can occupy. "
+                   "Something is forging node IDs and the filters did not catch it.")
+
+    if r["announce_set"]:
+        click.echo("\n  closest nodes reached (these are what store and serve us):")
+        for row in r["announce_set"]:
+            mark = "verified" if row["bep42"] is True else (
+                "exempt" if row["bep42"] is None else "UNVERIFIED")
+            click.echo(f"    {row['addr']:>22}  2^{row['bits']:<4} {mark}")
+        if any(row["bep42"] is False for row in r["announce_set"]):
+            click.echo("  WARNING: an unverified node is in the set we publish to.")
+
+    if r["readback"] is True:
+        click.echo("\n  read-back: OK -- a fresh lookup found this node's own address, "
+                   "so other nodes can find it too.")
+    elif r["readback"] is False:
+        click.echo("\n  read-back: FAILED -- we announced, but a fresh lookup could not "
+                   "find our own address. Other nodes will not find us either.")
+
+    if r["peers"]:
+        click.echo(f"\n  {len(r['peers'])} address(es) advertised on the roastmesh swarm:")
+        for addr in r["peers"]:
+            click.echo(f"    {addr}")
+        click.echo("  (each still has to pass the roastmesh handshake before it counts "
+                   "as a peer)")
+    else:
+        click.echo("\n  no roastmesh peers currently advertised. If another node is "
+                   "serving with --wan-discovery right now, re-run in a minute -- "
+                   "announcements take a round to propagate.")
 
 
 @main.group()
