@@ -159,6 +159,12 @@ jobs:
             throw "uninstaller left the firewall rule behind"
           }
           Write-Host "install -> run -> uninstall OK (firewall rule added and removed)"
+          # Explicit, because the check above leaves $LASTEXITCODE at 1: netsh
+          # exits non-zero when a rule is absent, which is precisely the result
+          # being asserted. The pwsh wrapper fails a step on a non-zero trailing
+          # $LASTEXITCODE, so this step failed while printing that every one of
+          # its assertions had passed.
+          exit 0
 
       - name: Zip the portable build
         # onedir means a bare .exe is no longer a usable download -- without
