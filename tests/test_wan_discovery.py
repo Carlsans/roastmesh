@@ -12,7 +12,14 @@ import socket
 import pytest
 
 from roastmesh.dht import bdecode, bencode, encode_compact_addr
-from roastmesh.dht import DhtClient, LookupStats, encode_compact_addr as _eca
+from roastmesh.dht import (
+    IP_VOTE_QUORUM,
+    IP_VOTE_ROTATE_AFTER,
+    IP_VOTE_ROTATE_S,
+    DhtClient,
+    IpVoter,
+    LookupStats,
+)
 from roastmesh.wan_discovery import (
     DEFAULT_DHT_BOOTSTRAP,
     DHT_BOOTSTRAP_FALLBACK_IPS,
@@ -193,10 +200,33 @@ async def test_resolve_returns_only_ipv4_addresses() -> None:
 # --- external address & NAT verdict ----------------------------------------
 
 class _Votes:
-    """Just enough of a DhtClient for external_address()."""
+    """Just enough of a DhtClient for external_address().
+
+    Drives a real IpVoter so the quorum, rotation and hysteresis under test
+    are the ones that actually ship, not a second implementation living in
+    the test.
+    """
 
     def __init__(self, votes):
-        self.ip_votes = votes
+        voter = IpVoter()
+        responder = 0
+        for claim, count in votes.items():
+            for _ in range(count):
+                responder += 1
+                voter.record((f"10.9.9.{responder}", 1000 + responder), claim, now=0.0)
+        self._voter = voter
+
+    @property
+    def ip_votes(self):
+        return self._voter.tally
+
+    @property
+    def external_address(self):
+        return self._voter.current(now=0.0)
+
+    @property
+    def external_ports_seen(self):
+        return self._voter.ports_seen()
 
 
 def test_external_address_needs_a_quorum_before_it_will_commit() -> None:
@@ -429,3 +459,77 @@ def test_a_forwarded_port_that_still_fails_keeps_the_advice() -> None:
 def test_a_healthy_node_is_not_nagged() -> None:
     assert needs_public_port("consistent", readback=True, public_port=None) is False
     assert needs_public_port("unknown", readback=None, public_port=None) is False
+
+
+# --- votes have to expire ---------------------------------------------------
+
+def test_a_stale_address_does_not_win_forever() -> None:
+    """The bug this replaces.
+
+    The tally only ever grew, so after a laptop changed network, a VPN
+    reconnected, or a DHCP lease turned over, the old address kept an
+    unbeatable lead: we published an address we no longer held and never
+    re-derived the BEP 42 node ID that depends on it. Nothing internal
+    disagreed, because every check was reading the same poisoned tally.
+    """
+    voter = IpVoter()
+    old, new = ("198.51.100.7", 4000), ("203.0.113.9", 4000)
+
+    for i in range(IP_VOTE_ROTATE_AFTER + 10):     # a long stay on one network
+        voter.record((f"10.0.0.{i}", 6881), old, now=0.0)
+    assert voter.current(now=0.0) == old
+
+    for i in range(IP_VOTE_ROTATE_AFTER + 10):     # then it moves
+        voter.record((f"10.1.0.{i}", 6881), new, now=1.0)
+    assert voter.current(now=1.0) == new, "the address we no longer hold is still winning"
+
+
+def test_a_settled_address_is_not_displaced_by_a_narrow_lead() -> None:
+    """Hysteresis. Without it a couple of nodes lying about our address could
+    move us, and moving means re-deriving our node ID and re-bootstrapping."""
+    voter = IpVoter()
+    settled, challenger = ("198.51.100.7", 4000), ("203.0.113.9", 4000)
+    for i in range(IP_VOTE_ROTATE_AFTER):
+        voter.record((f"10.0.0.{i}", 6881), settled, now=0.0)
+    assert voter.current(now=0.0) == settled
+
+    for i in range(4):                      # a plurality, but not a clear one
+        voter.record((f"10.2.0.{i}", 6881), challenger, now=1.0)
+    for i in range(3):
+        voter.record((f"10.3.0.{i}", 6881), settled, now=1.0)
+    assert voter.current(now=1.0) == settled
+
+
+def test_one_responder_cannot_stuff_the_ballot() -> None:
+    voter = IpVoter()
+    claim = ("203.0.113.9", 4000)
+    for _ in range(50):
+        voter.record(("10.0.0.1", 6881), claim, now=0.0)   # same responder, 50 times
+    assert voter.tally == {claim: 1}
+    assert voter.current(now=0.0) is None                  # nowhere near quorum
+
+
+def test_the_time_based_rotation_needs_actual_votes() -> None:
+    """An idle node must not churn its settled address just because time
+    passed -- rotation is driven by new information, not by the clock alone."""
+    voter = IpVoter()
+    claim = ("203.0.113.9", 4000)
+    for i in range(IP_VOTE_QUORUM):
+        voter.record((f"10.0.0.{i}", 6881), claim, now=0.0)
+    assert voter.current(now=0.0) == claim
+    assert voter.current(now=IP_VOTE_ROTATE_S * 10) == claim
+
+
+def test_the_symmetric_verdict_survives_a_rotation() -> None:
+    """A tally that has just been cleared has no ports in it, and reading the
+    NAT verdict from that alone would tell a carrier-grade-NAT node it had a
+    consistent mapping -- the one thing it certainly does not have."""
+    voter = IpVoter()
+    # A different port to every responder -- the signature of a symmetric NAT.
+    for i in range(IP_VOTE_ROTATE_AFTER):
+        voter.record((f"10.0.0.{i}", 6881), ("203.0.113.9", 5000 + i), now=0.0)
+    assert len(voter.tally) == IP_VOTE_ROTATE_AFTER
+
+    voter.current(now=0.0)                       # the round is full; this rotates it
+    assert voter.tally == {}, "expected the round to have been cleared"
+    assert len(voter.ports_seen()) > 1, "the symmetric evidence was thrown away"

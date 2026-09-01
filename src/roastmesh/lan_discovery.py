@@ -24,8 +24,20 @@ from collections.abc import Awaitable, Callable
 
 from roastmesh.dht import udp_socket
 from roastmesh.hello import decode_hello, encode_hello
+from roastmesh.interfaces import local_interfaces
 
 BEACON_PORT = 41888
+
+# Our own administratively-scoped group (239.192.0.0/14), deliberately *not*
+# BEP 14's 239.192.152.143:6771. Reusing that would deliver roastmesh hellos to
+# every BitTorrent client on the LAN, which cannot parse them -- rude at best,
+# and indistinguishable from someone probing them at worst. The mechanism is
+# borrowed from Transmission's LPD; the address space is not.
+MULTICAST_GROUP = "239.192.152.144"
+
+# Link-local only. A beacon has no business leaving the switch it was sent on,
+# and a TTL of 1 guarantees it cannot.
+MULTICAST_TTL = 1
 BEACON_INTERVAL_S = 5.0
 # Minimum time between auto-syncs with the same discovered peer. A real bug
 # found by benchmarking this against an actually-live LAN peer (not just
@@ -100,6 +112,7 @@ async def run_beacon(
     if hasattr(socket, "SO_REUSEPORT"):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    _join_multicast(sock)
 
     transport, _ = await loop.create_datagram_endpoint(
         lambda: _BeaconProtocol(own_pubkey_hex, _handle), sock=sock,
@@ -108,10 +121,70 @@ async def run_beacon(
     payload = encode_hello(own_pubkey_hex, own_ticket)
     try:
         while True:
-            try:
-                transport.sendto(payload, ("255.255.255.255", port))
-            except OSError:
-                pass  # no broadcast-capable interface right now; keep trying next interval
+            _announce(sock, transport, payload, port)
             await asyncio.sleep(interval_s)
     finally:
         transport.close()
+
+
+def _join_multicast(sock: socket.socket) -> None:
+    """Listen to the beacon group on every interface we can find.
+
+    Per interface, not once globally: a multicast join is scoped to one
+    interface, and joining only on the routing table's favourite is how the
+    broadcast version of this ended up talking exclusively to a VPN tunnel.
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
+    except OSError:
+        pass
+    group = socket.inet_aton(MULTICAST_GROUP)
+    for iface in local_interfaces():
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                            group + socket.inet_aton(iface.address))
+        except OSError:
+            # Plenty of interfaces cannot carry multicast (tunnels especially),
+            # and one that cannot is not a reason to give up on the others.
+            continue
+
+
+def _announce(sock: socket.socket, transport, payload: bytes, port: int) -> None:
+    """Send the beacon out of every interface, not just the default route's.
+
+    The bug this exists for, measured on a Raspberry Pi with a VPN up: a single
+    send to 255.255.255.255 was routed onto the tunnel (`ip route get
+    255.255.255.255` -> `dev tun0`) and the machine's actual LAN on wlan0 never
+    saw it, so LAN discovery found nobody on the one network where it should be
+    effortless.
+
+    Note what is *not* here: when interfaces are known we no longer send the
+    global broadcast at all. On that same Pi it went nowhere but into the VPN,
+    which means handing our pubkey and ticket to whatever sits at the other end
+    of the tunnel for no possible benefit.
+    """
+    interfaces = local_interfaces()
+    if not interfaces:
+        # Unknown platform. Exactly the old behaviour, which is the right
+        # fallback: worse than per-interface, better than silence.
+        try:
+            transport.sendto(payload, ("255.255.255.255", port))
+        except OSError:
+            pass
+        return
+
+    for iface in interfaces:
+        if iface.broadcast:
+            try:
+                transport.sendto(payload, (iface.broadcast, port))
+            except OSError:
+                pass
+        try:
+            # The address form of IP_MULTICAST_IF, which every platform
+            # accepts -- Linux also takes an ip_mreqn with an index, Windows
+            # does not.
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                            socket.inet_aton(iface.address))
+            transport.sendto(payload, (MULTICAST_GROUP, port))
+        except OSError:
+            pass

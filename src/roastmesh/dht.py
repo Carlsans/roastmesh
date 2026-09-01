@@ -202,6 +202,7 @@ def udp_socket(port: int) -> socket.socket:
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _size_socket_buffers(sock)
     sock.bind(("0.0.0.0", port))
     if hasattr(socket, "SIO_UDP_CONNRESET"):
         # After bind, not before: applied to an unbound socket this silently
@@ -219,6 +220,43 @@ def udp_socket(port: int) -> socket.socket:
                   "discovery may stall on this machine", flush=True)
     sock.setblocking(False)
     return sock
+
+
+# Transmission's sizes (tr-udp.cc: RecvBufferSize / SendBufferSize). A DHT
+# node that answers queries receives in bursts, and the default buffer is small
+# enough that a burst is simply dropped -- which looks from the inside exactly
+# like an unreliable network, with no error anywhere to say otherwise.
+RECV_BUFFER_BYTES = 4 * 1024 * 1024
+SEND_BUFFER_BYTES = 1 * 1024 * 1024
+
+# Below this the kernel has cut us down far enough to expect drops under load.
+# Linux's default net.core.rmem_max (208 KB) is comfortably above it, so this
+# stays quiet on an ordinary machine and speaks up on a squeezed one.
+MIN_USEFUL_RECV_BUFFER = 128 * 1024
+
+
+def _size_socket_buffers(sock: socket.socket) -> None:
+    """Ask for big buffers, then check what we actually got.
+
+    The check is the point, and it is why this mirrors Transmission rather than
+    being a one-line setsockopt: every OS silently clamps to its own maximum,
+    so a request that looks like it succeeded can leave a buffer a fraction of
+    the size asked for.
+    """
+    for opt, wanted in ((socket.SO_RCVBUF, RECV_BUFFER_BYTES),
+                        (socket.SO_SNDBUF, SEND_BUFFER_BYTES)):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, wanted)
+        except OSError:
+            pass
+    try:
+        got = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    except OSError:
+        return
+    if got < MIN_USEFUL_RECV_BUFFER:
+        print(f"dht: receive buffer is only {got // 1024} KiB "
+              f"(asked for {RECV_BUFFER_BYTES // 1024}); incoming packets may be dropped "
+              "under load. On Linux, raise net.core.rmem_max.", flush=True)
 
 
 def distance(a: bytes, b: bytes) -> int:
@@ -258,6 +296,12 @@ class LookupStats:
         return (f"{self.rounds} rounds, {self.replied}/{self.queried} replied, "
                 f"closest {closest}, announced to {self.announced} "
                 f"({self.no_token} gave no token), {self.peers_found} peer(s)")
+
+
+def _prefix24(ip: str) -> str:
+    """The /24 an address sits in -- the granularity libtorrent uses to decide
+    two DHT nodes are not independent of each other."""
+    return ip.rsplit(".", 1)[0]
 
 
 def bencode(obj) -> bytes:
@@ -722,10 +766,27 @@ class RoutingTable:
                 return self.new_node(node_id, addr, confirm=confirm, now=now)  # "goto again"
             return None  # bucket full, nothing to evict, not splittable here
 
+        # One entry per IP in the whole table (libtorrent's
+        # dht_restrict_routing_ips). Ports are free, addresses are not: a
+        # single host must not be able to occupy several slots by binding
+        # several sockets. BEP 42 already ties an ID to an address; this stops
+        # one address spending that identity more than once.
+        #
+        # Exempt on non-routable addresses, the same set BEP 42 exempts. Several
+        # nodes really do share one address there -- a household behind one NAT,
+        # or an in-process test swarm on loopback -- and it is only on the public
+        # internet that "many nodes, one address" is evidence of anything.
+        if not _bep42_exempt(addr[0]) and self._has_other_node_at_ip(addr[0], node_id):
+            return None
+
         node = Node(id=node_id, addr=addr, time=now if confirm else 0.0,
                     reply_time=now if confirm >= 2 else 0.0)
         bucket.nodes.append(node)
         return node
+
+    def _has_other_node_at_ip(self, ip: str, node_id: bytes) -> bool:
+        return any(n.addr[0] == ip and n.id != node_id
+                   for b in self._buckets for n in b.nodes)
 
     def find(self, node_id: bytes) -> Node | None:
         idx = self._bucket_index(int.from_bytes(node_id, "big"))
@@ -783,11 +844,13 @@ class Search:
         self._nodes: list[_SearchNode] = []
         self._by_id: dict[bytes, _SearchNode] = {}
         self.found: set[Addr] = set()
+        self._prefix_counts: dict[str, int] = {}
         # Rejection tally, broken out by cause -- see LookupStats' fields of
         # the same name, which the driver copies these into.
         self.rejected_martian = 0
         self.rejected_impossible_proximity = 0
         self.rejected_bep42 = 0
+        self.rejected_prefix = 0
 
     def _dist(self, node_id: bytes) -> int:
         return int.from_bytes(node_id, "big") ^ self._target_int
@@ -816,6 +879,10 @@ class Search:
         if d < BEP42_CONTESTED_ZONE_THRESHOLD and bep42_valid(node_id, addr[0]) is False:
             self.rejected_bep42 += 1
             return False
+        if (not _bep42_exempt(addr[0])
+                and self._prefix_counts.get(_prefix24(addr[0]), 0) >= MAX_SEARCH_NODES_PER_PREFIX):
+            self.rejected_prefix += 1
+            return False
         return True
 
     def insert(self, node_id: bytes, addr: Addr, *, replied: bool, token: bytes | None = None) -> _SearchNode | None:
@@ -828,10 +895,16 @@ class Search:
             node = _SearchNode(id=node_id, addr=addr)
             self._by_id[node_id] = node
             self._nodes.append(node)
+            self._prefix_counts[_prefix24(addr[0])] = \
+                self._prefix_counts.get(_prefix24(addr[0]), 0) + 1
             self._nodes.sort(key=lambda n: self._dist(n.id))
             if len(self._nodes) > SEARCH_NODES:
                 worst = self._nodes.pop()
                 del self._by_id[worst.id]
+                # Give the slot back to its network, or a search that churns
+                # through candidates would slowly lock every /24 out.
+                prefix = _prefix24(worst.addr[0])
+                self._prefix_counts[prefix] = max(self._prefix_counts.get(prefix, 1) - 1, 0)
         else:
             node = existing
             node.addr = addr
@@ -908,6 +981,168 @@ class Search:
 # =============================================================================
 # Phase C: serving -- rate limiting and peer storage.
 # =============================================================================
+
+# libtorrent's dht_max_peers_reply. Also bounds our amplification factor: a
+# get_peers reply is bigger than the query that provokes it, and an unbounded
+# one is a gift to anyone spoofing a source address.
+MAX_PEERS_REPLY = 100
+
+# libtorrent's dht_restrict_search_ips: candidates too close together in CIDR
+# terms are not independent, so one network should not supply a search's whole
+# frontier. Two per /24 leaves room for an ordinary pair of nodes behind one
+# ISP block while making a rented /24 useless for surrounding a target. Like
+# the routing-table rule, it does not apply to non-routable addresses.
+MAX_SEARCH_NODES_PER_PREFIX = 2
+
+
+# libtorrent's ip_voter, in the shape we need. Its numbers: rotate the tally
+# once ~50 votes are in or five minutes have passed, and require a clear
+# majority -- not a plurality -- before displacing an address we had already
+# settled on.
+IP_VOTE_ROTATE_AFTER = 50
+IP_VOTE_ROTATE_S = 300.0
+IP_VOTE_QUORUM = 3
+
+
+class IpVoter:
+    """What other nodes say our external address is, with an expiry date.
+
+    BEP 42 asks every node to echo the querier's address back, and that is the
+    only way a NAT'd node can learn its own. But a tally that only ever grows
+    is a trap: after a laptop changes network, a VPN reconnects, or a DHCP
+    lease turns over, the old address keeps an unbeatable lead forever. We then
+    publish an address we no longer hold and never re-derive the BEP 42 node ID
+    that depends on it -- silently, because every internal check still agrees
+    with itself.
+
+    So the tally is rotated, exactly as libtorrent does: the round's winner is
+    remembered, the votes are cleared, and the next round gets to disagree.
+    Hysteresis keeps that from flapping -- to unseat a settled address a
+    challenger needs twice the runner-up's votes, so one or two liars cannot
+    move us.
+    """
+
+    def __init__(self, *, quorum: int = IP_VOTE_QUORUM,
+                 rotate_after: int = IP_VOTE_ROTATE_AFTER,
+                 rotate_s: float = IP_VOTE_ROTATE_S, now: float | None = None) -> None:
+        self._quorum = quorum
+        self._rotate_after = rotate_after
+        self._rotate_s = rotate_s
+        self._votes: dict[Addr, set[Addr]] = {}
+        self._settled: Addr | None = None
+        self._prev_ports: set[int] = set()
+        self._started = now if now is not None else time.monotonic()
+
+    def record(self, responder: Addr, claimed: Addr, *, now: float | None = None) -> None:
+        now = now if now is not None else time.monotonic()
+        self._maybe_rotate(now)
+        # One vote per responder per round, so a single chatty node cannot
+        # stuff the ballot by answering repeatedly.
+        self._votes.setdefault(claimed, set()).add(responder)
+
+    @property
+    def tally(self) -> dict[Addr, int]:
+        return {claim: len(responders) for claim, responders in self._votes.items()}
+
+    def ports_seen(self) -> set[int]:
+        """Ports claimed this round *and* last.
+
+        Spanning two rounds on purpose: the symmetric-NAT verdict is "different
+        responders see different ports", and reading it from a tally that was
+        just cleared would report a freshly-rotated symmetric node as having a
+        consistent mapping until the next few votes arrive.
+        """
+        return {port for _ip, port in self._votes} | self._prev_ports
+
+    def current(self, *, now: float | None = None) -> Addr | None:
+        now = now if now is not None else time.monotonic()
+        self._maybe_rotate(now)
+        return self._winner() or self._settled
+
+    def _maybe_rotate(self, now: float) -> None:
+        total = sum(len(v) for v in self._votes.values())
+        if not self._votes:
+            return
+        if total < self._rotate_after and now - self._started < self._rotate_s:
+            return
+        winner = self._winner()
+        if winner is not None:
+            self._settled = winner
+        self._prev_ports = {port for _ip, port in self._votes}
+        self._votes.clear()
+        self._started = now
+
+    def _winner(self) -> Addr | None:
+        if not self._votes:
+            return None
+        ranked = sorted(self._votes.items(), key=lambda kv: len(kv[1]), reverse=True)
+        top, top_votes = ranked[0][0], len(ranked[0][1])
+        if top_votes < self._quorum:
+            return None
+        runner_up = len(ranked[1][1]) if len(ranked) > 1 else 0
+        if self._settled is not None and top != self._settled and top_votes <= runner_up * 2:
+            return self._settled  # not a clear enough majority to move us
+        return top
+
+
+# libtorrent's dos_blocker: 5 messages/second sustained per address, and a
+# source that manages 50 inside ten seconds is ignored for five minutes.
+SOURCE_RATE_LIMIT = 5
+SOURCE_BURST_WINDOW_S = 10.0
+SOURCE_BLOCK_S = 300.0
+SOURCE_TRACK_LIMIT = 4096
+
+
+class SourceLimiter:
+    """Per-address request limiting, which the global bucket cannot do.
+
+    A single token bucket answers "are we being asked too much", never "by
+    whom". One noisy source can drain all 400 tokens and every other node on
+    the network is refused service as a result -- and now that we answer
+    queries at all, that is a stranger's decision to make about us. libtorrent
+    keeps both: a global budget and a per-source one.
+    """
+
+    def __init__(self, *, rate: int = SOURCE_RATE_LIMIT,
+                 window_s: float = SOURCE_BURST_WINDOW_S,
+                 block_s: float = SOURCE_BLOCK_S) -> None:
+        self._rate = rate
+        self._window_s = window_s
+        self._block_s = block_s
+        self._seen: dict[str, list[float]] = {}   # ip -> [count, window_start, blocked_until]
+
+    def allow(self, ip: str, *, now: float | None = None) -> bool:
+        now = now if now is not None else time.monotonic()
+        entry = self._seen.get(ip)
+        if entry is None:
+            if len(self._seen) >= SOURCE_TRACK_LIMIT:
+                self._evict(now)
+            self._seen[ip] = [1.0, now, 0.0]
+            return True
+
+        count, window_start, blocked_until = entry
+        if now < blocked_until:
+            return False
+        if now - window_start > self._window_s:
+            # The burst took longer than the window, so it was not a burst.
+            entry[0], entry[1] = 1.0, now
+            return True
+        count += 1
+        entry[0] = count
+        if count >= self._rate * self._window_s:
+            entry[2] = now + self._block_s
+            return False
+        return True
+
+    def _evict(self, now: float) -> None:
+        """Keep the table bounded. Blocked addresses are exactly the ones worth
+        remembering, so they survive; everyone else is cheap to re-learn."""
+        for ip, (_count, window_start, blocked_until) in list(self._seen.items()):
+            if now >= blocked_until and now - window_start > self._window_s:
+                del self._seen[ip]
+        if len(self._seen) >= SOURCE_TRACK_LIMIT:
+            self._seen.clear()
+
 
 class TokenBucket:
     """`dht.c`'s rate limiter for incoming *requests*: 400 tokens, refilled
@@ -1038,6 +1273,7 @@ class DhtClient:
         self.routing_table = RoutingTable(own_id, blacklist=self.blacklist, allow_loopback=allow_loopback)
         self._tokens = TokenSecrets()
         self._rate_limiter = TokenBucket()
+        self._source_limiter = SourceLimiter()
         self._peer_store = PeerStore()
         # addr -> the last node ID we saw claim it. A real node's address can
         # change (NAT rebind) and RoutingTable/Search both handle that by
@@ -1051,7 +1287,7 @@ class DhtClient:
         # {claimed (ip, port): {addr of each distinct responder who claimed it}}
         # -- phase D's external-address/NAT detection reads this; nothing
         # here acts on it yet.
-        self._ip_vote_responders: dict[Addr, set[Addr]] = {}
+        self._ip_voter = IpVoter()
 
     @classmethod
     async def bind(cls, *, port: int, own_id: bytes, allow_loopback: bool = False) -> "DhtClient":
@@ -1066,7 +1302,17 @@ class DhtClient:
 
     @property
     def ip_votes(self) -> dict[Addr, int]:
-        return {claim: len(responders) for claim, responders in self._ip_vote_responders.items()}
+        return self._ip_voter.tally
+
+    @property
+    def external_address(self) -> Addr | None:
+        """Our public address as the network reports it, or None until enough
+        distinct nodes agree. See IpVoter -- this expires, deliberately."""
+        return self._ip_voter.current()
+
+    @property
+    def external_ports_seen(self) -> set[int]:
+        return self._ip_voter.ports_seen()
 
     def send_datagram(self, data: bytes, addr: Addr) -> None:
         # A send on a closed transport does not raise something catchable --
@@ -1090,7 +1336,7 @@ class DhtClient:
         if not isinstance(raw_ip, bytes) or len(raw_ip) != 6:
             return
         claimed = (socket.inet_ntoa(raw_ip[:4]), struct.unpack(">H", raw_ip[4:6])[0])
-        self._ip_vote_responders.setdefault(claimed, set()).add(responder)
+        self._ip_voter.record(responder, claimed)
 
     def adopt_node_id(self, new_id: bytes) -> bool:
         """Switch to a different node ID, starting the routing table over.
@@ -1193,6 +1439,10 @@ class DhtClient:
         # lookups).
         if not self._rate_limiter.take():
             return
+        # Per-source as well as global: without this one address can spend the
+        # whole global budget and everyone else is refused on its behalf.
+        if not self._source_limiter.allow(addr[0]):
+            return
         if not self._identity_ok(querier_id, addr):
             return
         # confirm=1: we've heard from it directly, but (unlike a reply to our
@@ -1216,7 +1466,7 @@ class DhtClient:
             reply = {b"id": self.own_id, b"token": token}
             held = self._peer_store.get(info_hash)
             if held:
-                reply[b"values"] = [encode_compact_addr(p) for p in held]
+                reply[b"values"] = [encode_compact_addr(p) for p in held[:MAX_PEERS_REPLY]]
             else:
                 reply[b"nodes"] = _encode_nodes(self.routing_table.closest(info_hash, K))
             self._reply(t, reply, addr)

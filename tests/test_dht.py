@@ -25,16 +25,23 @@ from roastmesh.dht import (
     RATE_LIMIT_CAPACITY,
     SEARCH_NODES,
     TOKEN_SIZE,
+    MAX_PEERS_REPLY,
+    MAX_SEARCH_NODES_PER_PREFIX,
+    MIN_USEFUL_RECV_BUFFER,
+    SOURCE_BLOCK_S,
+    SOURCE_BURST_WINDOW_S,
     Blacklist,
     DhtClient,
     Node,
     PeerStore,
     RoutingTable,
     Search,
+    SourceLimiter,
     TokenBucket,
     TokenSecrets,
     bdecode,
     bencode,
+    udp_socket,
     bep42_node_id,
     bep42_valid,
     crc32c,
@@ -257,7 +264,7 @@ def test_routing_table_full_bucket_pings_a_dubious_node_instead_of_evicting() ->
     ids = [secrets.token_bytes(20) for _ in range(BUCKET_MAX_COUNT)]
     for i, node_id in enumerate(ids):
         confirm_time = 1000.0 if i == 0 else 9000.0
-        table.new_node(node_id, ("203.0.113.1", 20000 + i), confirm=2, now=confirm_time)
+        table.new_node(node_id, (f"203.0.113.{i % 254 + 1}", 20000 + i), confirm=2, now=confirm_time)
     assert len(table) == BUCKET_MAX_COUNT
 
     pinged: list[Node] = []
@@ -279,12 +286,14 @@ def test_routing_table_splits_its_own_bucket_when_full_of_good_nodes() -> None:
     # the newcomer rather than depending on random luck to avoid re-filling it.
     for i in range(BUCKET_MAX_COUNT):
         node_id = bytes([0x80]) + secrets.token_bytes(19)
-        table.new_node(node_id, ("203.0.113.1", 20000 + i), confirm=2, now=1000.0)
+        table.new_node(node_id, (f"203.0.113.{i % 254 + 1}", 20000 + i), confirm=2, now=1000.0)
     assert len(table._buckets) == 1
     assert len(table) == BUCKET_MAX_COUNT
 
     newcomer = bytes([0x00]) + secrets.token_bytes(19)  # top bit 0 -- our side
-    result = table.new_node(newcomer, ("203.0.113.2", 30000), confirm=2, now=1000.0)
+    # An address none of the planted nodes used -- one entry per IP is now a
+    # rule of the table, not an accident of the fixture.
+    result = table.new_node(newcomer, ("203.0.113.200", 30000), confirm=2, now=1000.0)
 
     assert result is not None and result.id == newcomer
     assert len(table._buckets) == 2
@@ -302,7 +311,10 @@ def test_search_keeps_at_most_search_nodes_slots_sorted_by_distance() -> None:
     target = secrets.token_bytes(20)
     search = Search(target)
     for i in range(SEARCH_NODES + 5):
-        search.insert(secrets.token_bytes(20), ("203.0.113.1", 20000 + i), replied=False)
+        # A different /24 each: MAX_SEARCH_NODES_PER_PREFIX deliberately stops
+        # one network filling a search's frontier, which is not what this test
+        # is about.
+        search.insert(secrets.token_bytes(20), (f"198.51.{i}.1", 20000 + i), replied=False)
     assert len(search._nodes) == SEARCH_NODES
     dists = [search._dist(n.id) for n in search._nodes]
     assert dists == sorted(dists)
@@ -717,3 +729,107 @@ async def test_without_a_forwarded_port_the_source_port_is_still_what_gets_publi
     finally:
         server.close()
         client.close()
+
+
+# =============================================================================
+# Hardening taken from libtorrent/Transmission after the first release worked.
+# =============================================================================
+
+def test_one_flooding_source_does_not_deny_service_to_everyone_else() -> None:
+    """What the global token bucket cannot express.
+
+    A single bucket answers "are we being asked too much" and never "by whom",
+    so one noisy address could spend the whole 400-token budget and every other
+    node on the network was refused as a result -- a stranger deciding who we
+    talk to. libtorrent keeps both budgets for this reason.
+    """
+    limiter = SourceLimiter()
+    flooder, bystander = "198.51.100.5", "203.0.113.9"
+
+    blocked_at = None
+    for i in range(200):
+        if not limiter.allow(flooder, now=1.0):
+            blocked_at = i
+            break
+    assert blocked_at is not None, "a flooding source was never blocked"
+    assert limiter.allow(bystander, now=1.0), "an innocent address was refused too"
+
+
+def test_a_blocked_source_is_forgiven_after_the_timeout() -> None:
+    limiter = SourceLimiter()
+    ip = "198.51.100.5"
+    for _ in range(200):
+        limiter.allow(ip, now=1.0)
+    assert not limiter.allow(ip, now=1.0)
+    assert limiter.allow(ip, now=1.0 + SOURCE_BLOCK_S + 1.0)
+
+
+def test_slow_traffic_is_never_mistaken_for_a_flood() -> None:
+    """Spread the same number of messages over a long enough period and it is
+    just an ordinary busy peer."""
+    limiter = SourceLimiter()
+    ip = "198.51.100.5"
+    now = 0.0
+    for _ in range(100):
+        assert limiter.allow(ip, now=now)
+        now += SOURCE_BURST_WINDOW_S + 1.0
+
+
+def test_one_public_address_gets_one_routing_table_slot() -> None:
+    """libtorrent's dht_restrict_routing_ips. Ports are free, addresses are
+    not -- otherwise one host binds sixteen sockets and owns a bucket."""
+    table = RoutingTable(b"\x00" * 20, allow_loopback=True)
+    first = table.new_node(secrets.token_bytes(20), ("203.0.113.7", 6881), confirm=2, now=1.0)
+    second = table.new_node(secrets.token_bytes(20), ("203.0.113.7", 6882), confirm=2, now=1.0)
+    assert first is not None
+    assert second is None, "a second identity from one public address was admitted"
+
+
+def test_several_nodes_may_share_a_private_address() -> None:
+    """The exemption matters as much as the rule: a household behind one NAT,
+    or an in-process test swarm on loopback, really is several nodes at one
+    address, and only on the public internet is that evidence of anything."""
+    table = RoutingTable(b"\x00" * 20, allow_loopback=True)
+    kept = [table.new_node(secrets.token_bytes(20), ("127.0.0.1", 6881 + i), confirm=2, now=1.0)
+            for i in range(4)]
+    assert all(n is not None for n in kept)
+
+
+def test_one_network_cannot_fill_a_search_frontier() -> None:
+    """libtorrent's dht_restrict_search_ips: nodes this close together in CIDR
+    terms are not independent, so a rented /24 must not be able to surround a
+    target even if every ID in it verifies."""
+    target = secrets.token_bytes(20)
+    search = Search(target)
+    admitted = [search.insert(secrets.token_bytes(20), (f"203.0.113.{i}", 6881), replied=False)
+                for i in range(1, 8)]
+    assert sum(1 for a in admitted if a is not None) == MAX_SEARCH_NODES_PER_PREFIX
+    assert search.rejected_prefix == 7 - MAX_SEARCH_NODES_PER_PREFIX
+
+
+async def test_a_get_peers_reply_is_capped() -> None:
+    """dht_max_peers_reply. A reply is bigger than the query that provokes it,
+    so an unbounded one is a gift to anyone spoofing a source address."""
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        info_hash = secrets.token_bytes(20)
+        for i in range(MAX_PEERS_REPLY + 50):
+            server._peer_store.store(info_hash, (f"198.51.{i // 254}.{i % 254 + 1}", 6881))
+        reply = await client.get_peers(_loopback_addr(server), info_hash, timeout=2.0)
+        assert reply is not None and b"values" in reply
+        assert len(reply[b"values"]) == MAX_PEERS_REPLY
+    finally:
+        server.close()
+        client.close()
+
+
+def test_the_udp_socket_asks_for_a_large_receive_buffer() -> None:
+    """Transmission sets these explicitly because the default is small enough
+    that a burst of DHT traffic is simply dropped -- which from inside looks
+    exactly like an unreliable network, with no error anywhere to say so."""
+    sock = udp_socket(0)
+    try:
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) >= MIN_USEFUL_RECV_BUFFER
+    finally:
+        sock.close()

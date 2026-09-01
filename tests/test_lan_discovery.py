@@ -1,9 +1,12 @@
 import asyncio
+import socket
 
 import sys
 
 import pytest
 
+from roastmesh import lan_discovery
+from roastmesh.interfaces import Interface
 from roastmesh.lan_discovery import run_beacon
 
 # a dedicated test port so this never collides with a real roastmesh node
@@ -110,3 +113,62 @@ async def test_repeated_beacons_are_debounced_within_resync_window() -> None:
                 await t
             except asyncio.CancelledError:
                 pass
+
+
+# --- announcing on every interface, not just the default route's -----------
+
+class _FakeSock:
+    def __init__(self) -> None:
+        self.multicast_if: list[str] = []
+
+    def setsockopt(self, level, opt, value):
+        if opt == socket.IP_MULTICAST_IF:
+            self.multicast_if.append(socket.inet_ntoa(value))
+
+
+class _FakeTransport:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, int]] = []
+
+    def sendto(self, _payload, addr):
+        self.sent.append(addr)
+
+
+def test_the_beacon_goes_out_every_interface_not_just_the_routed_one(monkeypatch) -> None:
+    """The measured bug, in miniature.
+
+    On a Raspberry Pi with a VPN up, `ip route get 255.255.255.255` resolves to
+    the tunnel, so the single global broadcast the beacon used to send went down
+    the VPN and the machine's real LAN on wlan0 never heard it -- LAN discovery
+    found nobody on the one network where it should be effortless. The fix is to
+    stop asking the routing table and address each interface directly.
+    """
+    interfaces = [
+        Interface("wlan0", 3, "192.168.2.19", "192.168.2.255"),   # the LAN
+        Interface("tun0", 9, "10.137.8.74", None),                # the VPN
+    ]
+    monkeypatch.setattr(lan_discovery, "local_interfaces", lambda: interfaces)
+    sock, transport = _FakeSock(), _FakeTransport()
+
+    lan_discovery._announce(sock, transport, b"hello", 41888)
+
+    assert ("192.168.2.255", 41888) in transport.sent, "the real LAN was not addressed"
+    # The tunnel has no broadcast address, so it gets the multicast announce
+    # only -- and both interfaces get one, each scoped to itself.
+    assert sock.multicast_if == ["192.168.2.19", "10.137.8.74"]
+    assert transport.sent.count((lan_discovery.MULTICAST_GROUP, 41888)) == 2
+    # And nothing goes to the global broadcast any more: on that Pi it reached
+    # only the VPN's far end, handing it our pubkey and ticket for nothing.
+    assert ("255.255.255.255", 41888) not in transport.sent
+
+
+def test_an_unknown_platform_keeps_the_old_global_broadcast(monkeypatch) -> None:
+    """Enumeration is best-effort and platform-specific. Where it returns
+    nothing we must behave exactly as before rather than going silent."""
+    monkeypatch.setattr(lan_discovery, "local_interfaces", list)
+    sock, transport = _FakeSock(), _FakeTransport()
+
+    lan_discovery._announce(sock, transport, b"hello", 41888)
+
+    assert transport.sent == [("255.255.255.255", 41888)]
+    assert sock.multicast_if == []

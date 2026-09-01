@@ -41,6 +41,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from roastmesh.dht import (
+    IP_VOTE_QUORUM,
     Addr,
     DhtClient,
     LookupStats,
@@ -88,9 +89,9 @@ BOOTSTRAP_SLOW_INTERVAL_S = 15.0
 
 # BEP 42: "Since a single node can not be trusted, there should be some
 # mechanism to determine whether or not the node has a correct understanding
-# of its external IP". Ours is a plain majority across distinct responders,
-# and we refuse to act on fewer than this many.
-IP_VOTE_QUORUM = 3
+# of its external IP". The quorum, the rotation that stops a stale address
+# winning forever, and the hysteresis that stops it flapping all live in
+# dht.IpVoter; IP_VOTE_QUORUM is imported from there.
 
 # Deliberately still "roastnet", the project's former name. This string is not
 # a label -- it is the rendezvous point every node looks itself up under, so
@@ -210,10 +211,14 @@ def external_address(client: DhtClient) -> tuple[Addr | None, str, int]:
     """
     votes = client.ip_votes
     total = sum(votes.values())
-    if not votes or total < IP_VOTE_QUORUM:
+    best = client.external_address
+    if best is None:
         return None, "unknown", total
-    best = max(votes, key=lambda claim: votes[claim])
-    return best, ("symmetric" if len({p for _ip, p in votes}) > 1 else "consistent"), total
+    # Ports across the current round and the previous one: a tally that has
+    # just rotated is empty, and reading the verdict from it alone would
+    # report a symmetric node as consistent for the next few votes.
+    ports = client.external_ports_seen
+    return best, ("symmetric" if len(ports) > 1 else "consistent"), total
 
 
 def needs_public_port(nat: str, readback: bool | None, public_port: int | None) -> bool:
