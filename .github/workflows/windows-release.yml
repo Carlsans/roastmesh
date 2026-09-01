@@ -132,12 +132,29 @@ jobs:
           if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\roastmesh.lnk")) {
             throw "Start Menu shortcut missing"
           }
+          # The firewall rule is the difference between a node that can reach
+          # others and one others can reach. Its absence is invisible at
+          # runtime -- roastmesh looks healthy and simply receives nothing --
+          # which is exactly why it is asserted here rather than trusted.
+          $fw = (& netsh advfirewall firewall show rule name="roastmesh" | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "installer did not add the firewall rule" }
+          if ($fw -notmatch "roastmesh\.exe") {
+            throw "firewall rule exists but does not point at roastmesh.exe: $fw"
+          }
+          if ($fw -notmatch "(?i)Private") {
+            throw "firewall rule is not scoped to private networks: $fw"
+          }
+          Write-Host "firewall rule present and scoped -- OK"
           & "$dir\roastmesh.exe" --version
           & "$dir\uninstall.exe" /S
           Start-Sleep -Seconds 10
           if (Test-Path "$dir\roastmesh.exe") { throw "uninstaller left roastmesh.exe behind" }
           if (Test-Path "$dir\_internal") { throw "uninstaller left the _internal tree behind" }
-          Write-Host "install -> run -> uninstall OK"
+          & netsh advfirewall firewall show rule name="roastmesh" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            throw "uninstaller left the firewall rule behind"
+          }
+          Write-Host "install -> run -> uninstall OK (firewall rule added and removed)"
 
       - name: Zip the portable build
         # onedir means a bare .exe is no longer a usable download -- without

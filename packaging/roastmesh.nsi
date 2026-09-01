@@ -30,20 +30,19 @@ SetCompressor /SOLID lzma
 BrandingText    "${APPNAME} ${VERSION}"
 
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 !define MUI_ICON   "roastmesh.ico"
 !define MUI_UNICON "roastmesh.ico"
 
 !define MUI_FINISHPAGE_RUN "$INSTDIR\roastmesh-gui.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Open roastmesh"
 
-; Shown at exactly the moment it matters: Windows raises its firewall prompt
-; the first time roastmesh opens a listening socket, which is seconds after
-; this page. "Private networks" is unticked by default in some Windows
-; configurations, and without it the LAN beacon is blocked -- roastmesh then
-; finds nobody on the home network and looks broken, with nothing to indicate
-; a firewall is the cause.
+; The installer now asks for the firewall rule itself (see SecMain), so this
+; page no longer depends on the user catching a prompt at the right moment.
+; It still says what to do if that did not take, because a blocked roastmesh
+; looks exactly like a working one that simply finds nobody.
 !define MUI_FINISHPAGE_TITLE "roastmesh is installed"
-!define MUI_FINISHPAGE_TEXT "One thing before you start.$\r$\n$\r$\nWhen Windows asks whether to allow roastmesh on a network, tick PRIVATE NETWORKS. Windows Firewall otherwise blocks the beacon roastmesh uses to find other machines on your home or studio network, and it will quietly find nobody there.$\r$\n$\r$\nIf you miss the prompt, you can fix it later under Windows Security > Firewall & network protection > Allow an app through firewall.$\r$\n$\r$\nSharing over the internet does not depend on this."
+!define MUI_FINISHPAGE_TEXT "roastmesh asked Windows Firewall to allow incoming connections on private and domain networks, so other machines can reach this one.$\r$\n$\r$\nIf you declined that prompt, or if Windows later asks again, allow it for PRIVATE NETWORKS. Without it roastmesh can still find other machines, but they cannot find this one -- it looks like it is working and quietly receives nothing.$\r$\n$\r$\nYou can change this at any time under Windows Security > Firewall & network protection > Allow an app through firewall."
 
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -79,8 +78,40 @@ Section "roastmesh" SecMain
   WriteRegDWORD HKCU "${REGKEY}" "NoModify" 1
   WriteRegDWORD HKCU "${REGKEY}" "NoRepair" 1
 
+  Call AddFirewallRule
+
   WriteUninstaller "$INSTDIR\uninstall.exe"
 SectionEnd
+
+; Only roastmesh.exe needs a rule. It is the process that serves: the GUI
+; shells out to it for everything (gui/runner.py's roastmesh_argv), and binds
+; nothing itself except a loopback port for single-instance detection, which
+; no firewall ever blocks.
+;
+; private,domain and deliberately not public: a home or studio network is
+; where roastmesh is meant to be reachable, and a cafe network is exactly
+; where accepting unsolicited inbound connections is not a favour.
+!define FW_RULE 'name="roastmesh" dir=in action=allow program="$INSTDIR\roastmesh.exe" enable=yes profile=private,domain'
+
+Function AddFirewallRule
+  DetailPrint "Allowing roastmesh through Windows Firewall..."
+  ; Direct first: succeeds when the installer already happens to be elevated,
+  ; which is the case in CI and for anyone who ran it as administrator.
+  nsExec::ExecToLog 'netsh.exe advfirewall firewall add rule ${FW_RULE}'
+  Pop $0
+  ${If} $0 != 0
+    ; A per-user install has no UAC prompt by design, so this is the one place
+    ; that asks for one -- and only interactively. Raising a UAC dialog during
+    ; a /S silent install would hang whatever automation invoked it.
+    ${IfNot} ${Silent}
+      ExecShellWait "runas" "netsh.exe" 'advfirewall firewall add rule ${FW_RULE}' SW_HIDE
+    ${EndIf}
+  ${EndIf}
+  ; Never fatal. Declining the prompt leaves roastmesh able to reach out but
+  ; not to be reached, which the finish page explains -- it is not a reason to
+  ; fail an install that has otherwise completely succeeded.
+  ClearErrors
+FunctionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\roastmesh.exe"
@@ -93,6 +124,17 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\_internal"
   RMDir  "$INSTDIR"
   Delete "$SMPROGRAMS\roastmesh.lnk"
+
+  ; Leaving a firewall exception behind for a program that no longer exists is
+  ; the kind of quiet residue an uninstall exists to prevent.
+  nsExec::ExecToLog 'netsh.exe advfirewall firewall delete rule name="roastmesh"'
+  Pop $0
+  ${If} $0 != 0
+    ${IfNot} ${Silent}
+      ExecShellWait "runas" "netsh.exe" 'advfirewall firewall delete rule name="roastmesh"' SW_HIDE
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
 
   DeleteRegKey HKCU "${REGKEY}"
   DeleteRegKey HKCU "Software\roastmesh"
