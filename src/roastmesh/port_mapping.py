@@ -25,6 +25,8 @@ import socket
 import struct
 from dataclasses import dataclass
 
+from roastmesh.interfaces import default_gateway
+
 PORT_MAPPING_PORT = 5351
 DEFAULT_LIFETIME_S = 3600
 
@@ -39,28 +41,6 @@ class Mapping:
     external_port: int
     lifetime_s: int
     protocol: str  # "pcp" or "natpmp" -- which one answered
-
-
-def default_gateway() -> str | None:
-    """The default route's next hop, or None if we cannot tell.
-
-    Linux reads /proc/net/route. Everywhere else returns None, which the caller
-    treats as "no automatic mapping available" -- the same position as before
-    this module existed, not a failure.
-    """
-    try:
-        with open("/proc/net/route", encoding="ascii") as handle:
-            next(handle)  # header
-            for line in handle:
-                fields = line.split()
-                if len(fields) < 3 or fields[1] != "00000000":
-                    continue
-                # Little-endian hex, as the kernel writes it.
-                gw = int(fields[2], 16)
-                return socket.inet_ntoa(struct.pack("<I", gw))
-    except (OSError, StopIteration, ValueError):
-        return None
-    return None
 
 
 def _local_address_towards(gateway: str, port: int = PORT_MAPPING_PORT) -> str | None:
