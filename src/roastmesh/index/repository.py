@@ -171,11 +171,11 @@ def insert_roast(conn: sqlite3.Connection, record: RoastRecord, source_id: str) 
     conn.execute("DELETE FROM roasts_fts WHERE roast_id = ?", (record.roast_id,))
     _, _, machine_display = normalize_machine_key(record.roaster_type_raw)
     conn.execute(
-        """INSERT INTO roasts_fts (roast_id, beans_text, roasting_notes, cupping_notes,
-                                    roast_type, machine_display)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (record.roast_id, record.beans_text, record.roasting_notes, record.cupping_notes,
-         record.roast_type, machine_display),
+        """INSERT INTO roasts_fts (roast_id, title, beans_text, roasting_notes,
+                                    cupping_notes, roast_type, machine_display)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (record.roast_id, record.title, record.beans_text, record.roasting_notes,
+         record.cupping_notes, record.roast_type, machine_display),
     )
 
 

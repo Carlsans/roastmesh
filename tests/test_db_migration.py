@@ -160,3 +160,89 @@ def test_migrate_author_pubkey_is_idempotent_once_the_column_already_exists(tmp_
     conn = connect(db_path)
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(sources)")}
     assert "author_pubkey" in columns
+
+
+def _create_pre_title_fts_database(db_path: Path) -> None:
+    """A database whose roasts_fts predates the `title` column, holding a
+    roast and its matching (title-less) index row -- what an installed
+    roastmesh from before this change actually has on disk."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sources (
+            source_id TEXT PRIMARY KEY, source_type TEXT NOT NULL, source_ref TEXT NOT NULL,
+            source_url TEXT, fetched_at TEXT NOT NULL, raw_path TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL UNIQUE, author_pubkey TEXT
+        );
+        CREATE TABLE roasts (
+            roast_id TEXT PRIMARY KEY, source_id TEXT NOT NULL, roast_uuid TEXT,
+            roaster_type_raw TEXT, machine_key TEXT NOT NULL, mechanism_family TEXT NOT NULL,
+            batch_weight_in_g REAL, batch_weight_out_g REAL, density_g_per_l REAL,
+            title TEXT, beans_text TEXT, roast_date TEXT, roast_epoch INTEGER,
+            roast_type TEXT, roasting_notes TEXT, cupping_notes TEXT,
+            is_user_log INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0,
+            parse_warnings_json TEXT, raw_json TEXT NOT NULL
+        );
+        CREATE VIRTUAL TABLE roasts_fts USING fts5(
+            roast_id UNINDEXED, beans_text, roasting_notes, cupping_notes,
+            roast_type, machine_display
+        );
+    """)
+    conn.execute(
+        """INSERT INTO roasts (roast_id, source_id, machine_key, mechanism_family,
+                               roaster_type_raw, title, beans_text, roast_type,
+                               roasting_notes, cupping_notes, raw_json)
+           VALUES ('r1', 's1', 'hottop', 'drum', 'Hottop 2K+',
+                   'Sunday Morning Yirgacheffe', 'Ethiopia', 'full city',
+                   'notes here', '', '{}')""")
+    conn.execute(
+        """INSERT INTO roasts_fts (roast_id, beans_text, roasting_notes, cupping_notes,
+                                   roast_type, machine_display)
+           VALUES ('r1', 'Ethiopia', 'notes here', '', 'full city', 'Hottop 2K+')""")
+    conn.commit()
+    conn.close()
+
+
+def test_an_existing_index_is_rebuilt_so_titles_become_searchable(tmp_path: Path) -> None:
+    """The reason this migration exists: for two releases a roast could not be
+    found by the name printed in its own search result, which is the first
+    thing anyone would type. ALTER TABLE cannot add a column to an FTS5 table,
+    so the only route is to drop it and rebuild -- and the rebuild has to carry
+    the existing roasts across, or search returns nothing until some later
+    reindex happens to run.
+    """
+    db = tmp_path / "old.sqlite3"
+    _create_pre_title_fts_database(db)
+
+    conn = connect(db)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(roasts_fts)")}
+        assert "title" in columns
+
+        hit = conn.execute(
+            "SELECT roast_id FROM roasts_fts WHERE roasts_fts MATCH 'Yirgacheffe'"
+        ).fetchall()
+        assert [r["roast_id"] for r in hit] == ["r1"], "the title is still not searchable"
+
+        # Everything that was already indexed has to survive the rebuild.
+        for term in ("Ethiopia", "notes", "Hottop"):
+            found = conn.execute(
+                "SELECT roast_id FROM roasts_fts WHERE roasts_fts MATCH ?", (term,)
+            ).fetchall()
+            assert [r["roast_id"] for r in found] == ["r1"], f"lost {term!r} in the rebuild"
+    finally:
+        conn.close()
+
+
+def test_rebuilding_the_index_is_idempotent(tmp_path: Path) -> None:
+    """Reopening must not drop and refill the table every time -- that would
+    turn every connect() on a large index into a full reindex."""
+    db = tmp_path / "old.sqlite3"
+    _create_pre_title_fts_database(db)
+    connect(db).close()
+
+    conn = connect(db)
+    try:
+        rows = conn.execute("SELECT roast_id FROM roasts_fts").fetchall()
+        assert len(rows) == 1, "the rebuild duplicated rows on a second open"
+    finally:
+        conn.close()

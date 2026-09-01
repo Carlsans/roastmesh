@@ -68,6 +68,17 @@ from roastmesh.wan_discovery import DHT_LOOKUP_INTERVAL_S, WAN_PORT, run_wan_dis
 from roastmesh.watch_folder import publish_new_files
 
 ALPN = b"roastmesh/peer-sync/0"
+
+# A dial has to be bounded, and the reason is not impatience.
+#
+# A ticket pins the addresses a peer had when it minted the ticket. Once those
+# go stale the dial does not fail -- it sits there, for far longer than anyone
+# will wait. That matters more than the delay: the fallback in sync_with_peer
+# reconnects by identity alone in about two seconds, so a hang does not merely
+# postpone success, it prevents a recovery that would have worked. Observed as
+# `peer sync` producing no output whatsoever for 75 seconds, against a peer
+# that was online and reachable throughout.
+CONNECT_TIMEOUT_S = 20.0
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
@@ -532,8 +543,8 @@ async def sync_with_peer(
     ep = await bind_endpoint(identity, relay=relay)
     try:
         try:
-            conn = await ep.connect(addr, ALPN)
-        except Exception:
+            conn = await asyncio.wait_for(ep.connect(addr, ALPN), CONNECT_TIMEOUT_S)
+        except (Exception, asyncio.TimeoutError):
             # A ticket pins the addresses a peer had when it minted the ticket,
             # and those go stale on its next restart or IP change -- but its
             # identity never does. `preset_n0` (bind_endpoint) publishes every
@@ -545,7 +556,15 @@ async def sync_with_peer(
             peer_id = addr.id()
             if not str(peer_id):
                 raise
-            conn = await ep.connect(iroh.EndpointAddr(peer_id, None, []), ALPN)
+            try:
+                conn = await asyncio.wait_for(
+                    ep.connect(iroh.EndpointAddr(peer_id, None, []), ALPN), CONNECT_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"could not reach peer {str(peer_id)[:16]}... within "
+                    f"{CONNECT_TIMEOUT_S:.0f}s -- it is probably offline, or neither side "
+                    "can open a connection to the other"
+                ) from None
         peer_pubkey_hex = str(conn.remote_id())
 
         mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex

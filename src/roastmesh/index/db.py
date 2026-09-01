@@ -64,7 +64,45 @@ def migrate(conn: sqlite3.Connection) -> None:
     # after that column is guaranteed to exist on both a fresh and an
     # upgraded database -- see schema.sql's comment by `sources`.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_author ON sources(author_pubkey)")
+    _rebuild_fts_if_stale(conn)
     conn.commit()
+
+
+def _rebuild_fts_if_stale(conn: sqlite3.Connection) -> None:
+    """Recreate roasts_fts when it predates a column, and refill it.
+
+    _apply_added_columns cannot help here: ALTER TABLE ADD COLUMN does not
+    work on an FTS5 virtual table, so the only way to add `title` to a
+    database that already exists is to drop the table and build it again.
+
+    Safe to do because roasts_fts holds nothing of its own -- every column is
+    a copy of one in `roasts`, so it can be rebuilt from there in full. That
+    is also why it is refilled here rather than left to the version-gated
+    reindex: search would otherwise return nothing at all until that ran.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(roasts_fts)")}
+    if not columns or "title" in columns:
+        return
+    conn.execute("DROP TABLE roasts_fts")
+    conn.executescript(
+        resources.files("roastmesh.index").joinpath("schema.sql").read_text(encoding="utf-8")
+    )
+    from roastmesh.alog.machine import normalize_machine_key
+
+    rows = conn.execute(
+        """SELECT roast_id, title, beans_text, roasting_notes, cupping_notes,
+                  roast_type, roaster_type_raw FROM roasts"""
+    ).fetchall()
+    conn.executemany(
+        """INSERT INTO roasts_fts (roast_id, title, beans_text, roasting_notes,
+                                    cupping_notes, roast_type, machine_display)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [(r["roast_id"], r["title"], r["beans_text"], r["roasting_notes"],
+          r["cupping_notes"], r["roast_type"],
+          normalize_machine_key(r["roaster_type_raw"])[2]) for r in rows],
+    )
+    print(f"index: rebuilt the search index over {len(rows)} roast(s) so titles are "
+          "searchable", flush=True)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

@@ -103,8 +103,14 @@ CREATE INDEX IF NOT EXISTS idx_user_likes_subject ON user_likes(subject_pubkey);
 -- (origin, process, etc. only ever show up as prose in beans_text/notes).
 -- Own-copy (not "content=" external-content mode) so inserts/deletes follow
 -- the same delete-then-reinsert pattern already used for milestones/note_tags.
+-- `title` is here because for two releases it was not, and a roast could not
+-- be found by the name printed in its own search result -- the most obvious
+-- thing anyone would type. Adding a column to an FTS5 table is not something
+-- CREATE TABLE IF NOT EXISTS can do to a database that already exists, so
+-- db.py rebuilds this table when it finds the older shape.
 CREATE VIRTUAL TABLE IF NOT EXISTS roasts_fts USING fts5(
     roast_id UNINDEXED,
+    title,
     beans_text,
     roasting_notes,
     cupping_notes,

@@ -803,3 +803,33 @@ async def test_auto_sync_ingests_a_mirror_the_index_never_took(tmp_path: Path) -
         assert _index_is_behind_mirror(conn, publisher.public_key_hex, mirror_dir) is False
     finally:
         conn.close()
+
+
+async def test_a_stale_ticket_falls_back_to_the_identity_dial_instead_of_hanging(monkeypatch) -> None:
+    """The bug: a ticket pins addresses, those go stale, and dialling them does
+    not fail -- it hangs. The identity-only fallback right below it reconnects
+    in about two seconds, so the hang was not delaying success but preventing a
+    recovery that would have worked. Measured as `peer sync` printing nothing
+    at all for 75 seconds against a peer that was online throughout.
+    """
+    from roastmesh import net
+
+    monkeypatch.setattr(net, "CONNECT_TIMEOUT_S", 0.2)
+    calls: list[str] = []
+
+    async def _never_returns(*_a, **_kw):
+        calls.append("pinned")
+        await asyncio.sleep(60)          # the stale-address dial, hanging
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(_never_returns(), net.CONNECT_TIMEOUT_S)
+    assert calls == ["pinned"]
+
+
+def test_the_connect_timeout_is_bounded_and_short() -> None:
+    """Pinned deliberately: the value only has to outlast a normal dial, and
+    the fallback it protects takes seconds. A generous timeout here would
+    reinstate the original symptom in slower form."""
+    from roastmesh import net
+
+    assert 5.0 <= net.CONNECT_TIMEOUT_S <= 30.0
