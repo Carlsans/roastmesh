@@ -136,7 +136,11 @@ jobs:
           # others and one others can reach. Its absence is invisible at
           # runtime -- roastmesh looks healthy and simply receives nothing --
           # which is exactly why it is asserted here rather than trusted.
-          $fw = (& netsh advfirewall firewall show rule name="roastmesh" | Out-String)
+          # `verbose` is required: without it netsh prints the rule's direction,
+          # profiles and action but silently omits the Program it applies to --
+          # which is the one field worth checking, since a rule allowing
+          # nothing in particular would pass every other assertion here.
+          $fw = (& netsh advfirewall firewall show rule name="roastmesh" verbose | Out-String)
           if ($LASTEXITCODE -ne 0) { throw "installer did not add the firewall rule" }
           if ($fw -notmatch "roastmesh\.exe") {
             throw "firewall rule exists but does not point at roastmesh.exe: $fw"
