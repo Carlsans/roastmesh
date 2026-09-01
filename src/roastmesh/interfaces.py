@@ -41,12 +41,17 @@ class Interface:
     index: int
     address: str
     broadcast: str | None
+    # Optional so older callers keep working; needed to tell whether a device
+    # that answered a multicast probe is even on the network we probed (see
+    # upnp.py, and libtorrent's match_addr_mask).
+    netmask: str | None = None
 
 
 # Linux ioctls. Values from <bits/ioctls.h>; stable ABI, not worth a lookup.
 _SIOCGIFFLAGS = 0x8913
 _SIOCGIFADDR = 0x8915
 _SIOCGIFBRDADDR = 0x8919
+_SIOCGIFNETMASK = 0x891B
 
 _IFF_UP = 0x1
 _IFF_BROADCAST = 0x2
@@ -95,10 +100,34 @@ def _linux_interfaces() -> list[Interface]:
                     # broadcast to.
                     if candidate not in ("0.0.0.0", address):
                         broadcast = candidate
-            out.append(Interface(name=name, index=index, address=address, broadcast=broadcast))
+            netmask = None
+            mask_raw = _linux_ioctl(sock, _SIOCGIFNETMASK, name)
+            if mask_raw is not None:
+                netmask = socket.inet_ntoa(mask_raw[20:24])
+            out.append(Interface(name=name, index=index, address=address,
+                                 broadcast=broadcast, netmask=netmask))
     finally:
         sock.close()
     return out
+
+
+def same_subnet(address: str, netmask: str | None, other: str) -> bool:
+    """Is `other` on the same IPv4 subnet as `address`?
+
+    libtorrent's match_addr_mask, and it exists for the same reason: a device
+    that answers a multicast probe is unauthenticated and self-described, so
+    the least we can do is refuse one that is not even on the network we
+    probed. Without a netmask we cannot tell, and say so rather than guessing.
+    """
+    if not netmask:
+        return False
+    try:
+        a = struct.unpack(">I", socket.inet_aton(address))[0]
+        m = struct.unpack(">I", socket.inet_aton(netmask))[0]
+        o = struct.unpack(">I", socket.inet_aton(other))[0]
+    except (OSError, struct.error):
+        return False
+    return m != 0 and (a & m) == (o & m)
 
 
 def broadcast_for(address: str, netmask: str) -> str | None:
@@ -206,7 +235,8 @@ def _windows_adapters():
 
 
 def _windows_interfaces() -> list[Interface]:
-    return [Interface(name=name, index=index, address=ip, broadcast=broadcast_for(ip, mask))
+    return [Interface(name=name, index=index, address=ip, broadcast=broadcast_for(ip, mask),
+                      netmask=mask or None)
             for name, index, ip, mask, _gateway in _windows_adapters()]
 
 

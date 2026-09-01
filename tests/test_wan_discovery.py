@@ -28,6 +28,7 @@ from roastmesh.wan_discovery import (
     default_state_path,
     diagnostics_payload,
     _resolve_named,
+    double_nat_verdict,
     external_address,
     needs_public_port,
     run_wan_discovery,
@@ -283,7 +284,8 @@ async def test_diagnostics_payload_is_the_shape_both_producers_promise() -> None
         assert set(payload) == {
             "external_ip", "external_port", "nat", "ip_votes", "node_id",
             "node_id_bep42", "routing_table", "warm", "lookup", "announce_set",
-            "readback", "public_port", "needs_public_port", "peers", "swarm_info_hash",
+            "readback", "public_port", "router_external_ip", "double_nat",
+            "needs_public_port", "peers", "swarm_info_hash",
         }
         assert set(payload["lookup"]) == {
             "rounds", "queried", "replied", "closest_bits", "announced",
@@ -533,3 +535,34 @@ def test_the_symmetric_verdict_survives_a_rotation() -> None:
     voter.current(now=0.0)                       # the round is full; this rotates it
     assert voter.tally == {}, "expected the round to have been cleared"
     assert len(voter.ports_seen()) > 1, "the symmetric evidence was thrown away"
+
+
+# --- what the router says about our address ---------------------------------
+
+def test_a_router_reporting_a_private_address_means_a_second_layer_of_nat() -> None:
+    """The most useful thing UPnP adds beyond opening a port.
+
+    A router that says its own public address is a private one is itself
+    behind another NAT. That is carrier-grade NAT stated positively, where
+    until now we could only infer it from a symmetric mapping -- and it is the
+    single most useful thing to be able to tell a user who cannot be reached,
+    because no forwarded port can work through it.
+    """
+    assert double_nat_verdict("192.168.100.4", ("203.0.113.9", 4000)) == "double-nat"
+    assert double_nat_verdict("10.64.0.1", None) == "double-nat"
+
+
+def test_a_router_that_agrees_with_the_dht_is_a_free_confirmation() -> None:
+    assert double_nat_verdict("203.0.113.9", ("203.0.113.9", 4000)) == "agrees"
+
+
+def test_a_disagreement_is_reported_rather_than_resolved() -> None:
+    """Two sources, one answer each, and no basis for preferring either --
+    so say they disagree instead of silently picking one."""
+    assert double_nat_verdict("198.51.100.1", ("203.0.113.9", 4000)) == "disagrees"
+
+
+def test_no_verdict_without_upnp() -> None:
+    """PCP and NAT-PMP cannot answer this question, so most nodes will have
+    nothing here and that must not read as a problem."""
+    assert double_nat_verdict(None, ("203.0.113.9", 4000)) is None

@@ -539,6 +539,7 @@ def node_doctor(announce: bool, as_json: bool, public_port: int | None) -> None:
         _resolve_named,
         default_state_path,
         diagnostics_payload,
+        double_nat_verdict,
         needs_public_port,
         external_address,
     )
@@ -591,10 +592,16 @@ def node_doctor(announce: bool, as_json: bool, public_port: int | None) -> None:
                     seed_ids=dict(state), announce=False, stats=LookupStats(),
                 )
 
+            # Ask the router what it thinks our public address is. Read-only:
+            # this is the diagnostic command, so it looks and does not touch --
+            # no mapping is created here even though the same protocol could.
+            router_ip = await _ask_router_for_external_ip()
+
             report = diagnostics_payload(
                 client, stats, info_hash=SWARM_INFO_HASH, external=external, nat=nat,
                 votes=votes, warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
                 readback=readback, addrs=peers, public_port=public_port,
+                router_external_ip=router_ip,
             )
             report["identity"] = ident.public_key_hex
             report["state_path"] = str(state_path)
@@ -611,6 +618,27 @@ def node_doctor(announce: bool, as_json: bool, public_port: int | None) -> None:
             client.close()
 
     asyncio.run(run())
+
+
+async def _ask_router_for_external_ip() -> str | None:
+    """What the router says our public address is, if one will tell us.
+
+    UPnP is the only one of the three port-mapping protocols with a "what is
+    my public address" call, and the answer diagnoses something nothing else
+    can -- see wan_discovery.double_nat_verdict.
+    """
+    import asyncio as _asyncio
+
+    from roastmesh import upnp
+
+    def _look() -> str | None:
+        igd = upnp.discover()
+        return upnp.get_external_ip(igd) if igd is not None else None
+
+    try:
+        return await _asyncio.wait_for(_asyncio.to_thread(_look), 15.0)
+    except Exception:  # noqa: BLE001 -- no router is an ordinary answer
+        return None
 
 
 def _print_doctor_report(r: dict) -> None:
@@ -662,6 +690,28 @@ def _print_doctor_report(r: dict) -> None:
                        "which nothing here can\n       tell you: a stable mapping that still "
                        "drops unsolicited packets is\n       common, and was exactly the case "
                        "on the machine this was tested from.")
+
+    verdict = r.get("double_nat")
+    if verdict == "double-nat":
+        click.echo(f"  your router says its own public address is "
+                   f"{r['router_external_ip']}, which is a private one --\n"
+                   "  so it is behind another NAT as well (carrier-grade NAT). No port\n"
+                   "  you forward on it can be reached from the internet. Only your ISP\n"
+                   "  can change that; a VPN offering port forwarding is the usual way out.")
+    elif verdict == "agrees":
+        click.echo(f"  your router agrees: {r['router_external_ip']}")
+    elif verdict == "disagrees":
+        # Measured on the development machine: the ISP changed its address, the
+        # router knew immediately and the DHT tally was still carrying the old
+        # one. The router is authoritative for its own WAN and updates first;
+        # the DHT is what peers actually see and needs a fresh quorum. So this
+        # is usually a tally catching up, not two routes out -- and it is the
+        # reason the router's answer is reported rather than acted on.
+        click.echo(f"  NOTE: your router says {r['router_external_ip']}, the DHT says "
+                   f"{r['external_ip']}.\n"
+                   "  The router usually learns a new address first, so this most often "
+                   "means\n  the DHT's view has not caught up yet -- it settles on its own "
+                   "within a\n  few minutes. Peers reach you at whatever the DHT reports.")
 
     t = r["routing_table"]
     click.echo(f"\nrouting table: {t['good']} good of {t['total']} "
@@ -722,6 +772,13 @@ def _print_public_port_advice(r: dict) -> None:
     report just says "not findable" and leaves the user nowhere.
     """
     port = r.get("public_port")
+    if r.get("double_nat") == "double-nat":
+        click.echo("\n  WHAT TO DO: nothing here will help.")
+        click.echo("  Your router is itself behind your ISP's NAT, so there is no port on\n"
+                   "  it that anyone outside can reach -- forwarding one changes nothing.\n"
+                   "  A VPN that offers port forwarding is the usual way out; roastmesh\n"
+                   "  still finds others and syncs with them meanwhile.")
+        return
     click.echo("\n  WHAT TO DO: this node needs a forwarded port.")
     if r["nat"] == "symmetric":
         click.echo("  Your NAT gives every destination a different port, so the port "

@@ -14,6 +14,7 @@ import struct
 
 import pytest
 
+from roastmesh import port_mapping
 from roastmesh.port_mapping import (
     Mapping,
     _natpmp_request,
@@ -69,6 +70,21 @@ async def _start_router(**kwargs) -> tuple[asyncio.DatagramTransport, _FakeRoute
     router = _FakeRouter(**kwargs)
     transport, _ = await loop.create_datagram_endpoint(lambda: router, local_addr=("127.0.0.1", 0))
     return transport, router, transport.get_extra_info("sockname")[1]
+
+
+@pytest.fixture(autouse=True)
+def _no_upnp_fallback(monkeypatch):
+    """These tests are about the two UDP protocols.
+
+    map_udp_port falls through to UPnP when neither answers, and that is a real
+    multicast search of the actual network -- which would make "no mapping"
+    take seconds and, on a machine whose router does speak UPnP, not be true
+    at all. The fallback has its own test below.
+    """
+    async def _none(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(port_mapping.upnp, "map_udp_port", _none)
 
 
 async def test_a_pcp_router_grants_a_mapping() -> None:
@@ -149,3 +165,59 @@ def test_gateway_discovery_returns_an_address_or_nothing() -> None:
     gw = default_gateway()
     if gw is not None:
         socket.inet_aton(gw)  # raises if it is not a dotted quad
+
+
+async def test_upnp_is_tried_when_neither_udp_protocol_answers(monkeypatch) -> None:
+    """The ordering that matters: PCP and NAT-PMP are one round trip each, so
+    they go first; UPnP is a multicast search plus HTTP plus SOAP, so it goes
+    last -- but it does go."""
+    from roastmesh.upnp import Igd, UpnpMapping
+
+    called: list[int] = []
+
+    async def _upnp(internal_port, **_kw):
+        called.append(internal_port)
+        return UpnpMapping(external_port=51234, lifetime_s=3600,
+                           external_ip="203.0.113.9",
+                           igd=Igd(control_url="http://192.168.0.1/c", service_ns="ns"))
+
+    monkeypatch.setattr(port_mapping.upnp, "map_udp_port", _upnp)
+    transport, _router, port = await _start_router(speaks="none")
+    try:
+        mapping = await map_udp_port(41890, gateway="127.0.0.1", port=port, timeout=0.3)
+    finally:
+        transport.close()
+
+    assert called == [41890]
+    assert mapping is not None
+    assert (mapping.protocol, mapping.external_port) == ("upnp", 51234)
+    assert mapping.external_ip == "203.0.113.9"
+
+
+async def test_a_upnp_mapping_is_released_on_the_way_out(monkeypatch) -> None:
+    """A router that refuses timed leases gives a permanent one, and nothing
+    removes that but us."""
+    from roastmesh.upnp import Igd, UpnpMapping
+
+    released: list[int] = []
+
+    async def _upnp(_internal_port, **_kw):
+        return UpnpMapping(external_port=51234, lifetime_s=0, external_ip=None,
+                           igd=Igd(control_url="http://192.168.0.1/c", service_ns="ns"))
+
+    async def _unmap(mapping):
+        released.append(mapping.external_port)
+        return True
+
+    monkeypatch.setattr(port_mapping.upnp, "map_udp_port", _upnp)
+    monkeypatch.setattr(port_mapping.upnp, "unmap", _unmap)
+    transport, _router, port = await _start_router(speaks="none")
+    try:
+        await map_udp_port(41890, gateway="127.0.0.1", port=port, timeout=0.3)
+    finally:
+        transport.close()
+
+    await port_mapping.release()
+    assert released == [51234]
+    await port_mapping.release()
+    assert released == [51234], "releasing twice tried to delete it again"

@@ -43,6 +43,7 @@ from collections.abc import Awaitable, Callable
 
 from roastmesh.dht import (
     IP_VOTE_QUORUM,
+    _bep42_exempt,
     Addr,
     DhtClient,
     LookupStats,
@@ -52,7 +53,7 @@ from roastmesh.dht import (
     save_node_cache,
 )
 from roastmesh.hello import decode_hello, encode_hello
-from roastmesh.port_mapping import map_udp_port
+from roastmesh.port_mapping import map_udp_port, release as release_port_mapping
 from roastmesh.paths import data_dir
 
 WAN_PORT = 41890
@@ -85,6 +86,10 @@ ANNOUNCE_MAX_BITS = 150
 # How long to wait before asking a router that just said no again. Routers that
 # do not speak PCP or NAT-PMP never will, so this is about not hammering them.
 MAPPING_RETRY_S = 900.0
+
+# A permanent mapping has no expiry to renew before, so this is only a
+# periodic re-check that it is still there.
+PERMANENT_RECHECK_S = 3600.0
 
 # Consecutive announcing rounds whose read-back failed before we say the
 # configured port has stopped working. One failure is a bad round; two in a row
@@ -254,9 +259,30 @@ def needs_public_port(nat: str, readback: bool | None, public_port: int | None) 
     return nat == "symmetric" or readback is False
 
 
+def double_nat_verdict(router_external_ip: str | None, external: Addr | None) -> str | None:
+    """What the router's own idea of our address says, when we can ask it.
+
+    UPnP is the only one of the three mapping protocols with a "what is my
+    public address" call, and the answer is worth more than a confirmation. If
+    the router reports a *private* address, the router is itself behind another
+    NAT -- carrier-grade NAT, stated positively for the first time rather than
+    inferred from a symmetric mapping. No forwarded port can work through that,
+    and it is the single most useful thing to be able to tell a user who
+    cannot be reached.
+    """
+    if router_external_ip is None:
+        return None
+    if _bep42_exempt(router_external_ip):
+        return "double-nat"
+    if external is not None and external[0] != router_external_ip:
+        return "disagrees"
+    return "agrees"
+
+
 def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: bytes,
                         external: Addr | None, nat: str, votes: int, warm: bool,
-                        readback: bool | None, addrs, public_port: int | None = None) -> dict:
+                        readback: bool | None, addrs, public_port: int | None = None,
+                        router_external_ip: str | None = None) -> dict:
     """The single definition of the diagnostics contract.
 
     Both producers use it -- the `wan-stats:` line `node serve` emits every
@@ -298,6 +324,8 @@ def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: byt
         "announce_set": announce_set,
         "readback": readback,
         "public_port": public_port,
+        "router_external_ip": router_external_ip,
+        "double_nat": double_nat_verdict(router_external_ip, external),
         "needs_public_port": needs_public_port(nat, readback, public_port),
         "peers": sorted(f"{a[0]}:{a[1]}" for a in addrs),
         "swarm_info_hash": info_hash.hex(),
@@ -567,6 +595,10 @@ async def run_wan_discovery(
     effective_port = public_port
     mapping_renew_at = 0.0
     stale_port_rounds = 0
+    # What the router says our public address is, when UPnP could ask it.
+    router_external_ip: str | None = None
+    # What the router says our public address is, when UPnP could ask it.
+    router_external_ip: str | None = None
     # The last read-back verdict we actually measured, kept across rounds:
     # most rounds do not announce, and forgetting it every time would flip the
     # read-only flag on and off for no reason.
@@ -583,9 +615,15 @@ async def run_wan_discovery(
                         print(f"wan: router mapped port {mapping.external_port} "
                               f"({mapping.protocol}, {mapping.lifetime_s}s)", flush=True)
                     effective_port = mapping.external_port
+                    router_external_ip = mapping.external_ip
                     # Halfway through the lease, so a renewal that fails still
-                    # leaves a working mapping while we retry.
-                    mapping_renew_at = time.monotonic() + max(mapping.lifetime_s / 2, 60.0)
+                    # leaves a working mapping while we retry. A lease of 0 is
+                    # a *permanent* mapping -- some routers grant nothing else
+                    # -- and renewing that on a 60-second timer would be the
+                    # arithmetic doing something the router never asked for.
+                    mapping_renew_at = time.monotonic() + (
+                        PERMANENT_RECHECK_S if mapping.lifetime_s == 0
+                        else max(mapping.lifetime_s / 2, 60.0))
                 else:
                     mapping_renew_at = time.monotonic() + MAPPING_RETRY_S
 
@@ -651,7 +689,8 @@ async def run_wan_discovery(
                 # what fills the routing table, so reporting the count from
                 # before it makes a healthy node read as permanently cold.
                 warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
-                readback=readback, addrs=addrs, public_port=effective_port)), flush=True)
+                readback=readback, addrs=addrs, public_port=effective_port,
+                router_external_ip=router_external_ip)), flush=True)
             if on_round is not None:
                 on_round(stats)
             for addr in addrs:
@@ -679,4 +718,11 @@ async def run_wan_discovery(
         # shutdown. The race that made awaiting tempting (a drip mid-send when
         # the socket closes) is handled in DhtClient.send_datagram instead.
         bootstrap_task.cancel()
+        # A UPnP mapping can outlive this process -- a router that refuses
+        # timed leases hands out a permanent one, and nothing removes it but
+        # us. Best effort: a kill or a power cut skips this entirely.
+        try:
+            await release_port_mapping()
+        except Exception:  # noqa: BLE001 -- shutdown is not a place to raise
+            pass
         client.close()

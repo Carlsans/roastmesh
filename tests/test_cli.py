@@ -671,6 +671,7 @@ def _doctor_report(**over) -> dict:
         "announce_set": [{"addr": "1.2.3.4:6881", "bits": 140, "bep42": True}],
         "readback": True, "peers": ["5.6.7.8:41890"],
         "public_port": None, "needs_public_port": False,
+        "router_external_ip": None, "double_nat": None,
         "swarm_info_hash": "22" * 20,
     }
     report.update(over)
@@ -808,3 +809,43 @@ def test_public_port_accepts_a_number_or_auto_and_rejects_anything_else() -> Non
     for bad in ("bogus", "0", "70000", "-1", "26513x"):
         with pytest.raises(click.BadParameter):
             _parse_public_port(bad)
+
+
+def test_doctor_names_double_nat_when_the_router_admits_to_it() -> None:
+    """The one diagnosis nothing else can make.
+
+    A router reporting a private address as its own public one is behind the
+    ISP's NAT as well, and no port forwarded on it can be reached. Saying so
+    stops a user spending an evening on port-forwarding settings that cannot
+    possibly work.
+    """
+    text = _render(_doctor_report(router_external_ip="100.64.0.1", double_nat="double-nat"))
+    assert "behind another NAT" in text
+    assert "carrier-grade" in text.lower()
+
+
+def test_double_nat_replaces_the_forward_a_port_advice_rather_than_adding_to_it() -> None:
+    """Telling someone to forward a port *and* that forwarding cannot work
+    would be worse than saying nothing."""
+    text = _render(_doctor_report(nat="symmetric", readback=False, needs_public_port=True,
+                                  router_external_ip="100.64.0.1", double_nat="double-nat"))
+    assert "nothing here will help" in text
+    assert "--public-port N" not in text
+    assert "VPN that offers port forwarding" in text
+
+
+def test_a_router_that_agrees_is_reported_as_confirmation() -> None:
+    text = _render(_doctor_report(router_external_ip="209.227.189.65", double_nat="agrees"))
+    assert "router agrees" in text
+    assert "WARNING" not in text
+
+
+def test_a_disagreement_is_surfaced_without_picking_a_side() -> None:
+    text = _render(_doctor_report(router_external_ip="198.51.100.1", double_nat="disagrees"))
+    assert "198.51.100.1" in text and "209.227.189.65" in text
+    # Observed for real: the ISP changed the address, the router knew at once
+    # and the DHT tally was still carrying the old one. Reporting that as "more
+    # than one route out" would have sent the user looking for a second WAN
+    # link that does not exist.
+    assert "has not caught up" in text
+    assert "route out" not in text

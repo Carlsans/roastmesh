@@ -25,6 +25,7 @@ import socket
 import struct
 from dataclasses import dataclass
 
+from roastmesh import upnp
 from roastmesh.interfaces import default_gateway
 
 PORT_MAPPING_PORT = 5351
@@ -40,7 +41,13 @@ _PROTO_UDP = 17
 class Mapping:
     external_port: int
     lifetime_s: int
-    protocol: str  # "pcp" or "natpmp" -- which one answered
+    protocol: str  # "pcp", "natpmp" or "upnp" -- which one answered
+    # Only UPnP can tell us this: it is the one protocol with an explicit
+    # "what is my public address" call. A *private* address here is worth
+    # reporting rather than discarding -- it means the router is itself behind
+    # another NAT, which is carrier-grade NAT diagnosed positively instead of
+    # inferred from a symmetric mapping.
+    external_ip: str | None = None
 
 
 def _local_address_towards(gateway: str, port: int = PORT_MAPPING_PORT) -> str | None:
@@ -140,7 +147,42 @@ async def map_udp_port(internal_port: int, *, gateway: str | None = None,
     Mapping is a claim, not a fact -- verify it before telling anyone about it.
     """
     gateway = gateway or default_gateway()
-    if gateway is None:
+    if gateway is not None:
+        mapping = await asyncio.to_thread(_map_blocking, internal_port, gateway, lifetime_s,
+                                          timeout, port)
+        if mapping is not None:
+            return mapping
+
+    # UPnP last, and not only because it is the least trustworthy of the three.
+    # PCP and NAT-PMP are a single UDP round trip; this is a multicast search,
+    # an HTTP fetch and a SOAP call, which is seconds rather than milliseconds.
+    # It is also the only one that works without knowing the gateway's address,
+    # so it is still worth trying when that lookup failed.
+    global _active_upnp
+    found = await upnp.map_udp_port(internal_port, lifetime_s=lifetime_s)
+    if found is None:
         return None
-    return await asyncio.to_thread(_map_blocking, internal_port, gateway, lifetime_s,
-                                   timeout, port)
+    _active_upnp = found
+    return Mapping(external_port=found.external_port, lifetime_s=found.lifetime_s,
+                   protocol="upnp", external_ip=found.external_ip)
+
+
+# The UPnP mapping this process created, if any. Kept because a UPnP mapping is
+# the only kind that can outlive us: a router that refuses timed leases gives a
+# permanent one, and nothing then removes it but us.
+_active_upnp: upnp.UpnpMapping | None = None
+
+
+async def release() -> None:
+    """Remove a mapping we asked for, on the way out.
+
+    Best effort by nature -- a kill or a power cut skips this entirely, which
+    is the accepted cost of using permanent leases at all on the routers that
+    support nothing else."""
+    global _active_upnp
+    mapping, _active_upnp = _active_upnp, None
+    if mapping is not None:
+        try:
+            await upnp.unmap(mapping)
+        except Exception:  # noqa: BLE001 -- shutdown is not a place to raise
+            pass

@@ -1103,7 +1103,11 @@ class NetworkTab(Tab):
         else:
             v["external"].set(t("unknown -- not enough nodes have reported it back yet"))
 
-        if nat == "symmetric":
+        if r.get("double_nat") == "double-nat":
+            v["nat"].set(t("behind your provider's NAT as well -- your router reports a "
+                            "private address as its own public one, so no forwarded port "
+                            "can be reached from outside"))
+        elif nat == "symmetric":
             v["nat"].set(t("symmetric or carrier-grade NAT -- other nodes cannot open a "
                             "connection to you, so internet discovery cannot work here. "
                             "LAN peers and pasted tickets still work."))
@@ -1145,7 +1149,15 @@ class NetworkTab(Tab):
         peers = r.get("peers") or []
         v["peers"].set(", ".join(peers) if peers else t("none advertised right now"))
 
-        if r.get("needs_public_port"):
+        if r.get("double_nat") == "double-nat":
+            # The one case where "forward a port" is the wrong advice: there is
+            # no port on this router the internet can reach.
+            v["advice"].set(t("Your router is itself behind your internet provider's NAT "
+                               "(it reports {ip} as its own public address). No port you "
+                               "forward can be reached from outside, so there is nothing "
+                               "to configure here. You can still find other people and "
+                               "sync with them.", ip=r.get("router_external_ip")))
+        elif r.get("needs_public_port"):
             port = r.get("public_port")
             if port:
                 v["advice"].set(t("Port {port} is set, but a fresh lookup still could not "
