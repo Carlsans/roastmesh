@@ -980,11 +980,16 @@ class NetworkTab(Tab):
                               "--publish-watch-dir", self.app.watch_dir.get())
         if self.app.wan_discovery_enabled.get():
             argv.append("--wan-discovery")
-            # Both, and the same number: --wan-port is the socket we listen on,
-            # --public-port is what we tell other nodes to use. A forward is
-            # only useful if the port it delivers to is the one we are on.
-            port = self.app.public_port.get().strip()
-            if port.isdigit():
+            port = self.app.public_port.get().strip().lower()
+            if port == "auto":
+                # No --wan-port here: the router picks the external number, so
+                # pinning both would only work if we happened to guess the one
+                # it was going to grant.
+                argv += ["--public-port", "auto"]
+            elif port.isdigit():
+                # Both, and the same number: --wan-port is the socket we listen
+                # on, --public-port is what we tell other nodes to use. A
+                # forward is only useful if the port it delivers to is ours.
                 argv += ["--wan-port", port, "--public-port", port]
         self.serve_console.clear()
         self.serve_console.set_command(describe(argv))
@@ -1254,12 +1259,13 @@ class SettingsTab(Tab):
         ttk.Checkbutton(wan_section, text=t("Find peers over the whole internet, not just my LAN"),
                          variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
         port_field = Field(wan_section, t("Forwarded port (optional)"), variable=self.app.public_port,
-              help_text=t("Leave empty unless your router or VPN forwards a port to this "
-                          "machine. Some networks give every outgoing connection a different "
+              help_text=t("Type 'auto' to ask your router for one, or a number if your "
+                          "router or VPN already forwards a port here. Leave empty if "
+                          "neither. Some networks give every outgoing connection a different "
                           "port, so the address other people see is not one they can reach -- "
                           "then you need a forwarded port to be findable at all. The Network "
                           "tab says so outright when that is the case, and 'Run a full check' "
-                          "will tell you whether the port you entered actually works."))
+                          "will tell you whether the port actually works."))
         # On commit, not on every keystroke: this restarts the serving process,
         # and the auto-save trace every other Settings field uses fires per
         # character -- typing "26513" would have restarted the node five times.

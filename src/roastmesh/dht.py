@@ -1274,6 +1274,11 @@ class DhtClient:
         self._tokens = TokenSecrets()
         self._rate_limiter = TokenBucket()
         self._source_limiter = SourceLimiter()
+        # BEP 43. Set while we know we cannot be reached (symmetric NAT, or an
+        # announce we could not find afterwards) so other nodes do not spend a
+        # routing-table slot on us. wan_discovery keeps this current; it is not
+        # a fix for being unreachable, just an honest declaration of it.
+        self.read_only = False
         self._peer_store = PeerStore()
         # addr -> the last node ID we saw claim it. A real node's address can
         # change (NAT rebind) and RoutingTable/Search both handle that by
@@ -1447,7 +1452,13 @@ class DhtClient:
             return
         # confirm=1: we've heard from it directly, but (unlike a reply to our
         # own query) it hasn't demonstrated liveness *to a query we sent*.
-        self.routing_table.new_node(querier_id, addr, confirm=1)
+        #
+        # Unless it told us not to bother: BEP 43's read-only flag means the
+        # sender knows it is unreachable, so a routing-table slot spent on it
+        # is a slot that answers nobody. We still reply -- it can query us
+        # perfectly well, it just cannot be queried.
+        if not msg.get(b"ro"):
+            self.routing_table.new_node(querier_id, addr, confirm=1)
 
         if q == b"ping":
             self._reply(t, {b"id": self.own_id}, addr)
@@ -1489,6 +1500,8 @@ class DhtClient:
         self._next_t = (self._next_t + 1) % 65536
         t = struct.pack(">H", self._next_t)
         message = {b"t": t, b"y": b"q", b"q": q.encode("ascii"), b"a": args}
+        if self.read_only:
+            message[b"ro"] = 1   # BEP 43: top level, beside "y", not inside "a"
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending[t] = fut

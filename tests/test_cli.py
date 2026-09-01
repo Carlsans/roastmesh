@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import click
+import pytest
 from click.testing import CliRunner
 
 from roastmesh.cli import main
@@ -676,8 +678,6 @@ def _doctor_report(**over) -> dict:
 
 
 def _render(report: dict) -> str:
-    from click.testing import CliRunner
-
     from roastmesh.cli import _print_doctor_report
 
     runner = CliRunner()
@@ -793,3 +793,18 @@ def test_doctor_says_a_configured_port_is_not_actually_open() -> None:
                                   readback=False, needs_public_port=True))
     assert "26513 is configured but the read-back still failed" in text
     assert "--public-port N" not in text
+
+
+def test_public_port_accepts_a_number_or_auto_and_rejects_anything_else() -> None:
+    """Rejected loudly rather than ignored. A typo here means publishing the
+    wrong port or none at all, and the only symptom is that nobody ever
+    arrives -- the least diagnosable failure this program has."""
+    from roastmesh.cli import _parse_public_port
+
+    assert _parse_public_port(None) == (False, None)
+    assert _parse_public_port("26513") == (False, 26513)
+    assert _parse_public_port(" AUTO ") == (True, None)
+
+    for bad in ("bogus", "0", "70000", "-1", "26513x"):
+        with pytest.raises(click.BadParameter):
+            _parse_public_port(bad)

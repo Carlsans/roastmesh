@@ -36,6 +36,7 @@ import asyncio
 import hashlib
 import json
 import random
+import shutil
 import socket
 import time
 from collections.abc import Awaitable, Callable
@@ -51,6 +52,7 @@ from roastmesh.dht import (
     save_node_cache,
 )
 from roastmesh.hello import decode_hello, encode_hello
+from roastmesh.port_mapping import map_udp_port
 from roastmesh.paths import data_dir
 
 WAN_PORT = 41890
@@ -79,6 +81,15 @@ WARM_GOOD_NODES = 8
 # close. Measured on the live DHT, a healthy lookup lands at 2^138-2^143 and a
 # starved one stops in the 2^150s, so this sits just above the healthy band.
 ANNOUNCE_MAX_BITS = 150
+
+# How long to wait before asking a router that just said no again. Routers that
+# do not speak PCP or NAT-PMP never will, so this is about not hammering them.
+MAPPING_RETRY_S = 900.0
+
+# Consecutive announcing rounds whose read-back failed before we say the
+# configured port has stopped working. One failure is a bad round; two in a row
+# with a port configured means the forward is gone.
+STALE_PORT_ROUNDS = 2
 
 # Bootstrap drip, from tr-dht.cc's bootstrap_interval: ping the first few
 # quickly, then slow down. The routers rate-limit per source IP, and firing
@@ -293,6 +304,50 @@ def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: byt
     }
 
 
+async def _renew_mapping(internal_port: int):
+    """Ask the router for a forwarded port, tolerating every way that fails."""
+    try:
+        return await map_udp_port(internal_port)
+    except Exception:  # noqa: BLE001 -- a router is not a dependency
+        return None
+
+
+async def _warn_port_went_stale(port: int) -> None:
+    """Say so when a forward that used to work has stopped.
+
+    A leased port is not permanent -- a VPN reconnecting is enough to change
+    it -- and the failure is silent by nature: we keep announcing a port that
+    no longer reaches us, and the only symptom is that nobody arrives. Naming
+    the likely cause beats leaving the user to notice an absence.
+    """
+    message = (f"wan: port {port} was announced but a fresh lookup could not find this "
+               "node twice running -- the forward has probably gone away.")
+    current = await _pia_forwarded_port()
+    if current is not None and current != port:
+        message += (f" Private Internet Access now reports port {current}; "
+                    "its forwarded port changes when it reconnects.")
+    print(message, flush=True)
+
+
+async def _pia_forwarded_port() -> int | None:
+    """PIA's current forwarded port, if PIA is even installed.
+
+    Deliberately narrow and entirely optional: `piactl` is one specific VPN's
+    tool, this is the one place where naming it saves the user a real search,
+    and a machine without it simply gets the generic message.
+    """
+    if shutil.which("piactl") is None:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "piactl", "get", "portforward",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        return int(out.decode().strip())
+    except (OSError, ValueError, asyncio.TimeoutError):
+        return None
+
+
 async def run_wan_discovery(
     own_pubkey_hex: str,
     own_ticket: str,
@@ -308,6 +363,7 @@ async def run_wan_discovery(
     on_round: Callable[[object], None] | None = None,
     allow_loopback: bool = False,
     public_port: int | None = None,
+    auto_port: bool = False,
 ) -> None:
     """Announce on the public DHT and react to other roastmesh nodes found
     there, until cancelled. `on_peer_discovered(pubkey, ticket)` is
@@ -320,6 +376,12 @@ async def run_wan_discovery(
     production: `dht.is_martian` rejects 127.x precisely so that a hostile
     node cannot put loopback addresses in a `nodes` blob and aim our queries
     at whatever is listening on this machine.
+    `auto_port` asks the router for a forwarded port (PCP/NAT-PMP, see
+    port_mapping) and uses whatever it grants, renewing before the lease runs
+    out. What the router claims is never taken on trust: the port is announced
+    and then confirmed by the read-back, and a mapping that does not survive
+    that is reported as failing like any other.
+
     `public_port` is the port other nodes can reach this machine on, when a
     router or VPN forwards one to us. Without it we announce with BEP 5's
     `implied_port`, which asks storing nodes to record the source port they
@@ -486,7 +548,7 @@ async def run_wan_discovery(
         # What we published, which is not always where we were seen from: with
         # a forwarded port the announce carries that port explicitly, so that
         # is the address other nodes hold for us and the one to look for.
-        published = (external[0], public_port) if public_port is not None else external
+        published = (external[0], effective_port) if effective_port is not None else external
         seeds = await _seeds()
         if not seeds:
             return None
@@ -500,13 +562,39 @@ async def run_wan_discovery(
 
     bootstrap_task = asyncio.create_task(_bootstrap_loop())
     next_announce_at = 0.0
+    # The port we actually publish: what the caller configured, or whatever the
+    # router granted under `auto_port`.
+    effective_port = public_port
+    mapping_renew_at = 0.0
+    stale_port_rounds = 0
+    # The last read-back verdict we actually measured, kept across rounds:
+    # most rounds do not announce, and forgetting it every time would flip the
+    # read-only flag on and off for no reason.
+    readback_state: bool | None = None
 
     try:
         while True:
             stats = LookupStats()
             readback: bool | None = None
+            if auto_port and time.monotonic() >= mapping_renew_at:
+                mapping = await _renew_mapping(port)
+                if mapping is not None:
+                    if mapping.external_port != effective_port:
+                        print(f"wan: router mapped port {mapping.external_port} "
+                              f"({mapping.protocol}, {mapping.lifetime_s}s)", flush=True)
+                    effective_port = mapping.external_port
+                    # Halfway through the lease, so a renewal that fails still
+                    # leaves a working mapping while we retry.
+                    mapping_renew_at = time.monotonic() + max(mapping.lifetime_s / 2, 60.0)
+                else:
+                    mapping_renew_at = time.monotonic() + MAPPING_RETRY_S
+
             external, nat, votes = external_address(client)
             _maybe_adopt_node_id(external)
+            # Declare ourselves read-only exactly while we know we cannot be
+            # found (BEP 43). Costs nothing, and keeps us out of routing tables
+            # we would only be dead weight in.
+            client.read_only = needs_public_port(nat, readback_state, effective_port)
             warm = len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES
             # "Due" is all the caller can judge up front; whether the lookup
             # actually got near the swarm is only known once it has run, so
@@ -524,7 +612,7 @@ async def run_wan_discovery(
                         info_hash, seeds, seed_ids=dict(state), stats=stats, announce=announce,
                         announce_if=lambda st: (st.closest_bits is not None
                                                 and st.closest_bits <= ANNOUNCE_MAX_BITS),
-                        public_port=public_port,
+                        public_port=effective_port,
                     )
             except Exception as exc:  # noqa: BLE001 -- a bad DHT round shouldn't kill serve()
                 # Previously swallowed silently, which is how a permanently
@@ -547,6 +635,13 @@ async def run_wan_discovery(
                     # run at all. Measured: announced to 5, read-back "None".
                     external, _nat, _votes = external_address(client)
                     readback = await _readback(external)
+                    readback_state = readback
+                    if effective_port is not None and readback is False:
+                        stale_port_rounds += 1
+                        if stale_port_rounds >= STALE_PORT_ROUNDS:
+                            await _warn_port_went_stale(effective_port)
+                    elif readback is True:
+                        stale_port_rounds = 0
                 print(f"wan: {stats.summary()}", flush=True)
 
             external, nat, votes = external_address(client)
@@ -556,7 +651,7 @@ async def run_wan_discovery(
                 # what fills the routing table, so reporting the count from
                 # before it makes a healthy node read as permanently cold.
                 warm=len(client.routing_table.good_nodes()) >= WARM_GOOD_NODES,
-                readback=readback, addrs=addrs, public_port=public_port)), flush=True)
+                readback=readback, addrs=addrs, public_port=effective_port)), flush=True)
             if on_round is not None:
                 on_round(stats)
             for addr in addrs:

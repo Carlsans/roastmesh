@@ -1157,6 +1157,7 @@ def restart(label, value):
 
 restart("NOPORT", "")
 restart("PORT", "26513")
+restart("AUTO", "auto")
 restart("JUNK", "not-a-port")
 tab._on_stop_serve()
 app.destroy()
@@ -1166,8 +1167,13 @@ app.destroy()
     port = next(l for l in r.stdout.splitlines() if l.startswith("PORT"))
     junk = next(l for l in r.stdout.splitlines() if l.startswith("JUNK"))
 
+    auto = next(l for l in r.stdout.splitlines() if l.startswith("AUTO"))
     assert "--public-port" not in noport      # empty means "no forward", not a flag
     assert "--wan-port 26513" in port and "--public-port 26513" in port
+    # `auto` deliberately does not pin --wan-port: the router chooses the
+    # external number, and guessing it in advance is the one thing that cannot
+    # work.
+    assert "--public-port auto" in auto and "--wan-port" not in auto
     assert "--public-port" not in junk        # junk must not produce a serve that won't start
 
 

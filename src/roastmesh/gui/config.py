@@ -36,10 +36,11 @@ class GuiConfig:
     # in the GUI, at which point it sticks across restarts and screens
     # until reset (Ctrl+0).
     ui_scale: float | None = None
-    # "" means none. The port other machines can reach this one on, when a
-    # router or VPN forwards one here -- see wan_discovery.needs_public_port
-    # for when it is required. Kept as text because it comes straight from an
-    # entry box and an empty box has to survive a round trip unchanged.
+    # "" means none, "auto" means ask the router (PCP/NAT-PMP), a number means
+    # that port. The port other machines can reach this one on, when a router
+    # or VPN forwards one here -- see wan_discovery.needs_public_port for when
+    # it is required. Kept as text because it comes straight from an entry box,
+    # and both an empty box and the word "auto" have to survive a round trip.
     public_port: str = ""
 
 
@@ -82,8 +83,11 @@ def _valid_port(value: object) -> str:
     so junk in the config file must not turn into a serve process that
     refuses to start; an unusable value is simply no value.
     """
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
     try:
-        port = int(str(value).strip())
+        port = int(text)
     except (TypeError, ValueError):
         return ""
     return str(port) if 1 <= port <= 65535 else ""

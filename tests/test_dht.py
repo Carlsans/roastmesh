@@ -833,3 +833,57 @@ def test_the_udp_socket_asks_for_a_large_receive_buffer() -> None:
         assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) >= MIN_USEFUL_RECV_BUFFER
     finally:
         sock.close()
+
+
+async def test_a_read_only_node_says_so_and_is_not_routed_to() -> None:
+    """BEP 43, both directions.
+
+    A node behind a symmetric NAT can query perfectly well and simply cannot be
+    queried. Saying so keeps it out of routing tables where it would answer
+    nobody -- and honouring other nodes' flags keeps ours free of the same dead
+    weight. It is politeness, not a fix: it does not make anyone reachable.
+    """
+    server = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+    try:
+        server_addr = _loopback_addr(server)
+
+        client.read_only = True
+        reply = await client.ping(server_addr, timeout=2.0)
+        assert reply is not None, "a read-only node must still get answers"
+        assert server.routing_table.find(client.own_id) is None, (
+            "a node that told us it is unreachable took a routing-table slot anyway")
+
+        client.read_only = False
+        assert await client.ping(server_addr, timeout=2.0) is not None
+        assert server.routing_table.find(client.own_id) is not None
+    finally:
+        server.close()
+        client.close()
+
+
+async def test_the_read_only_flag_is_top_level_on_the_wire() -> None:
+    """Beside "y", not inside "a" -- pinned at the byte level for the same
+    reason BEP 42's `ip` field is: a flag in the wrong place is invisible to
+    every other implementation while looking perfectly correct from here."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        listener = _loopback_addr_of_raw(sock)
+        client = await DhtClient.bind(port=0, own_id=secrets.token_bytes(20), allow_loopback=True)
+        client.read_only = True
+        try:
+            asyncio.get_running_loop().create_task(client.ping(listener, timeout=1.0))
+            raw, _ = await asyncio.get_running_loop().run_in_executor(None, sock.recvfrom, 4096)
+        finally:
+            client.close()
+        query = bdecode(raw)
+        assert query[b"ro"] == 1, "the read-only flag must be in the top-level dictionary"
+        assert b"ro" not in query[b"a"]
+    finally:
+        sock.close()
+
+
+def _loopback_addr_of_raw(sock) -> tuple[str, int]:
+    return ("127.0.0.1", sock.getsockname()[1])

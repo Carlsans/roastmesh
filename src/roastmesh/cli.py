@@ -440,12 +440,13 @@ def node() -> None:
               help="UDP port for internet-wide discovery (default: 41890). Only needs "
                    "changing to run two nodes on one machine, or if something else "
                    "already holds that port.")
-@click.option("--public-port", default=None, type=int,
+@click.option("--public-port", default=None, metavar="PORT|auto",
               help="The port other machines can reach this one on, when your router or "
                    "VPN forwards one to you. Set it and internet discovery publishes that "
                    "port instead of the one your NAT happened to use, which is the only "
-                   "thing that works behind a port forward. Run `node doctor` -- it says "
-                   "outright when you need this.")
+                   "thing that works behind a port forward. Use `auto` to ask the router "
+                   "for one (PCP/NAT-PMP) and renew it automatically. Run `node doctor` -- "
+                   "it says outright when you need this.")
 @click.option("--publish-watch-dir", default=None, type=click.Path(path_type=Path),
               help="Folder to auto-publish any .alog files dropped into it "
                    "(default: ~/RoastMeshShare).")
@@ -455,7 +456,7 @@ def node() -> None:
 def node_serve(
     ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
     no_relay: bool, no_lan_discovery: bool, wan_discovery: bool,
-    wan_port: int | None, public_port: int | None,
+    wan_port: int | None, public_port: str | None,
     publish_watch_dir: Path | None, no_publish_watch: bool,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
@@ -472,6 +473,7 @@ def node_serve(
     into --publish-watch-dir (default ~/RoastMeshShare) -- no `feed publish`
     needed for files placed there.
     """
+    auto_port, fixed_port = _parse_public_port(public_port)
     ident, created = load_or_create_identity()
     _remind_backup_if_new(ident, created)
     feed_dir = feed_dir or default_feed_dir()
@@ -482,8 +484,30 @@ def node_serve(
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
         enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
         **({"wan_discovery_port": wan_port} if wan_port else {}),
-        **({"wan_public_port": public_port} if public_port else {}),
+        **({"wan_public_port": fixed_port} if fixed_port else {}),
+        **({"wan_auto_port": True} if auto_port else {}),
     ))
+
+
+def _parse_public_port(value: str | None) -> tuple[bool, int | None]:
+    """`--public-port` takes a number or the word `auto`.
+
+    Rejected loudly rather than ignored: a typo here means silently publishing
+    the wrong port (or none), and the symptom is nobody ever arriving -- the
+    single least diagnosable failure this program has.
+    """
+    if value is None:
+        return False, None
+    text = str(value).strip().lower()
+    if text == "auto":
+        return True, None
+    try:
+        port = int(text)
+    except ValueError:
+        raise click.BadParameter(f"expected a port number or 'auto', got {value!r}") from None
+    if not 1 <= port <= 65535:
+        raise click.BadParameter(f"port out of range: {port}")
+    return False, port
 
 
 @node.command("doctor")

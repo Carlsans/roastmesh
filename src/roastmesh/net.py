@@ -370,6 +370,7 @@ async def serve(
     enable_wan_discovery: bool = False,
     wan_discovery_port: int = WAN_PORT,
     wan_public_port: int | None = None,
+    wan_auto_port: bool = False,
     wan_discovery_interval_s: float = DHT_LOOKUP_INTERVAL_S,
     profile_path: Path | None = None,
     publish_watch_dir: Path | None = None,
@@ -491,7 +492,7 @@ async def serve(
         background_tasks.append(asyncio.create_task(run_wan_discovery(
             identity.public_key_hex, ticket, _on_wan_discovered,
             port=wan_discovery_port, lookup_interval_s=wan_discovery_interval_s,
-            public_port=wan_public_port,
+            public_port=wan_public_port, auto_port=wan_auto_port,
         )))
 
     if publish_watch_dir is not None:
