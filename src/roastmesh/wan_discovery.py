@@ -226,8 +226,15 @@ def needs_public_port(nat: str, readback: bool | None, public_port: int | None) 
     they are reported, not guesses -- and neither can be fixed from inside the
     DHT, which is why this points at configuration instead.
     """
-    if public_port is not None and readback is True:
-        return False
+    if public_port is not None:
+        # Configured: only a *proven* failure is worth raising. Most rounds do
+        # not announce -- that happens every ~15 minutes -- so readback is
+        # usually unknown, and treating unknown as broken nags a node whose
+        # forward is working perfectly. Observed exactly that on a Pi moments
+        # after a stranger had found it and synced over that very port: the
+        # NAT is still symmetric, which is *why* the port was configured, so
+        # the symmetric test alone can never clear.
+        return readback is False
     return nat == "symmetric" or readback is False
 
 

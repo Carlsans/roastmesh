@@ -411,6 +411,14 @@ def test_a_working_forwarded_port_stops_the_advice() -> None:
     assert needs_public_port("symmetric", readback=True, public_port=26513) is False
 
 
+def test_a_configured_port_is_not_nagged_between_announces() -> None:
+    """The round that announces comes around every ~15 minutes; every other
+    round leaves the read-back unmeasured. Treating "not measured" as "broken"
+    told a node with a working forward that its port was not open -- while a
+    peer was in the middle of syncing with it over that exact port."""
+    assert needs_public_port("symmetric", readback=None, public_port=26513) is False
+
+
 def test_a_forwarded_port_that_still_fails_keeps_the_advice() -> None:
     # Configured but not actually reachable -- the wrong number, or the
     # forward is not really in place. Staying quiet here would be the
