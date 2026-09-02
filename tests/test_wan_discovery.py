@@ -553,6 +553,24 @@ def test_a_router_reporting_a_private_address_means_a_second_layer_of_nat() -> N
     assert double_nat_verdict("10.64.0.1", None) == "double-nat"
 
 
+def test_carrier_grade_nat_space_counts_as_a_second_layer_of_nat() -> None:
+    """100.64.0.0/10 is RFC 6598 shared address space -- what carrier-grade NAT
+    actually assigns. The BEP 42 exemption this originally reused covers only
+    RFC 1918, so the single most common CGNAT case went through unflagged:
+    caught against a real router reporting its own WAN address."""
+    for ip in ("100.64.0.1", "100.127.255.254"):
+        assert double_nat_verdict(ip, None) == "double-nat", ip
+    # Just outside the range, and genuinely public.
+    assert double_nat_verdict("100.128.0.1", None) != "double-nat"
+
+
+def test_a_router_answer_with_nothing_to_compare_it_to_is_not_agreement() -> None:
+    """Reported as "your router agrees" on a node whose DHT tally had not
+    reached a quorum -- confidently agreeing with nothing, at exactly the
+    moment a user most wants a straight answer about their address."""
+    assert double_nat_verdict("216.209.221.161", None) == "unconfirmed"
+
+
 def test_a_router_that_agrees_with_the_dht_is_a_free_confirmation() -> None:
     assert double_nat_verdict("203.0.113.9", ("203.0.113.9", 4000)) == "agrees"
 

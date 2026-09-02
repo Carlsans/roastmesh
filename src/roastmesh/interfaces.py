@@ -111,6 +111,29 @@ def _linux_interfaces() -> list[Interface]:
     return out
 
 
+def is_private_address(ip: str) -> bool:
+    """Addresses the public internet cannot route to.
+
+    Deliberately broader than BEP 42's exemption, which covers only RFC 1918
+    and loopback. **100.64.0.0/10 is the important addition**: RFC 6598 shared
+    address space is what carrier-grade NAT actually assigns, so a router
+    reporting one as its own public address is the clearest possible statement
+    that it sits behind another NAT -- and the BEP 42 list would have let
+    exactly that case through unnoticed.
+    """
+    try:
+        o = socket.inet_aton(ip)
+    except OSError:
+        return False
+    a, b = o[0], o[1]
+    return (a == 10                             # RFC 1918
+            or (a == 192 and b == 168)          # RFC 1918
+            or (a == 172 and 16 <= b < 32)      # RFC 1918
+            or (a == 100 and 64 <= b < 128)     # RFC 6598, carrier-grade NAT
+            or (a == 169 and b == 254)          # link-local
+            or a == 127 or a == 0)
+
+
 def same_subnet(address: str, netmask: str | None, other: str) -> bool:
     """Is `other` on the same IPv4 subnet as `address`?
 

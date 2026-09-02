@@ -39,7 +39,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
-from roastmesh.interfaces import local_interfaces, same_subnet
+from roastmesh.interfaces import is_private_address, local_interfaces, same_subnet
 
 SSDP_ADDR = "239.255.255.250"
 SSDP_PORT = 1900
@@ -188,13 +188,7 @@ def _header(raw: bytes, name: str) -> str | None:
 
 
 def _is_private(host: str) -> bool:
-    try:
-        octets = socket.inet_aton(host)
-    except OSError:
-        return False
-    a, b = octets[0], octets[1]
-    return (a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b < 32)
-            or (a == 169 and b == 254) or a == 127)
+    return is_private_address(host)
 
 
 def _location_is_plausible(location: str, source_ip: str) -> bool:

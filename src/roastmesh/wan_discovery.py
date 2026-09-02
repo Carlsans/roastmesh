@@ -53,6 +53,7 @@ from roastmesh.dht import (
     save_node_cache,
 )
 from roastmesh.hello import decode_hello, encode_hello
+from roastmesh.interfaces import is_private_address
 from roastmesh.port_mapping import map_udp_port, release as release_port_mapping
 from roastmesh.paths import data_dir
 
@@ -272,9 +273,15 @@ def double_nat_verdict(router_external_ip: str | None, external: Addr | None) ->
     """
     if router_external_ip is None:
         return None
-    if _bep42_exempt(router_external_ip):
+    if is_private_address(router_external_ip):
         return "double-nat"
-    if external is not None and external[0] != router_external_ip:
+    if external is None:
+        # Nothing to agree *with*. Saying "your router agrees" here was wrong
+        # and confidently so -- seen on a node whose DHT tally had not reached
+        # a quorum yet, which is exactly when a user most wants a straight
+        # answer about their address.
+        return "unconfirmed"
+    if external[0] != router_external_ip:
         return "disagrees"
     return "agrees"
 

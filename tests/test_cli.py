@@ -849,3 +849,19 @@ def test_a_disagreement_is_surfaced_without_picking_a_side() -> None:
     # link that does not exist.
     assert "has not caught up" in text
     assert "route out" not in text
+
+
+def test_doctor_does_not_claim_agreement_with_nothing() -> None:
+    text = _render(_doctor_report(external_ip=None, router_external_ip="216.209.221.161",
+                                  double_nat="unconfirmed"))
+    assert "216.209.221.161" in text
+    assert "nothing to compare" in text
+    assert "agrees" not in text
+
+
+def test_doctor_offers_both_explanations_for_a_disagreement() -> None:
+    """A VPN and a changed address produce the same symptom, and only one of
+    them is fixed by forwarding a port."""
+    text = _render(_doctor_report(router_external_ip="216.209.221.161", double_nat="disagrees"))
+    assert "VPN" in text
+    assert "not caught up" in text

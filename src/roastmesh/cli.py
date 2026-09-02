@@ -700,6 +700,9 @@ def _print_doctor_report(r: dict) -> None:
                    "  can change that; a VPN offering port forwarding is the usual way out.")
     elif verdict == "agrees":
         click.echo(f"  your router agrees: {r['router_external_ip']}")
+    elif verdict == "unconfirmed":
+        click.echo(f"  your router says {r['router_external_ip']} (nothing to compare it "
+                   "with yet --\n  the DHT has not settled on an address)")
     elif verdict == "disagrees":
         # Measured on the development machine: the ISP changed its address, the
         # router knew immediately and the DHT tally was still carrying the old
@@ -709,9 +712,11 @@ def _print_doctor_report(r: dict) -> None:
         # reason the router's answer is reported rather than acted on.
         click.echo(f"  NOTE: your router says {r['router_external_ip']}, the DHT says "
                    f"{r['external_ip']}.\n"
-                   "  The router usually learns a new address first, so this most often "
-                   "means\n  the DHT's view has not caught up yet -- it settles on its own "
-                   "within a\n  few minutes. Peers reach you at whatever the DHT reports.")
+                   "  Two usual causes: your traffic leaves through something other than\n"
+                   "  that router (a VPN, most often), or your address changed and the "
+                   "DHT's\n  view has not caught up. Either way peers reach you at what "
+                   "the DHT\n  reports -- forwarding a port on the router only helps in "
+                   "the second case.")
 
     t = r["routing_table"]
     click.echo(f"\nrouting table: {t['good']} good of {t['total']} "
