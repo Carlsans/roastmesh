@@ -266,3 +266,29 @@ def test_accepting_the_legacy_anchor_does_not_weaken_verification(tmp_path: Path
     result = verify_feed(feed_dir)
     assert result.error is not None
     assert "entry 0" in result.error
+
+
+def test_a_feed_dir_is_refused_for_a_pubkey_that_could_climb_the_tree(tmp_path: Path) -> None:
+    """write_received_entry's directory is peer_feeds/<pubkey>. The pubkey
+    arrives from a peer, so a traversal value would write outside the tree.
+    _init_feed_dir is the last gate before the filesystem; it must refuse a
+    name that is not a real pubkey. Found by an adversarial pass that wrote
+    to /tmp via "../../../../tmp/x".
+    """
+    from roastmesh.feed import _init_feed_dir, write_received_entry
+
+    for hostile in ("../../../../tmp/roastmesh_escape", "/tmp/roastmesh_abs", "a" * 63):
+        with pytest.raises(ValueError):
+            _init_feed_dir(tmp_path / hostile, hostile)
+
+    class _Entry:
+        seq = 0
+        content_sha256 = "0" * 64
+        size_bytes = 1
+        __dict__ = {"seq": 0, "content_sha256": "0" * 64, "size_bytes": 1}
+
+    escape = Path("/tmp/roastmesh_feed_traversal_probe")
+    with pytest.raises(ValueError):
+        write_received_entry(tmp_path / "peer_feeds" / "../../../../tmp/roastmesh_feed_traversal_probe",
+                             "../../../../tmp/roastmesh_feed_traversal_probe", _Entry(), b"x")
+    assert not escape.exists(), "a hostile pubkey wrote outside peer_feeds"

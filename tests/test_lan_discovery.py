@@ -44,10 +44,10 @@ async def test_two_beacons_discover_each_other() -> None:
         discovered_by_b.append((pubkey, ticket))
 
     task_a = asyncio.create_task(run_beacon(
-        "pubkey-a", "ticket-a", on_a_discovers, port=TEST_PORT, interval_s=0.2,
+        "aa" + "0"*62, "ticket-a", on_a_discovers, port=TEST_PORT, interval_s=0.2,
     ))
     task_b = asyncio.create_task(run_beacon(
-        "pubkey-b", "ticket-b", on_b_discovers, port=TEST_PORT, interval_s=0.2,
+        "bb" + "0"*62, "ticket-b", on_b_discovers, port=TEST_PORT, interval_s=0.2,
     ))
     try:
         for _ in range(50):
@@ -55,8 +55,8 @@ async def test_two_beacons_discover_each_other() -> None:
             if discovered_by_a and discovered_by_b:
                 break
 
-        assert discovered_by_a == [("pubkey-b", "ticket-b")]
-        assert discovered_by_b == [("pubkey-a", "ticket-a")]
+        assert discovered_by_a == [("bb" + "0"*62, "ticket-b")]
+        assert discovered_by_b == [("aa" + "0"*62, "ticket-a")]
     finally:
         task_a.cancel()
         task_b.cancel()
@@ -74,7 +74,7 @@ async def test_own_beacon_is_never_reported_as_discovered() -> None:
         discovered.append((pubkey, ticket))
 
     task = asyncio.create_task(run_beacon(
-        "solo-pubkey", "solo-ticket", on_discover, port=TEST_PORT + 1, interval_s=0.15,
+        "cc" + "0"*62, "solo-ticket", on_discover, port=TEST_PORT + 1, interval_s=0.15,
     ))
     try:
         await asyncio.sleep(1.0)
@@ -94,17 +94,17 @@ async def test_repeated_beacons_are_debounced_within_resync_window() -> None:
         discovered.append((pubkey, ticket))
 
     task_listener = asyncio.create_task(run_beacon(
-        "listener", "listener-ticket", on_discover,
+        "dd" + "0"*62, "listener-ticket", on_discover,
         port=TEST_PORT + 2, interval_s=999, resync_interval_s=5.0,
     ))
     task_chatty = asyncio.create_task(run_beacon(
-        "chatty", "chatty-ticket", lambda p, t: asyncio.sleep(0),
+        "ee" + "0"*62, "chatty-ticket", lambda p, t: asyncio.sleep(0),
         port=TEST_PORT + 2, interval_s=0.15, resync_interval_s=999,
     ))
     try:
         # several beacon intervals' worth of time, well within the 5s resync window
         await asyncio.sleep(1.5)
-        assert discovered == [("chatty", "chatty-ticket")]
+        assert discovered == [("ee" + "0"*62, "chatty-ticket")]
     finally:
         task_listener.cancel()
         task_chatty.cancel()

@@ -22,11 +22,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from roastmesh.identity import Identity, verify as verify_signature
 from roastmesh.paths import data_dir
+
+# A feed pubkey becomes a directory name under peer_feeds, so it must be
+# exactly what an Ed25519 key hex is and nothing that could climb the tree.
+# The write paths below take a pubkey from a peer; today the value is the
+# cryptographic conn.remote_id(), which cannot contain "/" or "..", but this
+# is the last gate before the filesystem and should not assume the caller
+# already sanitised it. See the matching guard in hello.decode_hello.
+_PUBKEY_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 _GENESIS_PREFIX = b"roastmesh-feed-genesis:"
 # The same constant under the project's old name. Renaming roastnet ->
@@ -122,6 +131,8 @@ def feed_pubkey(feed_dir: Path) -> str:
 
 
 def _init_feed_dir(feed_dir: Path, pubkey_hex: str) -> None:
+    if not _PUBKEY_RE.match(pubkey_hex):
+        raise ValueError(f"refusing to make a feed directory for a non-pubkey name: {pubkey_hex!r}")
     feed_dir.mkdir(parents=True, exist_ok=True)
     _entries_dir(feed_dir).mkdir(exist_ok=True)
     _blobs_dir(feed_dir).mkdir(exist_ok=True)
