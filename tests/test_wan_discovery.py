@@ -20,6 +20,7 @@ from roastmesh.dht import (
     IpVoter,
     LookupStats,
 )
+from roastmesh import wan_discovery
 from roastmesh.wan_discovery import (
     DEFAULT_DHT_BOOTSTRAP,
     DHT_BOOTSTRAP_FALLBACK_IPS,
@@ -566,3 +567,51 @@ def test_no_verdict_without_upnp() -> None:
     """PCP and NAT-PMP cannot answer this question, so most nodes will have
     nothing here and that must not read as a problem."""
     assert double_nat_verdict(None, ("203.0.113.9", 4000)) is None
+
+
+async def test_the_router_is_asked_its_address_once_whichever_protocol_mapped(tmp_path, monkeypatch) -> None:
+    """Only UPnP can answer "what is my public address", and it is usually
+    NAT-PMP that wins the mapping race -- so tying the question to the mapping
+    left the double-NAT verdict missing exactly when everything else worked.
+    Asked once, not per round: the answer changes about as often as the ISP
+    changes our address, and a multicast search every round is noise for
+    nothing.
+    """
+    from roastmesh.port_mapping import Mapping
+
+    asked = []
+
+    async def _mapping(_port, **_kw):
+        # A NAT-PMP-shaped result: no external_ip, because it cannot know one.
+        return Mapping(external_port=41890, lifetime_s=3600, protocol="natpmp")
+
+    async def _ask():
+        asked.append(1)
+        return "203.0.113.7"
+
+    monkeypatch.setattr(wan_discovery, "_renew_mapping", _mapping)
+    monkeypatch.setattr(wan_discovery, "_ask_router_external_ip", _ask)
+
+    fake_dht, fake_port = await _start_fake_dht([("127.0.0.1", 41997)])
+    task = asyncio.create_task(run_wan_discovery(
+        "ee" * 32, "ticket-e", lambda *_a: asyncio.sleep(0), port=41998,
+        lookup_interval_s=0.2, bootstrap_nodes=[("127.0.0.1", fake_port)],
+        node_cache_path=tmp_path / "state.json", allow_loopback=True,
+        auto_port=True,
+    ))
+    try:
+        for _ in range(60):
+            if asked:
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(1.0)          # several more rounds go by
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        fake_dht.close()
+
+    assert asked, "the router was never asked, so there can be no double-NAT verdict"
+    assert len(asked) == 1, f"asked {len(asked)} times; a multicast search per round is noise"

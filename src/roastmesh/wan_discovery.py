@@ -332,6 +332,26 @@ def diagnostics_payload(client: DhtClient, stats: LookupStats, *, info_hash: byt
     }
 
 
+async def _ask_router_external_ip() -> str | None:
+    """What the router says our public address is, via UPnP.
+
+    Separate from the mapping because the two are independent questions and
+    only one protocol can answer this one. Done once: the answer changes about
+    as often as the ISP changes our address, and a multicast search every round
+    would be noise on the LAN for nothing.
+    """
+    from roastmesh import upnp
+
+    def _look() -> str | None:
+        igd = upnp.discover()
+        return upnp.get_external_ip(igd) if igd is not None else None
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_look), 15.0)
+    except Exception:  # noqa: BLE001 -- no router is an ordinary answer
+        return None
+
+
 async def _renew_mapping(internal_port: int):
     """Ask the router for a forwarded port, tolerating every way that fails."""
     try:
@@ -597,6 +617,7 @@ async def run_wan_discovery(
     stale_port_rounds = 0
     # What the router says our public address is, when UPnP could ask it.
     router_external_ip: str | None = None
+    asked_router = False
     # What the router says our public address is, when UPnP could ask it.
     router_external_ip: str | None = None
     # The last read-back verdict we actually measured, kept across rounds:
@@ -608,6 +629,15 @@ async def run_wan_discovery(
         while True:
             stats = LookupStats()
             readback: bool | None = None
+            # Ask the router its public address once, whichever protocol ended
+            # up granting the mapping. Only UPnP can answer, and it is usually
+            # NAT-PMP that wins the race -- so without this the double-NAT
+            # verdict, which is the single most useful thing we can tell a node
+            # nobody can reach, is missing exactly when everything else worked.
+            if auto_port and router_external_ip is None and not asked_router:
+                asked_router = True
+                router_external_ip = await _ask_router_external_ip()
+
             if auto_port and time.monotonic() >= mapping_renew_at:
                 mapping = await _renew_mapping(port)
                 if mapping is not None:
@@ -615,7 +645,7 @@ async def run_wan_discovery(
                         print(f"wan: router mapped port {mapping.external_port} "
                               f"({mapping.protocol}, {mapping.lifetime_s}s)", flush=True)
                     effective_port = mapping.external_port
-                    router_external_ip = mapping.external_ip
+                    router_external_ip = mapping.external_ip or router_external_ip
                     # Halfway through the lease, so a renewal that fails still
                     # leaves a working mapping while we retry. A lease of 0 is
                     # a *permanent* mapping -- some routers grant nothing else
