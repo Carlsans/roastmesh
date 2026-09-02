@@ -60,18 +60,30 @@ from roastmesh.gui.app import (
 _posix_only = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX Artisan launcher discovery; no Windows equivalent yet",
 )
+# These drive _run_opener with POSIX shell commands (`true`, `sh -c`,
+# `sleep`) as stand-ins for a real opener. On Windows they fail with
+# WinError 2 -- which says nothing about _run_opener and everything about
+# `sh` not existing. The behaviour under test is platform-neutral; only the
+# stand-in commands are not. Found by running the suite on Windows, where
+# these were the only four failures.
+_needs_posix_shell = pytest.mark.skipif(
+    sys.platform == "win32", reason="uses POSIX shell commands as stand-in openers",
+)
 
 
+@_needs_posix_shell
 def test_run_opener_reports_success_for_a_command_that_exits_zero() -> None:
     assert _run_opener(["true"]) is None
 
 
+@_needs_posix_shell
 def test_run_opener_reports_the_error_for_a_command_that_exits_nonzero() -> None:
     error = _run_opener(["sh", "-c", "echo boom >&2; exit 7"])
     assert error is not None
     assert "boom" in error
 
 
+@_needs_posix_shell
 def test_run_opener_reports_success_for_a_still_running_command() -> None:
     # Stands in for a real opener handing off to a long-running app --
     # this must NOT be reported as a failure just because it hasn't
@@ -313,6 +325,7 @@ def test_external_subprocess_env_restores_the_original_when_frozen(monkeypatch) 
     assert env["LD_LIBRARY_PATH"] == "/usr/lib/some-real-system-path"
 
 
+@_needs_posix_shell
 def test_run_opener_never_leaks_a_frozen_ld_library_path_to_the_child(monkeypatch) -> None:
     """The actual integration point, not just _external_subprocess_env in
     isolation: the child reports its own view of LD_LIBRARY_PATH as its
