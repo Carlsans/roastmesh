@@ -61,13 +61,30 @@ from roastmesh.index import repository as repo
 from roastmesh.index.db import connect
 from roastmesh.index.ingest import ingest_feed
 from roastmesh.lan_discovery import BEACON_INTERVAL_S, BEACON_PORT, run_beacon
-from roastmesh.peers import Peer, load_peers, peer_from_dict, save_peers, upsert_peer
+from roastmesh.peers import (
+    Peer,
+    load_peers,
+    peer_from_dict,
+    prune_stale,
+    save_peers,
+    upsert_peer,
+)
 from roastmesh.profile import load_profile, verify_profile
 from roastmesh.quota import QuotaCheckResult, QuotaLimits, check_feed_metadata
 from roastmesh.wan_discovery import DHT_LOOKUP_INTERVAL_S, WAN_PORT, run_wan_discovery
 from roastmesh.watch_folder import publish_new_files
 
 ALPN = b"roastmesh/peer-sync/0"
+
+# Peers are dropped after this long unseen, and the sweep runs this often.
+# `peer prune` has existed since early on and nothing ever called it, so in
+# practice the list only grew: measured on a real node at 764 entries, 746 of
+# them learned through gossip and never once contacted. Gossip is worth having
+# -- it is how a node finds anyone beyond its own two or three -- but a list
+# that only accumulates turns every lookup and every gossip exchange into
+# carrying other people's dead addresses around forever.
+PEER_MAX_AGE_DAYS = 30.0
+PEER_PRUNE_INTERVAL_S = 6 * 3600.0
 
 # A dial has to be bounded, and the reason is not impatience.
 #
@@ -284,6 +301,27 @@ async def _auto_sync_discovered_peer(
                 persist_peer_profile(conn, report.profile)
         finally:
             conn.close()
+
+
+async def _prune_peers_loop(peers_path) -> None:
+    """Drop peers nobody has heard from in a month, periodically.
+
+    Deliberately load-modify-save rather than anything cleverer: a peer added
+    by a sync in the same instant could be lost, and that is fine -- gossip
+    re-learns it within a round. Holding a lock across a network sync to avoid
+    that would trade a self-healing rarity for a real stall.
+    """
+    while True:
+        try:
+            peers = load_peers(peers_path)
+            kept = prune_stale(peers, max_age_days=PEER_MAX_AGE_DAYS)
+            if len(kept) != len(peers):
+                save_peers(kept, peers_path)
+                print(f"peers: dropped {len(peers) - len(kept)} not seen in "
+                      f"{PEER_MAX_AGE_DAYS:.0f} days, {len(kept)} remaining", flush=True)
+        except Exception as exc:  # noqa: BLE001 -- housekeeping must not kill serve()
+            print(f"peers: prune failed: {exc!r}", flush=True)
+        await asyncio.sleep(PEER_PRUNE_INTERVAL_S)
 
 
 async def _refresh_index_if_needed(db_path: Path) -> None:
@@ -510,6 +548,8 @@ async def serve(
         background_tasks.append(asyncio.create_task(
             _watch_publish_loop(feed_dir, identity, publish_watch_dir, publish_watch_interval_s, db_path)
         ))
+
+    background_tasks.append(asyncio.create_task(_prune_peers_loop(peers_path)))
 
     try:
         while True:

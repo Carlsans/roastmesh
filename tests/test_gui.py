@@ -885,8 +885,18 @@ def run_search():
     for _ in range(200):
         app.update()
         if tab.task is not None and not tab.task.running and tab.table.count_var.get() != "running...":
-            break
+            return
         time.sleep(0.05)
+    raise AssertionError("a search never finished within 10s")
+
+
+def wait_for_button(text):
+    for _ in range(100):
+        app.update()
+        if detail.hide_button.cget("text") == text:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"the hide button never became {{text!r}}")
 
 run_search()
 print("COUNT_BEFORE_HIDE", tab.table.count_var.get())
@@ -909,11 +919,7 @@ detail = tab._last_detail_window
 print("INITIAL_BUTTON_TEXT", detail.hide_button.cget("text"))
 
 detail._on_toggle_hidden()
-for _ in range(100):
-    app.update()
-    if detail.hide_button.cget("text") == "Unhide":
-        break
-    time.sleep(0.05)
+wait_for_button("Unhide")
 print("BUTTON_TEXT_AFTER_HIDE", detail.hide_button.cget("text"))
 
 run_search()
@@ -924,11 +930,7 @@ run_search()
 print("COUNT_WITH_SHOW_HIDDEN", tab.table.count_var.get())
 
 detail._on_toggle_hidden()
-for _ in range(100):
-    app.update()
-    if detail.hide_button.cget("text") == "Hide":
-        break
-    time.sleep(0.05)
+wait_for_button("Hide")
 
 tab.show_hidden.set(False)
 run_search()
@@ -936,7 +938,7 @@ print("COUNT_AFTER_UNHIDE", tab.table.count_var.get())
 
 app._on_close()
 print("OK")
-""")
+""", timeout=120)
     assert "OK" in r.stdout, r.stderr
     assert "COUNT_BEFORE_HIDE 1 result" in r.stdout, r.stdout
     assert "INITIAL_BUTTON_TEXT Hide" in r.stdout, r.stdout

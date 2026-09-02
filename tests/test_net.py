@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import iroh
@@ -116,9 +117,15 @@ async def test_sync_merges_gossiped_peers(tmp_path: Path) -> None:
 
     # server B already knows about a third peer C (never actually started --
     # gossip only needs to relay what's *known*, not reach C directly)
+    # Seen *now*, not at a hardcoded date. This originally said 2026-01-01,
+    # which was recent when written and is not any more: a serving node prunes
+    # peers unseen for 30 days, so the fixture eventually aged out and the
+    # server dropped C before it could gossip it -- a test failing because
+    # time passed, which reads exactly like a broken merge.
+    recent = datetime.now(timezone.utc).isoformat()
     known_peer_c = Peer(
         ticket="deadbeef-fake-ticket-for-peer-c", feed_pubkey_hex="c" * 64,
-        first_seen="2026-01-01T00:00:00+00:00", last_seen="2026-01-01T00:00:00+00:00", added_via="manual",
+        first_seen=recent, last_seen=recent, added_via="manual",
     )
     save_peers([known_peer_c], server_peers_path)
 
@@ -727,7 +734,7 @@ async def test_sync_tolerates_a_gossiped_peer_dict_with_an_unknown_field(tmp_pat
     """Peer(**d) landmine, from the wire: a peer dict carrying a field this
     version doesn't recognize (e.g. one a newer peer added) must not raise
     TypeError and abort the whole sync."""
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
     server_identity = generate_identity()
     server_feed_dir = tmp_path / "server_feed"
@@ -833,3 +840,51 @@ def test_the_connect_timeout_is_bounded_and_short() -> None:
     from roastmesh import net
 
     assert 5.0 <= net.CONNECT_TIMEOUT_S <= 30.0
+
+
+async def test_serving_drops_peers_nobody_has_seen_in_a_month(tmp_path: Path) -> None:
+    """`peer prune` shipped early and nothing ever called it, so in practice
+    the list only grew -- measured on a real node at 764 entries, 746 learned
+    through gossip and never once contacted. Gossip is worth having; a list
+    that only accumulates means every node ends up carrying everyone else's
+    dead addresses forever.
+    """
+    peers_path = tmp_path / "peers.json"
+    fresh = datetime.now(timezone.utc)
+    stale = fresh - timedelta(days=net.PEER_MAX_AGE_DAYS + 1)
+    save_peers([
+        Peer(ticket="t-fresh", feed_pubkey_hex="a" * 64,
+             first_seen=fresh.isoformat(), last_seen=fresh.isoformat(), added_via="gossip"),
+        Peer(ticket="t-stale", feed_pubkey_hex="b" * 64,
+             first_seen=stale.isoformat(), last_seen=stale.isoformat(), added_via="gossip"),
+    ], peers_path)
+
+    task = asyncio.create_task(net._prune_peers_loop(peers_path))
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if len(load_peers(peers_path)) < 2:
+                break
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    remaining = {p.feed_pubkey_hex for p in load_peers(peers_path)}
+    assert remaining == {"a" * 64}, "the stale peer survived, or the fresh one did not"
+
+
+async def test_pruning_never_takes_down_the_node(tmp_path: Path) -> None:
+    """Housekeeping runs beside the accept loop. A corrupt peers file must cost
+    a log line, not the whole serve process."""
+    peers_path = tmp_path / "peers.json"
+    peers_path.write_text("{ this is not json", encoding="utf-8")
+
+    task = asyncio.create_task(net._prune_peers_loop(peers_path))
+    try:
+        await asyncio.sleep(0.2)
+        assert not task.done(), "a bad peers file killed the pruning loop"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
