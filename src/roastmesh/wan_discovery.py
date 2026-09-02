@@ -636,12 +636,15 @@ async def run_wan_discovery(
         while True:
             stats = LookupStats()
             readback: bool | None = None
-            # Ask the router its public address once, whichever protocol ended
-            # up granting the mapping. Only UPnP can answer, and it is usually
-            # NAT-PMP that wins the race -- so without this the double-NAT
-            # verdict, which is the single most useful thing we can tell a node
-            # nobody can reach, is missing exactly when everything else worked.
-            if auto_port and router_external_ip is None and not asked_router:
+            # Ask the router its public address once, whatever the port
+            # configuration is. This was gated on the UPnP mapping path, then on
+            # auto_port, and both were wrong in the same way: the question is a
+            # diagnostic, not part of mapping. A node given an explicit
+            # --public-port -- which is exactly what a VPN forward looks like,
+            # and the case most likely to be behind a second NAT -- got no
+            # verdict at all, while `node doctor` on the same machine printed
+            # one, because it always asked.
+            if router_external_ip is None and not asked_router:
                 asked_router = True
                 router_external_ip = await _ask_router_external_ip()
 

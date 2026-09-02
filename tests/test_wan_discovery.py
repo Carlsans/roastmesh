@@ -633,3 +633,40 @@ async def test_the_router_is_asked_its_address_once_whichever_protocol_mapped(tm
 
     assert asked, "the router was never asked, so there can be no double-NAT verdict"
     assert len(asked) == 1, f"asked {len(asked)} times; a multicast search per round is noise"
+
+
+async def test_the_router_is_asked_even_with_an_explicit_public_port(tmp_path, monkeypatch) -> None:
+    """An explicit --public-port is what a VPN forward looks like, and that is
+    the case most likely to sit behind a second layer of NAT -- so it is the
+    one that most needs the verdict. It was gated behind auto_port and got
+    nothing, while `node doctor` on the same machine printed a verdict because
+    it always asks. Caught on a Raspberry Pi running with a fixed port."""
+    asked = []
+
+    async def _ask():
+        asked.append(1)
+        return "100.64.0.1"
+
+    monkeypatch.setattr(wan_discovery, "_ask_router_external_ip", _ask)
+
+    fake_dht, fake_port = await _start_fake_dht([("127.0.0.1", 41999)])
+    task = asyncio.create_task(run_wan_discovery(
+        "ff" * 32, "ticket-f", lambda *_a: asyncio.sleep(0), port=42000,
+        lookup_interval_s=0.2, bootstrap_nodes=[("127.0.0.1", fake_port)],
+        node_cache_path=tmp_path / "state.json", allow_loopback=True,
+        public_port=26513,          # explicit, and auto_port deliberately off
+    ))
+    try:
+        for _ in range(60):
+            if asked:
+                break
+            await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        fake_dht.close()
+
+    assert asked, "a node with a fixed forwarded port was never given a verdict"
