@@ -670,3 +670,44 @@ async def test_the_router_is_asked_even_with_an_explicit_public_port(tmp_path, m
         fake_dht.close()
 
     assert asked, "a node with a fixed forwarded port was never given a verdict"
+
+
+async def test_the_router_query_does_not_delay_the_first_lookup(tmp_path, monkeypatch) -> None:
+    """Asking the router its address is a multicast search that waits seconds
+    for an answer -- on a network with no router, the full timeout. Awaiting it
+    inside the loop put that delay in front of the first DHT round, holding up
+    the announce for a diagnostic nobody is waiting on. Caught by a Windows CI
+    run, where the absence of any router made the wait maximal and the state
+    file arrived too late.
+    """
+    slow_started = asyncio.Event()
+
+    async def _slow_router():
+        slow_started.set()
+        await asyncio.sleep(30)        # a network with no router at all
+        return None
+
+    monkeypatch.setattr(wan_discovery, "_ask_router_external_ip", _slow_router)
+
+    state = tmp_path / "state.json"
+    fake_dht, fake_port = await _start_fake_dht([("127.0.0.1", 42001)])
+    task = asyncio.create_task(run_wan_discovery(
+        "aa" * 32, "ticket-a", lambda *_a: asyncio.sleep(0), port=42002,
+        lookup_interval_s=0.2, bootstrap_nodes=[("127.0.0.1", fake_port)],
+        node_cache_path=state, allow_loopback=True,
+    ))
+    try:
+        await asyncio.wait_for(slow_started.wait(), 5.0)
+        # The lookup must complete while the router query is still hanging.
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            if state.exists():
+                break
+        assert state.exists(), "a hanging router query held up the DHT round"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        fake_dht.close()

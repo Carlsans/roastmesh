@@ -625,6 +625,11 @@ async def run_wan_discovery(
     # What the router says our public address is, when UPnP could ask it.
     router_external_ip: str | None = None
     asked_router = False
+    router_query: asyncio.Task | None = None
+
+    async def _fill_router_ip() -> None:
+        nonlocal router_external_ip
+        router_external_ip = await _ask_router_external_ip()
     # What the router says our public address is, when UPnP could ask it.
     router_external_ip: str | None = None
     # The last read-back verdict we actually measured, kept across rounds:
@@ -646,7 +651,13 @@ async def run_wan_discovery(
             # one, because it always asked.
             if router_external_ip is None and not asked_router:
                 asked_router = True
-                router_external_ip = await _ask_router_external_ip()
+                # Fired off, not awaited. It is a multicast search that waits
+                # seconds for an answer -- on a network with no router, the
+                # full timeout -- and awaiting it here put that delay in front
+                # of the first DHT round, holding up the announce for a
+                # diagnostic nobody is waiting on. Caught by a Windows CI run
+                # where the absence of any router made the wait maximal.
+                router_query = asyncio.create_task(_fill_router_ip())
 
             if auto_port and time.monotonic() >= mapping_renew_at:
                 mapping = await _renew_mapping(port)
@@ -758,6 +769,8 @@ async def run_wan_discovery(
         # shutdown. The race that made awaiting tempting (a drip mid-send when
         # the socket closes) is handled in DhtClient.send_datagram instead.
         bootstrap_task.cancel()
+        if router_query is not None:
+            router_query.cancel()
         # A UPnP mapping can outlive this process -- a router that refuses
         # timed leases hands out a permanent one, and nothing removes it but
         # us. Best effort: a kill or a power cut skips this entirely.
