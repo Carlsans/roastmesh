@@ -63,6 +63,7 @@ from roastmesh.index.ingest import ingest_feed
 from roastmesh.lan_discovery import BEACON_INTERVAL_S, BEACON_PORT, run_beacon
 from roastmesh.peers import (
     Peer,
+    cap_peers,
     load_peers,
     peer_from_dict,
     prune_stale,
@@ -651,6 +652,11 @@ async def sync_with_peer(
             ticket=ticket_str, feed_pubkey_hex=peer_pubkey_hex,
             first_seen=now, last_seen=now, added_via=added_via,
         ))
+        # A peer's gossiped list is merged wholesale just above, and its
+        # entries carry attacker-declared last_seen values, so this is where
+        # an unbounded flood would otherwise be persisted. Cap it, evicting
+        # gossip and the oldest first -- see peers.cap_peers.
+        local_peers = cap_peers(local_peers)
         save_peers(local_peers, peers_path)
 
         # Ask for the peer's own signed profile (profile.py). Accepted only

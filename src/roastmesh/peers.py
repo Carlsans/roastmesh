@@ -117,3 +117,41 @@ def prune_stale(peers: list[Peer], *, max_age_days: float, now: datetime | None 
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=max_age_days)
     return [p for p in peers if datetime.fromisoformat(p.last_seen) >= cutoff]
+
+
+# The peer list has one growth source that time-based pruning cannot bound:
+# a peer's get_peers response is merged wholesale, and last_seen is
+# attacker-declared, so a single hostile peer can gossip an unbounded number
+# of freshly-timestamped entries that prune_stale will never drop. Found by
+# an adversarial pass: 4,000 injected peers grew peers.json to 1.3 MB and
+# the O(n) merge to over a second; extrapolated, tens of thousands make a
+# sync take minutes. A hard cap turns "grows without limit" into a bounded
+# cost. Sized well above any real network a hobbyist tool will see.
+MAX_PEERS = 2000
+
+
+def cap_peers(peers: list[Peer], *, limit: int = MAX_PEERS,
+              now: datetime | None = None) -> list[Peer]:
+    """Bound the peer list at `limit`, evicting the least valuable first.
+
+    Eviction order, worst first: gossip before manually-added/bootstrap
+    (gossip is the only source an attacker can flood, and the least trusted
+    -- ARCHITECTURE.md), then oldest last_seen before newest. So a flood of
+    freshly-gossiped strangers can never push out the handful of peers a user
+    added by hand, no matter how recent the flood claims to be.
+    """
+    if len(peers) <= limit:
+        return peers
+
+    def _last_seen(p: Peer) -> datetime:
+        try:
+            return datetime.fromisoformat(p.last_seen)
+        except (ValueError, TypeError):
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    # Sort best-to-keep first: trusted source, then most recently seen.
+    ranked = sorted(
+        peers,
+        key=lambda p: (p.added_via == "gossip", -_last_seen(p).timestamp()),
+    )
+    return ranked[:limit]

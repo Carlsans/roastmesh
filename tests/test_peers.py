@@ -145,3 +145,39 @@ def test_a_ticket_is_parsed_once_however_often_it_is_merged() -> None:
     )
     # Without the cache this is where the ~583k parses came from.
     assert info.hits > len(tickets) ** 2 // 2
+
+
+def test_the_peer_list_is_capped_against_a_gossip_flood() -> None:
+    """A peer's get_peers response is merged wholesale and last_seen is
+    attacker-declared, so time-based pruning cannot bound the list -- a
+    single hostile peer can gossip unlimited fresh-looking strangers. Found
+    by an adversarial pass. cap_peers bounds it.
+    """
+    from datetime import datetime, timezone
+    from roastmesh.peers import MAX_PEERS, cap_peers
+
+    now = datetime.now(timezone.utc).isoformat()
+    flood = [Peer(ticket=f"evil-{i}", feed_pubkey_hex=f"{i:064x}",
+                  first_seen=now, last_seen=now, added_via="gossip")
+             for i in range(MAX_PEERS * 3)]
+    capped = cap_peers(flood)
+    assert len(capped) == MAX_PEERS
+
+
+def test_a_flood_can_never_evict_a_hand_added_peer() -> None:
+    """The eviction order is the security property: a gossip flood, however
+    recent it claims to be, must not push out a peer the user added by hand.
+    """
+    from datetime import datetime, timezone
+    from roastmesh.peers import MAX_PEERS, cap_peers
+
+    old = "2020-01-01T00:00:00+00:00"          # the manual peer is stale...
+    fresh = datetime.now(timezone.utc).isoformat()  # ...the flood is brand new
+    mine = Peer(ticket="mine", feed_pubkey_hex="a" * 64,
+                first_seen=old, last_seen=old, added_via="manual")
+    flood = [Peer(ticket=f"evil-{i}", feed_pubkey_hex=f"{i:064x}",
+                  first_seen=fresh, last_seen=fresh, added_via="gossip")
+             for i in range(MAX_PEERS * 2)]
+    capped = cap_peers([mine] + flood)
+    assert any(p.added_via == "manual" for p in capped), "the flood evicted the hand-added peer"
+    assert len(capped) == MAX_PEERS
