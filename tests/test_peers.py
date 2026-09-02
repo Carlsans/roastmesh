@@ -107,3 +107,41 @@ def test_load_peers_tolerates_a_dict_with_an_unknown_field(tmp_path: Path) -> No
     assert len(loaded) == 1
     assert loaded[0].ticket == TICKET_A
     assert loaded[0].feed_pubkey_hex == "abc123"
+
+
+def test_a_ticket_is_parsed_once_however_often_it_is_merged() -> None:
+    """The peer merge is quadratic, so what it does per comparison decides
+    whether a sync is instant or unusable.
+
+    upsert_peer resolves every *stored* peer's node id on each insert, and
+    the sync path inserts once per *gossiped* peer -- so a merge performs
+    O(n^2) ticket resolutions. Ticket parsing goes through the iroh FFI at
+    ~120us a call, which on a real 764-peer list measured 583,696 parses and
+    ~60 seconds of pure CPU for a sync that transferred nothing. It ran on
+    every sync, on every node, and scaled with the size of the network.
+
+    Found by timing a Windows<->Pi sync (104s) against a LAN sync (100s):
+    identical, so it was never the transport. `time` then showed 96% CPU.
+
+    This pins the fix rather than the symptom -- a timing assertion would be
+    flaky, but "each distinct ticket is resolved at most once" is exact.
+    """
+    from roastmesh import peers as peers_mod
+
+    peers_mod.node_id_from_ticket.cache_clear()
+    tickets = [f"ticket-{i}" for i in range(60)]
+    merged: list[Peer] = []
+    for ticket in tickets:
+        merged = upsert_peer(merged, _peer(ticket))
+    # Re-merging the same list is what a gossip exchange actually does.
+    for ticket in tickets:
+        merged = upsert_peer(merged, _peer(ticket))
+
+    info = peers_mod.node_id_from_ticket.cache_info()
+    assert len(merged) == len(tickets)
+    assert info.misses == len(tickets), (
+        f"expected one parse per distinct ticket, got {info.misses} for "
+        f"{len(tickets)} tickets -- the memoisation is not holding"
+    )
+    # Without the cache this is where the ~583k parses came from.
+    assert info.hits > len(tickets) ** 2 // 2
