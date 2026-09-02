@@ -1,90 +1,73 @@
 """Machine identity and roast-level normalization.
 
-Machine identity is tricky in practice: the .alog `roastertype` field is
-often generic ("Kaleido Serial") but sometimes carries a real model token
-("Kaleido M2", "Kaleido Sniper M2", "Kaleido Legacy") -- `normalize_machine_key`
-extracts a model number when present instead of collapsing everything to one
-generic "kaleido_serial" bucket. It never encodes sub-variants like "Lite"
-vs. "Pro" though (no observed file has ever included that).
+Machine identity is tricky in practice, and the .alog `roastertype` field is
+a weaker signal than it looks. An audit of Artisan's own 273 machine strings
+found only half name a machine at all: the rest name the PID, the wiring, or
+the cable. "Kaleido Serial" is the clearest case -- it encodes hardware
+generation and connection method, and is written identically by an M1 and an
+M10, so the model genuinely cannot be recovered from the file. Across this
+project's own .alog fixtures, most carry an empty `roastertype` outright.
+
+So the order here is: ask the catalogue (which knows every literal string
+Artisan writes, and which machine each one really describes), and only fall
+back to pattern rules for a string the catalogue has never seen. The
+catalogue owns those rules -- `effective_key`/`effective_family` are
+imported, not restated, so the two cannot drift.
 """
 from __future__ import annotations
 
-import re
+from roastmesh.machines import (
+    NOT_A_ROASTER,
+    effective_family,
+    effective_key,
+    find_by_roastertype,
+)
 
-from roastmesh.machines import find_by_roastertype
-
-# roastertype substring (case-insensitive) -> (machine_key, mechanism_family, display_name)
-# Seeded from what's actually observed in real corpora; extend as more
-# roastertype strings are seen. First matching substring wins. Kaleido is
-# handled separately below since its model token varies per file.
+# Checked only for a roastertype string the catalogue does not list.
+# (machine_key, mechanism_family, display_name) per substring; first wins.
+# "roaster scope" is Artisan's own generic profile, not a machine.
 MACHINE_ALIASES: list[tuple[str, str, str, str]] = [
+    ("roaster scope", "unknown", "unknown", "Unspecified/generic profile"),
     ("hottop", "hottop", "hottop_drum", "Hottop"),
     ("behmor", "behmor", "behmor_drum", "Behmor"),
     ("bullet", "aillio_bullet", "aillio_fluidbed", "Aillio Bullet"),
-    ("roaster scope", "unknown", "unknown", "Unspecified/generic profile"),
 ]
-
-# Brand substrings already handled above (and by the Kaleido special case
-# below) with their own, more specific machine_key/mechanism_family. Any
-# roastmesh.machines catalogue entry whose own display_name contains one of
-# these must NOT be offered to the catalogue lookup: Artisan's own catalogue
-# happens to contain the literal strings "Kaleido Serial", "Kaleido Network",
-# "Kaleido Legacy" and "Hottop 2K+" (the fixture-observed value for
-# Hottop's KN-8828B-2K+), and a naive catalogue-first exact match on those
-# would rename existing keys out from under already-ingested data --
-# confirmed as a real break: "Hottop 2K+" slugifies to "hottop_2k" in the
-# catalogue but the pinned, already-shipped key is "hottop" (test_record.py).
-# Filtering the catalogue lookup to exclude these keeps every one of this
-# project's existing machine_key outputs byte-identical while still gaining
-# catalogue coverage for the other ~250 machines Artisan knows about that
-# aren't already special-cased here.
-_CATALOGUE_CONFLICT_SUBSTRINGS = ("kaleido", "hottop", "behmor", "bullet", "roaster scope")
-
-
-def _catalogue_lookup(text: str) -> tuple[str, str, str] | None:
-    """Exact (case-insensitive) match against roastmesh.machines' catalogue,
-    skipping any entry whose own text overlaps a brand already handled by
-    the Kaleido special case or MACHINE_ALIASES above (see the comment on
-    _CATALOGUE_CONFLICT_SUBSTRINGS). mechanism_family is "unknown" for a
-    catalogue-only match -- the catalogue has no trustworthy drum/fluidbed
-    data for the other ~250 machines it lists, and inventing it would
-    poison an existing search facet.
-    """
-    machine = find_by_roastertype(text)
-    if machine is None:
-        return None
-    if any(s in machine.display_name.lower() for s in _CATALOGUE_CONFLICT_SUBSTRINGS):
-        return None
-    return machine.key, "unknown", machine.display_name
-
-
-_KALEIDO_MODEL_RE = re.compile(r"\bm(\d+)\b")
 
 
 def normalize_machine_key(roastertype: str | None) -> tuple[str, str, str]:
     """Map a raw roastertype string to (machine_key, mechanism_family, display_name)."""
-    text = (roastertype or "").strip().lower()
+    raw = (roastertype or "").strip()
+    text = raw.lower()
     if not text:
         return "unknown", "unknown", "Unknown"
 
-    catalogue_hit = _catalogue_lookup(text)
-    if catalogue_hit is not None:
-        return catalogue_hit
+    # An interface board or a plugin is not a machine. Without this it would
+    # slugify into a facet of its own ("phidget_2xrtd"), which is exactly the
+    # bucket the catalogue was cleaned up to stop offering.
+    if text in NOT_A_ROASTER:
+        return "unknown", "unknown", "Unspecified/generic profile"
 
+    machine = find_by_roastertype(raw)
+    if machine is not None:
+        return machine.key, machine.mechanism_family, machine.display_name
+
+    # A Kaleido string the catalogue does not list -- a model token Artisan
+    # itself never writes, but which a hand-edited or third-party file may.
     if "kaleido" in text:
-        model = _KALEIDO_MODEL_RE.search(text)
-        if model:
-            key = f"kaleido_m{model.group(1)}"
-            return key, "kaleido_drum", f"Kaleido M{model.group(1)}"
-        if "legacy" in text:
-            return "kaleido_legacy", "kaleido_drum", "Kaleido Legacy"
-        return "kaleido_serial", "kaleido_drum", "Kaleido (model unspecified)"
+        key = effective_key(raw)
+        if key == "kaleido_legacy":
+            display = "Kaleido Legacy (model unspecified)"
+        elif key == "kaleido_serial":
+            display = "Kaleido (model unspecified)"
+        else:
+            display = f"Kaleido {key.removeprefix('kaleido_').upper()}"
+        return key, "kaleido_drum", display
 
     for substring, machine_key, family, display in MACHINE_ALIASES:
         if substring in text:
             return machine_key, family, display
-    slug = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
-    return slug or "unknown", "unknown", roastertype or "Unknown"
+
+    return effective_key(raw), effective_family(raw), raw or "Unknown"
 
 
 # DROP bean-temperature bands (Celsius), following

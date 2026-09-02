@@ -191,6 +191,31 @@ def test_refresh_known_sources_updates_a_field_without_reingesting_manually(conn
     assert repo.search_roasts(conn)[0].title is not None
 
 
+def test_refresh_rewrites_a_machine_key_left_by_an_older_catalogue(conn) -> None:
+    """This is the whole migration path for the catalogue rework, so it is
+    worth proving rather than assuming.
+
+    Entries indexed before that change carry keys derived by slugifying the
+    Artisan string, so a Coffed SR5 sits under `coffed_sr5_manual_delta` and
+    a Hottop's display reads "Hottop 2K+". Nothing hand-migrates those --
+    `roaster_type_raw` is kept on every row, so the version-gated refresh
+    that already runs on startup re-derives both fields from the original
+    file. If that stopped working, existing users would silently keep the
+    old buckets and see none of this.
+    """
+    ingest_file(conn, FIXTURES_DIR / "hottop_1.alog")
+    conn.execute("UPDATE roasts SET machine_key = 'hottop_2k'")
+    conn.commit()
+    assert not repo.search_roasts(conn, machine_key="hottop")
+
+    refresh_known_sources(conn)
+
+    row = conn.execute("SELECT machine_key, roaster_type_raw FROM roasts").fetchone()
+    assert row["roaster_type_raw"] == "Hottop 2K+", "the raw string must survive untouched"
+    assert row["machine_key"] == "hottop"
+    assert repo.search_roasts(conn, machine_key="hottop")
+
+
 def test_refresh_known_sources_preserves_own_roast_tagging(conn) -> None:
     ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog", is_user_log=True)
     ingest_file(conn, FIXTURES_DIR / "hottop_1.alog", is_user_log=False)
