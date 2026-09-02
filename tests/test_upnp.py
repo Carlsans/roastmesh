@@ -393,3 +393,46 @@ def test_a_probe_does_not_take_longer_the_more_interfaces_there_are(monkeypatch)
     elapsed = _time.monotonic() - started
 
     assert elapsed < 0.5 * 3, f"eight interfaces took {elapsed:.1f}s for a 0.5s budget"
+
+
+@pytest.mark.parametrize("service", [
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANIPConnection:2",
+    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+    "urn:schemas-upnp-org:service:WANPPPConnection:2",
+])
+def test_every_port_forwarding_service_type_is_recognised(service) -> None:
+    """All four, not the three libtorrent lists.
+
+    A router advertising only the fourth would be invisible -- discovery would
+    find it, read its description, recognise nothing and move on, which looks
+    exactly like a network with no gateway on it. Syncthing knows all four, and
+    the PPP family is not hypothetical: the router this was tested against
+    speaks WANPPPConnection.
+    """
+    body = DESCRIPTION.replace("urn:schemas-upnp-org:service:WANIPConnection:1", service)
+    server = _ServeBody(body.encode())
+    try:
+        found = describe(f"http://127.0.0.1:{server.port}/desc.xml")
+        assert found is not None, f"{service} was not recognised as forwarding-capable"
+        assert found.service_ns == service
+    finally:
+        server.close()
+
+
+def test_the_search_asks_for_gateways_not_every_device_on_the_lan() -> None:
+    """libtorrent asks for `upnp:rootdevice`, which makes every UPnP device
+    answer -- measured on one LAN as seven responses, six of them Chromecasts
+    and media servers. Asking for the gateway device types gets a router to
+    identify itself directly; rootdevice stays as the catch-all for devices
+    that ignore a device-type search."""
+    from roastmesh.upnp import _SEARCH_TARGETS, _m_search
+
+    assert "urn:schemas-upnp-org:device:InternetGatewayDevice:2" in _SEARCH_TARGETS
+    assert "urn:schemas-upnp-org:device:InternetGatewayDevice:1" in _SEARCH_TARGETS
+    assert "upnp:rootdevice" in _SEARCH_TARGETS, "the compatibility fallback was dropped"
+    for target in _SEARCH_TARGETS:
+        probe = _m_search(target)
+        assert probe.startswith(b"M-SEARCH * HTTP/1.1\r\n")
+        assert f"ST:{target}".encode() in probe
+        assert b'MAN:"ssdp:discover"' in probe

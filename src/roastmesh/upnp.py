@@ -48,14 +48,30 @@ SSDP_PORT = 1900
 # device may wait before answering, so it also sets how long a probe is worth
 # listening for.
 SSDP_MX = 2
-_M_SEARCH = (
-    "M-SEARCH * HTTP/1.1\r\n"
-    f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
-    "ST:upnp:rootdevice\r\n"
-    'MAN:"ssdp:discover"\r\n'
-    f"MX:{SSDP_MX}\r\n"
-    "\r\n\r\n"
-).encode("ascii")
+
+# One search per target. libtorrent asks for `upnp:rootdevice`, which makes
+# every UPnP device on the network answer -- measured on one LAN as seven
+# responses of which six were Chromecasts, a media server and a proprietary
+# queue handler. Syncthing asks for the gateway device types instead, which is
+# what we actually want. Both are sent: the targeted ones get a gateway to
+# identify itself promptly, and rootdevice stays as the catch-all for devices
+# that ignore a device-type search.
+_SEARCH_TARGETS = (
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+    "upnp:rootdevice",
+)
+
+
+def _m_search(target: str) -> bytes:
+    return (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+        f"ST:{target}\r\n"
+        'MAN:"ssdp:discover"\r\n'
+        f"MX:{SSDP_MX}\r\n"
+        "\r\n\r\n"
+    ).encode("ascii")
 
 # libtorrent retries up to twelve times over about two minutes. We do not:
 # this runs behind two protocols that answer in one round trip, and
@@ -70,6 +86,11 @@ _WAN_SERVICES = (
     "urn:schemas-upnp-org:service:WANIPConnection:1",
     "urn:schemas-upnp-org:service:WANIPConnection:2",
     "urn:schemas-upnp-org:service:WANPPPConnection:1",
+    # libtorrent stops at the three above; Syncthing knows this fourth one, and
+    # a router advertising only it would have been invisible to us. The Pi's
+    # router turned out to speak WANPPPConnection at all, so the PPP family is
+    # not hypothetical.
+    "urn:schemas-upnp-org:service:WANPPPConnection:2",
 )
 
 MAX_BODY_BYTES = 256 * 1024
@@ -134,7 +155,8 @@ def _ssdp_probe_once(timeout: float) -> list[tuple[str, str]]:
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                                 socket.inet_aton(iface.address))
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-            sock.sendto(_M_SEARCH, (SSDP_ADDR, SSDP_PORT))
+            for target in _SEARCH_TARGETS:
+                sock.sendto(_m_search(target), (SSDP_ADDR, SSDP_PORT))
         except OSError:
             sock.close()      # an interface that cannot carry multicast is fine
             continue

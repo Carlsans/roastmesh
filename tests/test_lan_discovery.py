@@ -172,3 +172,28 @@ def test_an_unknown_platform_keeps_the_old_global_broadcast(monkeypatch) -> None
 
     assert transport.sent == [("255.255.255.255", 41888)]
     assert sock.multicast_if == []
+
+
+def test_multicast_groups_are_rejoined_as_interfaces_appear(monkeypatch) -> None:
+    """A group joined only at startup is never joined on an interface that
+    turns up later -- wifi associating after launch, a VPN connecting, a cable
+    going in. Joining again is refused by the kernel for groups we already
+    hold, so re-running it every announce is the cheapest way to stay current.
+    """
+    interfaces = [Interface("wlan0", 3, "192.168.2.19", "192.168.2.255", "255.255.255.0")]
+    monkeypatch.setattr(lan_discovery, "local_interfaces", lambda: interfaces)
+    joined: list[str] = []
+
+    class _Sock:
+        def setsockopt(self, _level, opt, value):
+            if opt == socket.IP_ADD_MEMBERSHIP:
+                joined.append(socket.inet_ntoa(value[4:8]))
+
+    sock, transport = _Sock(), _FakeTransport()
+    lan_discovery._announce(sock, transport, b"hello", 41888)
+    assert joined == ["192.168.2.19"]
+
+    # A second interface appears after the beacon was already running.
+    interfaces.append(Interface("tun0", 9, "10.137.8.74", None, "255.255.0.0"))
+    lan_discovery._announce(sock, transport, b"hello", 41888)
+    assert "10.137.8.74" in joined, "an interface that appeared later was never joined"

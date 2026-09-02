@@ -133,6 +133,13 @@ def _join_multicast(sock: socket.socket) -> None:
     Per interface, not once globally: a multicast join is scoped to one
     interface, and joining only on the routing table's favourite is how the
     broadcast version of this ended up talking exclusively to a VPN tunnel.
+
+    Called on every announce, not once at startup. Interfaces come and go --
+    wifi associates after the app starts, a VPN connects, a cable is plugged in
+    -- and a group joined only at startup is never joined on any of them. A
+    repeat join of a group we already hold is refused by the kernel and
+    ignored here, which makes re-running this the cheapest way to stay current.
+    Syncthing gets the same effect by letting its reader fail and be restarted.
     """
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
@@ -163,6 +170,7 @@ def _announce(sock: socket.socket, transport, payload: bytes, port: int) -> None
     which means handing our pubkey and ticket to whatever sits at the other end
     of the tunnel for no possible benefit.
     """
+    _join_multicast(sock)
     interfaces = local_interfaces()
     if not interfaces:
         # Unknown platform. Exactly the old behaviour, which is the right
