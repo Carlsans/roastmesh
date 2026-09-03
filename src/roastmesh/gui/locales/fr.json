@@ -1,6 +1,7 @@
 {
   "(hidden)": "(masqué)",
   "(loading...)": "(chargement...)",
+  "(not downloaded)": "(non téléchargé)",
   "(unknown)": "(inconnu)",
   "({n} independent reports agree)": "({n} rapports indépendants concordent)",
   "-- cancelled --": "-- annulé --",
@@ -84,6 +85,7 @@
   "Name": "Nom",
   "Network": "Réseau",
   "No curve data in this profile.": "Aucune donnée de courbe dans ce profil.",
+  "Not downloaded -- held by other peers, none reachable right now. It will download automatically when a holder comes online.": "Non téléchargé -- conservé par d'autres pairs, aucun joignable pour l'instant. Il se téléchargera automatiquement dès qu'un détenteur sera en ligne.",
   "Notes": "Notes",
   "On by default. LAN discovery only ever broadcasts on your local network; this also finds and syncs with roastmesh peers anywhere on the internet, the same way a BitTorrent client finds peers with no tracker of its own: by announcing on the public BitTorrent DHT, a huge, already-running public network -- no server of roastmesh's own involved. The trade-off: your public IP address (and the fact that it's running roastmesh) becomes visible to anyone else looking at that same swarm, which a LAN broadcast never exposes. Uncheck this if you'd rather only ever be found on your local network. Takes effect immediately -- serving restarts on its own when you change this, so the ticket on the Network tab will change.": "Activé par défaut. La découverte locale ne diffuse que sur votre réseau local ; ceci trouve et se synchronise aussi avec des pairs roastmesh n'importe où sur Internet, de la même façon qu'un client BitTorrent trouve des pairs sans tracker propre : en s'annonçant sur le DHT BitTorrent public, un vaste réseau public déjà existant -- sans aucun serveur propre à roastmesh. Le compromis : votre adresse IP publique (et le fait que vous utilisez roastmesh) devient visible à quiconque regarde ce même essaim, ce qu'une diffusion locale n'expose jamais. Décochez ceci si vous préférez n'être trouvé que sur votre réseau local. Prend effet immédiatement -- le service redémarre tout seul quand vous changez ceci, donc le ticket de l'onglet Réseau changera.",
   "One user": "Un utilisateur",

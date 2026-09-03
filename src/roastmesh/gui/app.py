@@ -625,6 +625,7 @@ class SearchTab(Tab):
         self._last_detail_window = RoastDetailWindow(
             self, self.app, roast_id, payload.get("record") or {}, payload.get("raw_path"),
             bool(payload.get("hidden")), on_change=self._on_run,
+            blob_local=bool(payload.get("blob_local", True)),
         )
 
 
@@ -640,6 +641,7 @@ class RoastDetailWindow(tk.Toplevel):
     def __init__(
         self, parent: tk.Widget, app: "RoastmeshApp", roast_id: str, record: dict,
         raw_path: str | None, hidden: bool, *, on_change: Callable[[], None] | None = None,
+        blob_local: bool = True,
     ) -> None:
         super().__init__(parent)
         self.app = app
@@ -709,7 +711,7 @@ class RoastDetailWindow(tk.Toplevel):
 
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=14, pady=(12, 2))
-        if raw_path:
+        if raw_path and blob_local:
             ttk.Button(btn_row, text=t("Open original file"),
                        command=lambda: self._on_open_file(raw_path)).pack(side="left")
             ttk.Button(btn_row, text=t("Copy path"),
@@ -720,8 +722,17 @@ class RoastDetailWindow(tk.Toplevel):
         self.hide_button.pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text=t("Close"), command=self.destroy).pack(side="right")
 
-        if raw_path:
+        if raw_path and blob_local:
             tk.Label(self, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
+                     wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
+        elif not blob_local:
+            # A stub whose bytes are not local (opening it already tried to
+            # fetch them and no holder was reachable). Say so instead of
+            # offering an "Open" button for a file that isn't there.
+            tk.Label(self, text=t("Not downloaded -- held by other peers, none reachable "
+                                  "right now. It will download automatically when a holder "
+                                  "comes online."),
+                     font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
                      wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
 
         self.status_var = tk.StringVar(value="")

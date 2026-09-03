@@ -199,6 +199,9 @@ class RoastSearchRow:
     is_user_log: bool
     hidden: bool
     author_pubkey: str | None
+    # False for a roast whose blob was evicted to a search-only stub
+    # (replication.py): still findable, bytes fetched on demand when opened.
+    blob_local: bool = True
 
 
 def _fts_query(text: str) -> str:
@@ -228,6 +231,7 @@ def search_roasts(
         SELECT r.roast_id, r.machine_key, r.mechanism_family, r.roast_type,
                r.batch_weight_in_g, r.density_g_per_l, r.title, r.beans_text, r.roast_date,
                r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, s.author_pubkey,
+               s.blob_local,
                p.dtr_pct, p.total_time_s,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'DROP') AS drop_bt_c,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'SC_START') AS sc_start_bt_c
@@ -308,6 +312,7 @@ def search_roasts(
             is_user_log=bool(row["is_user_log"]),
             hidden=bool(row["hidden"]),
             author_pubkey=row["author_pubkey"],
+            blob_local=bool(row["blob_local"]),
         )
         for row in cur.fetchall()
         # after_second_crack can't be expressed as a plain SQL predicate
@@ -561,3 +566,181 @@ def find_distinct_machine_keys(conn: sqlite3.Connection) -> list[str]:
         "SELECT DISTINCT machine_key FROM roasts WHERE machine_key IS NOT NULL ORDER BY machine_key"
     )
     return [row["machine_key"] for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Replication ledger + stubs (replication.py)
+# ---------------------------------------------------------------------------
+
+def upsert_known_feed(
+    conn: sqlite3.Connection,
+    feed_pubkey: str,
+    *,
+    latest_seq: int | None = None,
+    total_bytes: int | None = None,
+    entry_count: int | None = None,
+    held_local: bool | None = None,
+    pinned: bool | None = None,
+) -> None:
+    """Record (or update) a feed in the ledger. Only the fields passed
+    non-None are written, so merging a peer's digest can advance latest_seq
+    without clobbering our own held_local/pinned flags, and marking a feed
+    held/pinned locally doesn't reset a peer-reported latest_seq. A brand-new
+    feed defaults to held_local=0, pinned=0 -- a hint until we actually fetch
+    it."""
+    now = datetime.now(timezone.utc).isoformat()
+    row = conn.execute(
+        "SELECT latest_seq, total_bytes, entry_count, held_local, pinned "
+        "FROM known_feeds WHERE feed_pubkey = ?",
+        (feed_pubkey,),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO known_feeds (feed_pubkey, latest_seq, total_bytes, entry_count, "
+            "held_local, pinned, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (feed_pubkey, latest_seq, total_bytes, entry_count,
+             int(bool(held_local)), int(bool(pinned)), now),
+        )
+    else:
+        conn.execute(
+            "UPDATE known_feeds SET latest_seq = ?, total_bytes = ?, entry_count = ?, "
+            "held_local = ?, pinned = ?, last_updated = ? WHERE feed_pubkey = ?",
+            (
+                latest_seq if latest_seq is not None else row["latest_seq"],
+                total_bytes if total_bytes is not None else row["total_bytes"],
+                entry_count if entry_count is not None else row["entry_count"],
+                int(held_local) if held_local is not None else row["held_local"],
+                int(pinned) if pinned is not None else row["pinned"],
+                now, feed_pubkey,
+            ),
+        )
+    conn.commit()
+
+
+def record_feed_holder(
+    conn: sqlite3.Connection, feed_pubkey: str, holder_pubkey: str, latest_seq: int | None
+) -> None:
+    """Note that `holder_pubkey` reports holding `feed_pubkey`. Caller is
+    responsible for the trust gate (only record holders we could reach -- see
+    net.record_feed_holder) so a stranger can't inflate a feed's apparent
+    replication to get it evicted everywhere."""
+    conn.execute(
+        "INSERT INTO feed_holders (feed_pubkey, holder_pubkey, latest_seq, last_reported) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(feed_pubkey, holder_pubkey) DO UPDATE SET "
+        "latest_seq = excluded.latest_seq, last_reported = excluded.last_reported",
+        (feed_pubkey, holder_pubkey, latest_seq, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def feed_holder_counts(conn: sqlite3.Connection, *, exclude_holder: str | None = None) -> dict[str, int]:
+    """replica estimate per feed: how many *other* peers hold it. Excludes our
+    own pubkey so a feed we alone hold reads as rarity 0 (must-keep), not 1."""
+    if exclude_holder is None:
+        cur = conn.execute("SELECT feed_pubkey, COUNT(*) c FROM feed_holders GROUP BY feed_pubkey")
+    else:
+        cur = conn.execute(
+            "SELECT feed_pubkey, COUNT(*) c FROM feed_holders WHERE holder_pubkey != ? "
+            "GROUP BY feed_pubkey",
+            (exclude_holder,),
+        )
+    return {row["feed_pubkey"]: row["c"] for row in cur.fetchall()}
+
+
+def known_holders(conn: sqlite3.Connection, feed_pubkey: str) -> list[str]:
+    """Holder pubkeys for a feed, most-recently-reported first -- who to try
+    when fetching an evicted stub's bytes on demand."""
+    cur = conn.execute(
+        "SELECT holder_pubkey FROM feed_holders WHERE feed_pubkey = ? ORDER BY last_reported DESC",
+        (feed_pubkey,),
+    )
+    return [row["holder_pubkey"] for row in cur.fetchall()]
+
+
+def load_known_feeds(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT feed_pubkey, latest_seq, total_bytes, entry_count, held_local, pinned "
+        "FROM known_feeds"
+    ).fetchall()
+
+
+def held_feed_pubkeys(conn: sqlite3.Connection) -> set[str]:
+    return {r["feed_pubkey"] for r in conn.execute(
+        "SELECT feed_pubkey FROM known_feeds WHERE held_local = 1")}
+
+
+def pinned_feed_pubkeys(conn: sqlite3.Connection) -> set[str]:
+    return {r["feed_pubkey"] for r in conn.execute(
+        "SELECT feed_pubkey FROM known_feeds WHERE pinned = 1")}
+
+
+def set_feed_pinned(conn: sqlite3.Connection, feed_pubkey: str, pinned: bool) -> None:
+    upsert_known_feed(conn, feed_pubkey, pinned=pinned)
+
+
+def set_blobs_local(conn: sqlite3.Connection, feed_pubkey: str, blob_local: bool) -> int:
+    """Flip the blob_local flag on every p2p source authored by `feed_pubkey`
+    and mirror it into the ledger. Returns the number of source rows touched.
+    Evicting to a stub deletes the actual blob files separately (net.py); this
+    only records that they are gone so search can flag the roast 'not
+    downloaded' and on-demand fetch knows to re-materialize it."""
+    cur = conn.execute(
+        "UPDATE sources SET blob_local = ? WHERE author_pubkey = ?",
+        (int(blob_local), feed_pubkey),
+    )
+    conn.execute(
+        "UPDATE known_feeds SET held_local = ? WHERE feed_pubkey = ?",
+        (int(blob_local), feed_pubkey),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def is_blob_local(conn: sqlite3.Connection, roast_id: str) -> bool | None:
+    row = conn.execute(
+        "SELECT s.blob_local FROM roasts r JOIN sources s ON s.source_id = r.source_id "
+        "WHERE r.roast_id = ?",
+        (roast_id,),
+    ).fetchone()
+    return bool(row["blob_local"]) if row is not None else None
+
+
+def feed_pubkey_for_roast(conn: sqlite3.Connection, roast_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT s.author_pubkey FROM roasts r JOIN sources s ON s.source_id = r.source_id "
+        "WHERE r.roast_id = ?",
+        (roast_id,),
+    ).fetchone()
+    return row["author_pubkey"] if row else None
+
+
+def delete_known_feeds(conn: sqlite3.Connection, pubkeys: set[str]) -> None:
+    """Drop ledger + holder rows for feeds being forgotten (cap_known_feeds).
+    Never deletes any `sources`/`roasts` row -- those are the real index; this
+    only prunes the bounded gossip ledger about feeds we neither hold nor pin."""
+    for pk in pubkeys:
+        conn.execute("DELETE FROM known_feeds WHERE feed_pubkey = ?", (pk,))
+        conn.execute("DELETE FROM feed_holders WHERE feed_pubkey = ?", (pk,))
+    conn.commit()
+
+
+def cap_feed_holders(conn: sqlite3.Connection, feed_pubkey: str, limit: int) -> None:
+    """Keep at most `limit` holder rows for one feed, the most recently
+    reported -- a replica estimate only needs enough to answer 'rare or not'."""
+    keep = conn.execute(
+        "SELECT holder_pubkey FROM feed_holders WHERE feed_pubkey = ? "
+        "ORDER BY last_reported DESC LIMIT ?",
+        (feed_pubkey, limit),
+    ).fetchall()
+    if len(keep) < limit:
+        return
+    kept = {r["holder_pubkey"] for r in keep}
+    all_holders = [r["holder_pubkey"] for r in conn.execute(
+        "SELECT holder_pubkey FROM feed_holders WHERE feed_pubkey = ?", (feed_pubkey,))]
+    for h in all_holders:
+        if h not in kept:
+            conn.execute(
+                "DELETE FROM feed_holders WHERE feed_pubkey = ? AND holder_pubkey = ?",
+                (feed_pubkey, h))
+    conn.commit()

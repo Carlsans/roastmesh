@@ -10,8 +10,10 @@ import click
 
 import roastmesh
 from roastmesh import net
+from roastmesh import replication
 from roastmesh.bootstrap import BOOTSTRAP_TICKETS
-from roastmesh.feed import append_entry, default_feed_dir, default_peer_feeds_root, verify_feed
+from roastmesh.feed import (append_entry, default_feed_dir, default_peer_feeds_root,
+                            held_feeds_digest, verify_feed)
 from roastmesh.gateway import make_server
 from roastmesh.identity import load_or_create_identity
 from roastmesh.index import repository as repo
@@ -285,9 +287,21 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
     record = repo.load_full_record(conn, full_id)
     raw_path = repo.find_raw_path(conn, full_id)
     hidden = repo.find_hidden(conn, full_id)
+    blob_local = repo.is_blob_local(conn, full_id)
+    feed_pubkey = repo.feed_pubkey_for_roast(conn, full_id)
+    conn.close()
+
+    # A stub -- the metadata is indexed but the .alog bytes were evicted to
+    # reclaim disk. Fetch them on demand from a holder so the file path below
+    # actually resolves.
+    fetched = False
+    if blob_local is False and feed_pubkey:
+        fetched = _fetch_stub_on_demand(ctx, feed_pubkey)
+        blob_local = fetched or blob_local
 
     if as_json:
-        click.echo(json.dumps({"record": record, "raw_path": raw_path, "hidden": hidden}))
+        click.echo(json.dumps({"record": record, "raw_path": raw_path,
+                               "hidden": hidden, "blob_local": bool(blob_local)}))
         return
 
     beans = record.get("beans_text") or "(no beans text)"
@@ -302,7 +316,15 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
         click.echo(f"  {m.get('name'):<10} t={m.get('time_s')}  BT={m.get('bt_c')}  ET={m.get('et_c')}")
     if record.get("roasting_notes"):
         click.echo(f"notes: {record['roasting_notes']}")
-    click.echo(f"file: {raw_path}")
+    if blob_local is False:
+        conn2 = connect(ctx.obj["db_path"])
+        n = len(repo.known_holders(conn2, feed_pubkey)) if feed_pubkey else 0
+        conn2.close()
+        click.echo(f"file: not downloaded -- held by {n} peer(s), none reachable right now")
+    else:
+        if fetched:
+            click.echo("(fetched on demand from a peer)")
+        click.echo(f"file: {raw_path}")
     if hidden:
         click.echo("hidden: yes -- hidden from your own search results (unhide to see it there again)")
 
@@ -452,12 +474,23 @@ def node() -> None:
                    "(default: ~/RoastMeshShare).")
 @click.option("--no-publish-watch", is_flag=True,
               help="Don't auto-publish files from the watch folder.")
+@click.option("--no-replicate", is_flag=True,
+              help="Don't mirror other users' feeds for resilience. By default this node "
+                   "keeps a bounded cache of feeds it learns about (even ones it never "
+                   "synced directly) so a roast stays available while its author is "
+                   "offline. Note: this is unrelated to --no-relay, which is Iroh's "
+                   "hole-punch relay.")
+@click.option("--replication-budget", default=None, metavar="SIZE",
+              help="Max disk for mirrored peer feeds, e.g. 500MB or 2GB (default: 500MB). "
+                   "When full, the rarest feeds are kept and the most-replicated evicted "
+                   "to search-only stubs, fetched again on demand. 0 disables replication.")
 @click.pass_context
 def node_serve(
     ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
     no_relay: bool, no_lan_discovery: bool, wan_discovery: bool,
     wan_port: int | None, public_port: str | None,
     publish_watch_dir: Path | None, no_publish_watch: bool,
+    no_replicate: bool, replication_budget: str | None,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
@@ -479,14 +512,38 @@ def node_serve(
     feed_dir = feed_dir or default_feed_dir()
     peers_file = peers_file or default_peers_path()
     watch_dir = None if no_publish_watch else (publish_watch_dir or default_watch_dir())
+    budget = _parse_size(replication_budget) if replication_budget is not None \
+        else replication.DEFAULT_REPLICATION_BUDGET
     asyncio.run(net.serve(
         ident, feed_dir, peers_file, relay=not no_relay,
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
         enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
+        replicate=not no_replicate, replication_budget=budget,
         **({"wan_discovery_port": wan_port} if wan_port else {}),
         **({"wan_public_port": fixed_port} if fixed_port else {}),
         **({"wan_auto_port": True} if auto_port else {}),
     ))
+
+
+def _parse_size(value: str) -> int:
+    """Parse a human size like `500MB`, `2gb`, `750000`, `0` into bytes.
+    Rejected loudly rather than guessed, the same posture as _parse_public_port."""
+    v = value.strip().lower().replace(" ", "").replace("i", "")  # accept MiB as MB
+    if not v:
+        raise click.ClickException("empty --replication-budget")
+    units = [("tb", 1024**4), ("gb", 1024**3), ("mb", 1024**2), ("kb", 1024),
+             ("t", 1024**4), ("g", 1024**3), ("m", 1024**2), ("k", 1024), ("b", 1)]
+    for suffix, mult in units:
+        if v.endswith(suffix):
+            try:
+                return int(float(v[:-len(suffix)]) * mult)
+            except ValueError:
+                break
+    try:
+        return int(v)
+    except ValueError:
+        raise click.ClickException(
+            f"not a size: {value!r} -- use a number of bytes, or e.g. 500MB, 2GB") from None
 
 
 def _parse_public_port(value: str | None) -> tuple[bool, int | None]:
@@ -896,6 +953,44 @@ def _sync_and_ingest(ctx: click.Context, ticket: str, added_via: str) -> None:
         # deserves a name (see net.py's _auto_sync_discovered_peer, which
         # follows the same rule for LAN/WAN auto-sync).
         net.persist_peer_profile(conn, report.profile)
+    # Record who holds what for replication (no third-party feeds are pulled on
+    # a manual `peer sync` -- that is the serving node's background job).
+    net.record_sync_replication(conn, report, Path(ctx.obj["peer_feeds_root"]))
+    if report.held_feeds:
+        click.echo(f"peer advertises {len(report.held_feeds)} feed(s) it holds")
+
+
+def _fetch_stub_on_demand(ctx: click.Context, feed_pubkey: str) -> bool:
+    """Re-materialize an evicted stub's bytes: find a known holder of its feed
+    that we have a ticket for, and pull that feed from them (also_pull). The
+    same verified path any replication uses -- forgery is impossible, the
+    signature is the author's. Returns whether the bytes are now local."""
+    peers_file = ctx.obj.get("peers_file") or default_peers_path()
+    peer_feeds_root = ctx.obj.get("peer_feeds_root") or default_peer_feeds_root()
+    conn = connect(ctx.obj["db_path"])
+    holders = repo.known_holders(conn, feed_pubkey)
+    conn.close()
+    if not holders:
+        return False
+    by_pubkey = {pr.feed_pubkey_hex: pr for pr in load_peers(peers_file) if pr.feed_pubkey_hex}
+    ident, _ = load_or_create_identity()
+    for holder in holders:
+        peer = by_pubkey.get(holder)
+        if peer is None:
+            continue  # we know they had it, but have no way to reach them
+        try:
+            report = asyncio.run(net.sync_with_peer(
+                peer.ticket, ident, peer_feeds_root, peers_file,
+                added_via=peer.added_via, also_pull=[feed_pubkey],
+            ))
+        except Exception:  # noqa: BLE001 -- try the next holder
+            continue
+        if feed_pubkey in report.pulled_feeds:
+            conn = connect(ctx.obj["db_path"])
+            net.record_sync_replication(conn, report, Path(peer_feeds_root))
+            conn.close()
+            return True
+    return False
 
 
 @peer.command("sync")
@@ -927,6 +1022,54 @@ def peer_bootstrap(ctx: click.Context) -> None:
         return
     for ticket in BOOTSTRAP_TICKETS:
         _sync_and_ingest(ctx, ticket, added_via="bootstrap")
+
+
+@peer.command("replication")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON instead of text.")
+@click.pass_context
+def peer_replication(ctx: click.Context, as_json: bool) -> None:
+    """Show what this node is mirroring for the network and what's at risk.
+
+    Held = feeds whose bytes are on disk here (yours and others'); stubs =
+    feeds evicted to search-only entries, re-fetched on demand; at-risk =
+    feeds we hold that few other reachable peers do -- the ones our copy is
+    keeping alive.
+    """
+    ident, _ = load_or_create_identity()
+    own = ident.public_key_hex
+    digest = held_feeds_digest(default_feed_dir(), own, ctx.obj["peer_feeds_root"])
+    used = sum(d["total_bytes"] for d in digest)
+
+    conn = connect(ctx.obj["db_path"])
+    known = repo.load_known_feeds(conn)
+    holder_counts = repo.feed_holder_counts(conn, exclude_holder=own)
+    conn.close()
+    held = [r["feed_pubkey"] for r in known if r["held_local"]]
+    stubs = [r["feed_pubkey"] for r in known if not r["held_local"]]
+    at_risk = sorted(
+        (pk for pk in held if pk != own and holder_counts.get(pk, 0) <= 1),
+        key=lambda pk: holder_counts.get(pk, 0),
+    )
+
+    if as_json:
+        click.echo(json.dumps({
+            "own_feed": own, "used_bytes": used,
+            "default_budget_bytes": replication.DEFAULT_REPLICATION_BUDGET,
+            "held": len(digest), "stubs": len(stubs), "known": len(known),
+            "at_risk": [{"feed": pk, "other_holders": holder_counts.get(pk, 0)} for pk in at_risk],
+        }))
+        return
+
+    mb = used / (1024 * 1024)
+    click.echo(f"mirroring {len(digest)} feed(s) on disk ({mb:.1f} MB used); "
+               f"default budget {replication.DEFAULT_REPLICATION_BUDGET // (1024*1024)} MB")
+    click.echo(f"ledger: {len(known)} feed(s) known, {len(stubs)} kept as search-only stub(s)")
+    if at_risk:
+        click.echo(f"at risk -- few other holders, our copy matters ({len(at_risk)}):")
+        for pk in at_risk[:20]:
+            click.echo(f"  {pk[:16]}...  other holders: {holder_counts.get(pk, 0)}")
+    else:
+        click.echo("no held feed is at risk -- every one has other reachable holders")
 
 
 @main.group()

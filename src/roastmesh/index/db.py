@@ -44,6 +44,11 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     ("roasts", "title", "TEXT"),
     ("roasts", "hidden", "INTEGER NOT NULL DEFAULT 0"),
     ("sources", "author_pubkey", "TEXT"),
+    # 1 = the raw .alog bytes are on disk; 0 = evicted to a search-only stub,
+    # the blob deleted but the index row kept (replication.py). Defaults to 1
+    # so every already-ingested source is correctly "held" until eviction says
+    # otherwise.
+    ("sources", "blob_local", "INTEGER NOT NULL DEFAULT 1"),
 ]
 
 

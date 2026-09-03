@@ -251,3 +251,57 @@ def write_received_entry(feed_dir: Path, pubkey_hex: str, entry: FeedEntry, blob
     entry_path = _entries_dir(feed_dir) / f"{entry.seq:08d}.json"
     if not entry_path.exists():
         entry_path.write_text(json.dumps(entry.__dict__, sort_keys=True), encoding="utf-8")
+
+
+def feed_is_fully_held(feed_dir: Path) -> bool:
+    """True when every entry's blob is present on disk. A feed evicted to a
+    stub (replication.py) has its blobs deleted, so this is what distinguishes
+    'we can serve this feed' from 'we only remember it existed'. Cheap: a stat
+    per entry, no hashing (verify_feed does the hashing when it matters)."""
+    feed_dir = Path(feed_dir)
+    entries = read_entries(feed_dir)
+    if not entries:
+        return False
+    blobs = _blobs_dir(feed_dir)
+    return all((blobs / f"{e.content_sha256}.alog").exists() for e in entries)
+
+
+def feed_holding(feed_dir: Path) -> dict | None:
+    """A digest of one held feed: {latest_seq, entry_count, total_bytes}, or
+    None if the feed is empty or not fully held. total_bytes is the sum of the
+    entries' own signed size_bytes -- which verify_feed guarantees equals the
+    real blob length, so it's an honest local measurement, not a declaration."""
+    feed_dir = Path(feed_dir)
+    if not feed_is_fully_held(feed_dir):
+        return None
+    entries = read_entries(feed_dir)
+    return {
+        "latest_seq": entries[-1].seq,
+        "entry_count": len(entries),
+        "total_bytes": sum(e.size_bytes for e in entries),
+    }
+
+
+def held_feeds_digest(own_feed_dir: Path, own_pubkey_hex: str, peer_feeds_root: Path) -> list[dict]:
+    """Every feed this node holds with servable bytes -- its own feed plus each
+    fully-held mirror under peer_feeds_root -- as
+    [{pubkey, latest_seq, entry_count, total_bytes}, ...]. This is the payload
+    of the get_held_feeds op and the input to replication.plan_retention's
+    `local`. A mirror dir whose name isn't a valid pubkey, or that has been
+    evicted to a stub (blobs gone), is skipped."""
+    digest: list[dict] = []
+    own = feed_holding(own_feed_dir)
+    if own is not None:
+        digest.append({"pubkey": own_pubkey_hex, **own})
+
+    root = Path(peer_feeds_root)
+    if root.is_dir():
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or not _PUBKEY_RE.match(child.name):
+                continue
+            if child.name == own_pubkey_hex:
+                continue  # own feed already covered, never double-count
+            holding = feed_holding(child)
+            if holding is not None:
+                digest.append({"pubkey": child.name, **holding})
+    return digest

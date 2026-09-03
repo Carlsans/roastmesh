@@ -40,7 +40,8 @@ import asyncio
 import base64
 import json
 import os
-from dataclasses import asdict, dataclass
+import shutil
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -48,10 +49,13 @@ from typing import Callable
 import iroh
 
 from roastmesh.feed import (
+    _PUBKEY_RE,
     FeedEntry,
     FeedVerifyResult,
     blob_path_for,
     default_peer_feeds_root,
+    feed_is_fully_held,
+    held_feeds_digest,
     read_entries,
     verify_feed,
     write_received_entry,
@@ -72,6 +76,7 @@ from roastmesh.peers import (
 )
 from roastmesh.profile import load_profile, verify_profile
 from roastmesh.quota import QuotaCheckResult, QuotaLimits, check_feed_metadata
+from roastmesh import replication
 from roastmesh.wan_discovery import DHT_LOOKUP_INTERVAL_S, WAN_PORT, run_wan_discovery
 from roastmesh.watch_folder import publish_new_files
 
@@ -113,6 +118,16 @@ class SyncReport:
     # node), or its profile failed verification. Never a third party's
     # profile: see sync_with_peer's docstring on why relaying is refused.
     profile: dict | None = None
+    # The peer's own get_held_feeds digest -- every feed it holds with servable
+    # bytes, as [{pubkey, latest_seq, entry_count, total_bytes}, ...]. Empty for
+    # a peer too old to know the op. The caller records this peer as a holder of
+    # each and merges the digest into the replication ledger. Never trusted for
+    # budget: the bytes are re-measured after any feed is actually pulled.
+    held_feeds: list = field(default_factory=list)
+    # Third-party feeds (pubkey hex) this sync actually pulled into their
+    # mirror dirs because `also_pull` asked for them and this peer held them --
+    # the caller verifies + ingests each, exactly like the peer's own feed.
+    pulled_feeds: list = field(default_factory=list)
 
 
 async def bind_endpoint(identity: Identity, *, alpns: list[bytes] | None = None, relay: bool = True) -> iroh.Endpoint:
@@ -155,21 +170,70 @@ def _entry_from_wire(wire: dict) -> tuple[FeedEntry, bytes]:
     return FeedEntry(**wire), blob
 
 
-def _build_response(request: dict, feed_dir: Path, peers_path: Path, profile_path: Path | None = None) -> dict:
+def _feed_dir_for_request(
+    request: dict, feed_dir: Path, peer_feeds_root: Path | None, own_pubkey_hex: str | None
+) -> tuple[Path | None, str | None]:
+    """Which feed a get_feed/get_feed_meta request targets: this node's own
+    feed when no `pubkey` is given (byte-for-byte the original behavior), or a
+    mirrored third-party feed under peer_feeds_root when one is -- how a node
+    re-serves a feed it did not author (replication.py).
+
+    The pubkey is validated against _PUBKEY_RE *before* it becomes a path
+    component (the same guard hello.decode_hello / feed._init_feed_dir use):
+    an unauthenticated request must never be able to name `../` its way out of
+    peer_feeds_root. A well-formed pubkey we simply don't hold returns (None,
+    None) -- 'no such feed here', not an error -- so the caller just tries
+    another holder. Returns (dir, error_message)."""
+    pubkey = request.get("pubkey")
+    if pubkey is None or (own_pubkey_hex is not None and pubkey == own_pubkey_hex):
+        return feed_dir, None
+    if not isinstance(pubkey, str) or not _PUBKEY_RE.match(pubkey):
+        return None, "invalid pubkey"
+    if peer_feeds_root is None:
+        return None, None
+    mirror = Path(peer_feeds_root) / pubkey
+    # Only ever serve a feed whose bytes we actually hold -- never fetch-through
+    # on a requester's behalf (no amplification, no open relay to arbitrary
+    # third parties beyond what we already store).
+    if not feed_is_fully_held(mirror):
+        return None, None
+    return mirror, None
+
+
+def _build_response(
+    request: dict, feed_dir: Path, peers_path: Path, profile_path: Path | None = None,
+    peer_feeds_root: Path | None = None, own_pubkey_hex: str | None = None,
+) -> dict:
     op = request.get("op")
     if op == "get_peers":
         return {"peers": [asdict(p) for p in load_peers(peers_path)]}
+    if op == "get_held_feeds":
+        # A cheap digest of every feed we hold with servable bytes -- our own
+        # plus every fully-held mirror. This is how holdings gossip so a peer
+        # can discover, and later pull, feeds it never synced directly.
+        return {"feeds": held_feeds_digest(feed_dir, own_pubkey_hex or "", peer_feeds_root
+                                           or default_peer_feeds_root())}
     if op == "get_feed_meta":
+        target, error = _feed_dir_for_request(request, feed_dir, peer_feeds_root, own_pubkey_hex)
+        if error is not None:
+            return {"error": error}
+        if target is None:
+            return {"entries": []}
         since_seq = int(request.get("since_seq", 0))
-        entries = [e for e in read_entries(feed_dir) if e.seq >= since_seq]
+        entries = [e for e in read_entries(target) if e.seq >= since_seq]
         return {"entries": [asdict(e) for e in entries]}
     if op == "get_feed":
+        target, error = _feed_dir_for_request(request, feed_dir, peer_feeds_root, own_pubkey_hex)
+        if error is not None:
+            return {"error": error}
+        if target is None:
+            return {"entries": []}
         since_seq = int(request.get("since_seq", 0))
-        entries = [e for e in read_entries(feed_dir) if e.seq >= since_seq]
+        entries = [e for e in read_entries(target) if e.seq >= since_seq]
         limit = request.get("limit")
         if limit is not None:
             entries = entries[:int(limit)]
-        return {"entries": [_entry_to_wire(feed_dir, e) for e in entries]}
+        return {"entries": [_entry_to_wire(target, e) for e in entries]}
     if op == "get_profile":
         # A peer may only ever be served ITS OWN profile -- there is no
         # "profile of pubkey X" lookup here, deliberately: this node has no
@@ -181,10 +245,12 @@ def _build_response(request: dict, feed_dir: Path, peers_path: Path, profile_pat
     return {"error": f"unknown op {op!r}"}
 
 
-async def _handle_request(bi, feed_dir: Path, peers_path: Path, profile_path: Path | None = None) -> None:
+async def _handle_request(bi, feed_dir: Path, peers_path: Path, profile_path: Path | None = None,
+                          peer_feeds_root: Path | None = None, own_pubkey_hex: str | None = None) -> None:
     try:
         request = await _recv_message(bi)
-        response = _build_response(request, feed_dir, peers_path, profile_path)
+        response = _build_response(request, feed_dir, peers_path, profile_path,
+                                   peer_feeds_root, own_pubkey_hex)
     except Exception as exc:
         response = {"error": str(exc)}
     try:
@@ -193,7 +259,8 @@ async def _handle_request(bi, feed_dir: Path, peers_path: Path, profile_path: Pa
         pass  # peer likely disconnected mid-response; nothing more to do
 
 
-async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile_path: Path | None = None) -> None:
+async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile_path: Path | None = None,
+                             peer_feeds_root: Path | None = None, own_pubkey_hex: str | None = None) -> None:
     try:
         accepting = await incoming.accept()
         conn = await accepting.connect()
@@ -204,7 +271,166 @@ async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile
             bi = await conn.accept_bi()
         except Exception:
             return  # connection closed
-        asyncio.create_task(_handle_request(bi, feed_dir, peers_path, profile_path))
+        asyncio.create_task(_handle_request(bi, feed_dir, peers_path, profile_path,
+                                            peer_feeds_root, own_pubkey_hex))
+
+
+# How often serve() re-enforces the disk budget and refreshes the acquire set.
+# Matched to the WAN discovery retry cadence -- replication rides on the same
+# syncs that discovery already drives, so re-planning much more often than new
+# peers arrive would just churn. A node fills spare budget over many rounds.
+REPLICATION_INTERVAL_S = 15 * 60.0
+
+
+async def _pull_third_party_feed(conn_iroh, target_pubkey_hex: str, peer_feeds_root: Path,
+                                 limits: QuotaLimits) -> bool:
+    """Pull a feed we did NOT author from a peer that holds it, into that
+    feed's own mirror dir, verifying the whole chain against
+    target_pubkey_hex. Returns True if new verified entries landed.
+
+    Quota-checked on metadata first (a hostile holder can't make us store an
+    oversized third-party feed), and re-verified after: forgery is impossible
+    because the signature is the author's, not the server's. A feed that fails
+    verification from an empty start is deleted wholesale -- there's no local
+    investment to protect, and an unverifiable prefix left on disk would block
+    a good holder from supplying it cleanly next round.
+    """
+    mirror = Path(peer_feeds_root) / target_pubkey_hex
+    existing = read_entries(mirror)
+    since = len(existing)
+    meta = await _request(conn_iroh, {"op": "get_feed_meta", "since_seq": since, "pubkey": target_pubkey_hex})
+    if "error" in meta:
+        return False
+    candidates = [FeedEntry(**d) for d in meta.get("entries", [])]
+    if not candidates:
+        return False
+    quota = check_feed_metadata(existing, candidates, limits)
+    if quota.allowed_count <= 0:
+        return False
+    feed = await _request(conn_iroh, {"op": "get_feed", "since_seq": since,
+                                      "limit": quota.allowed_count, "pubkey": target_pubkey_hex})
+    if "error" in feed:
+        return False
+    wrote = 0
+    for wire in feed.get("entries", []):
+        entry, blob = _entry_from_wire(wire)
+        write_received_entry(mirror, target_pubkey_hex, entry, blob)
+        wrote += 1
+    if wrote == 0:
+        return False
+    result = verify_feed(mirror, expected_pubkey_hex=target_pubkey_hex)
+    if result.valid_count <= since:
+        # Nothing new verified. If we planted this dir from empty and it won't
+        # verify, drop it so a good holder can supply it fresh.
+        if since == 0 and result.error:
+            shutil.rmtree(mirror, ignore_errors=True)
+        return False
+    return True
+
+
+def record_sync_replication(conn, report: "SyncReport", peer_feeds_root: Path) -> None:
+    """Fold a sync's replication data into the ledger.
+
+    Records the peer as a *first-hand* holder of every feed it advertised --
+    we only ever record a holder we reached ourselves, never a third party a
+    peer merely names, which is what keeps a stranger from inflating a rare
+    feed's apparent replication to get it evicted (ARCHITECTURE.md's local-only
+    trust). Then verifies + ingests any third-party feeds this sync pulled and
+    marks their blobs local. Holder rows per feed are bounded (cap_feed_holders).
+    """
+    peer = report.peer_pubkey_hex
+    for d in report.held_feeds:
+        fpk = d.get("pubkey")
+        if not isinstance(fpk, str) or not _PUBKEY_RE.match(fpk):
+            continue
+        repo.upsert_known_feed(conn, fpk, latest_seq=d.get("latest_seq"),
+                               total_bytes=d.get("total_bytes"), entry_count=d.get("entry_count"))
+        repo.record_feed_holder(conn, fpk, peer, d.get("latest_seq"))
+        repo.cap_feed_holders(conn, fpk, replication.MAX_HOLDERS_PER_FEED)
+    for fpk in report.pulled_feeds:
+        if not _PUBKEY_RE.match(fpk):
+            continue
+        mirror = Path(peer_feeds_root) / fpk
+        ingest_feed(conn, mirror, expected_pubkey_hex=fpk)
+        repo.set_blobs_local(conn, fpk, True)
+        repo.upsert_known_feed(conn, fpk, held_local=True)
+
+
+def _pinned_pubkeys(conn, peers_path: Path, own_pubkey_hex: str) -> set[str]:
+    """Feeds that must never be evicted: our own, every manually-added or
+    bootstrap peer (a deliberate choice by the user), and every favorited
+    author. These are kept and still counted against the budget."""
+    pinned = {own_pubkey_hex}
+    for peer in load_peers(peers_path):
+        if peer.added_via in ("manual", "bootstrap") and peer.feed_pubkey_hex:
+            pinned.add(peer.feed_pubkey_hex)
+    for row in conn.execute("SELECT pubkey_hex FROM users WHERE is_favorite = 1"):
+        pinned.add(row["pubkey_hex"])
+    return pinned
+
+
+def _evict_feed_to_stub(conn, peer_feeds_root: Path, feed_pubkey: str) -> None:
+    """Reclaim a feed's disk: delete its mirror dir (entries + blobs) and flag
+    each of its roasts not-local, keeping the index rows as searchable stubs.
+    On-demand fetch re-materializes the bytes from a holder later."""
+    mirror = Path(peer_feeds_root) / feed_pubkey
+    shutil.rmtree(mirror, ignore_errors=True)
+    repo.set_blobs_local(conn, feed_pubkey, False)
+    print(f"replication: evicted feed {feed_pubkey[:16]}... to a stub (over budget)", flush=True)
+
+
+async def _replication_loop(feed_dir: Path, own_pubkey_hex: str, peer_feeds_root: Path,
+                            peers_path: Path, db_path: Path, budget_bytes: int,
+                            acquire_state: list) -> None:
+    """Enforce the disk budget and steer acquisition, periodically.
+
+    Measures what we hold on disk, loads the ledger, runs
+    replication.plan_retention, evicts over-budget feeds to stubs, bounds the
+    ledger's gossip-grown growth, and publishes the rarest wanted feeds into
+    `acquire_state` so the discovery syncs pull them (sync_with_peer's
+    also_pull). Budget accounting is measured bytes only, never a declaration.
+    Runs in a thread (synchronous DB/file work) so it never blocks the endpoint.
+    """
+    own_id = bytes.fromhex(own_pubkey_hex)
+
+    def _work() -> list:
+        conn = connect(db_path)
+        try:
+            digest = held_feeds_digest(feed_dir, own_pubkey_hex, peer_feeds_root)
+            local = [replication.FeedHolding(d["pubkey"], d["entry_count"],
+                                             d["total_bytes"], d["latest_seq"]) for d in digest]
+            for d in digest:
+                repo.upsert_known_feed(conn, d["pubkey"], latest_seq=d["latest_seq"],
+                                       total_bytes=d["total_bytes"], entry_count=d["entry_count"],
+                                       held_local=True)
+            repo.set_feed_pinned(conn, own_pubkey_hex, True)
+            pinned = _pinned_pubkeys(conn, peers_path, own_pubkey_hex)
+            for pk in pinned:
+                repo.upsert_known_feed(conn, pk, pinned=True)
+            known_rows = repo.load_known_feeds(conn)
+            known = {r["feed_pubkey"]: replication.KnownFeed(
+                        r["feed_pubkey"], r["latest_seq"] or 0,
+                        r["total_bytes"] or 0, r["entry_count"] or 0)
+                     for r in known_rows}
+            holder_counts = repo.feed_holder_counts(conn, exclude_holder=own_pubkey_hex)
+            plan = replication.plan_retention(local, known, holder_counts, pinned, own_id, budget_bytes)
+            for pk in plan.evict:
+                _evict_feed_to_stub(conn, peer_feeds_root, pk)
+            held = repo.held_feed_pubkeys(conn)
+            drop = replication.cap_known_feeds(known, holder_counts, held, pinned)
+            if drop:
+                repo.delete_known_feeds(conn, drop)
+            return plan.acquire
+        finally:
+            conn.close()
+
+    while True:
+        try:
+            acquire = await asyncio.to_thread(_work)
+            acquire_state[:] = acquire
+        except Exception as exc:  # noqa: BLE001 -- housekeeping must not kill serve()
+            print(f"replication: pass failed: {exc!r}", flush=True)
+        await asyncio.sleep(REPLICATION_INTERVAL_S)
 
 
 def persist_peer_profile(conn, profile: dict) -> None:
@@ -258,14 +484,18 @@ async def _auto_sync_discovered_peer(
     db_path: Path | None,
     relay: bool,
     source: str = "lan",
+    also_pull: list[str] | None = None,
 ) -> None:
     """Shared by LAN and internet (DHT) auto-discovery -- `source` (used
     both as a log-line prefix and as the peer's `added_via` tag) is the
-    only thing that differs between the two callers."""
+    only thing that differs between the two callers. `also_pull` is the
+    replication acquire set: third-party feeds to pull from this peer if it
+    holds them (replication.py)."""
     print(f"{source}: discovered {peer_pubkey_hex[:16]}..., syncing", flush=True)
     try:
         report = await sync_with_peer(
             peer_ticket, identity, peer_feeds_root, peers_path, relay=relay, added_via=source,
+            also_pull=also_pull,
         )
     except Exception as exc:  # noqa: BLE001 -- a bad/unreachable peer hint shouldn't kill serve()
         print(f"{source}: sync with {peer_pubkey_hex[:16]}... failed: {exc!r}", flush=True)
@@ -300,6 +530,12 @@ async def _auto_sync_discovered_peer(
                 ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
             if report.profile is not None:
                 persist_peer_profile(conn, report.profile)
+            # Replication: note who holds what, and ingest any third-party
+            # feeds this sync pulled (marking their blobs local).
+            record_sync_replication(conn, report, Path(peer_feeds_root))
+            if report.pulled_feeds:
+                print(f"{source}: replicated {len(report.pulled_feeds)} feed(s) held by others",
+                      flush=True)
         finally:
             conn.close()
 
@@ -425,6 +661,8 @@ async def serve(
     profile_path: Path | None = None,
     publish_watch_dir: Path | None = None,
     publish_watch_interval_s: float = 10.0,
+    replicate: bool = True,
+    replication_budget: int = replication.DEFAULT_REPLICATION_BUDGET,
 ) -> None:
     """Bind a node and serve get_peers/get_feed requests forever.
 
@@ -514,6 +752,12 @@ async def serve(
 
     resolved_peer_feeds_root = peer_feeds_root or default_peer_feeds_root()
 
+    # The replication acquire set, refreshed each pass by _replication_loop and
+    # read by the discovery syncs: the rarest wanted feeds to pull opportunistically
+    # from whichever peer we next talk to that holds them. A plain list mutated
+    # in place so the closures below always see the latest set.
+    acquire_state: list[str] = []
+
     background_tasks: list[asyncio.Task] = []
     if db_path is not None:
         background_tasks.append(asyncio.create_task(_refresh_index_if_needed(db_path)))
@@ -524,6 +768,7 @@ async def serve(
                 peer_pubkey_hex, peer_ticket, identity=identity,
                 peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
                 db_path=db_path, relay=relay, source="lan",
+                also_pull=list(acquire_state),
             )
 
         background_tasks.append(asyncio.create_task(run_beacon(
@@ -537,6 +782,7 @@ async def serve(
                 peer_pubkey_hex, peer_ticket, identity=identity,
                 peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
                 db_path=db_path, relay=relay, source="wan",
+                also_pull=list(acquire_state),
             )
 
         background_tasks.append(asyncio.create_task(run_wan_discovery(
@@ -552,12 +798,20 @@ async def serve(
 
     background_tasks.append(asyncio.create_task(_prune_peers_loop(peers_path)))
 
+    if replicate and replication_budget > 0 and db_path is not None:
+        background_tasks.append(asyncio.create_task(_replication_loop(
+            feed_dir, identity.public_key_hex, resolved_peer_feeds_root, peers_path,
+            db_path, replication_budget, acquire_state,
+        )))
+
     try:
         while True:
             incoming = await ep.accept_next()
             if incoming is None:
                 break
-            asyncio.create_task(_handle_connection(incoming, feed_dir, peers_path, profile_path))
+            asyncio.create_task(_handle_connection(
+                incoming, feed_dir, peers_path, profile_path,
+                resolved_peer_feeds_root, identity.public_key_hex))
     finally:
         for task in background_tasks:
             task.cancel()
@@ -573,6 +827,7 @@ async def sync_with_peer(
     relay: bool = True,
     added_via: str = "manual",
     limits: QuotaLimits | None = None,
+    also_pull: list[str] | None = None,
 ) -> SyncReport:
     """Dial a peer, pull any new feed entries into a local mirror directory
     (subject to `limits` -- ARCHITECTURE.md's Abuse Resistance quotas,
@@ -682,6 +937,39 @@ async def sync_with_peer(
         except Exception:  # noqa: BLE001 -- a profile is a nice-to-have, never worth failing sync over
             peer_profile = None
 
+        # Ask what feeds this peer holds (its own plus feeds it mirrors for
+        # others). Backward compatible: a peer too old for the op answers
+        # {"error": ...}, which is just "no digest", never a sync failure --
+        # the same convention get_profile uses.
+        held_feeds: list = []
+        try:
+            hf_response = await _request(conn, {"op": "get_held_feeds"})
+            if "error" not in hf_response:
+                held_feeds = [d for d in hf_response.get("feeds", [])
+                              if isinstance(d, dict) and isinstance(d.get("pubkey"), str)]
+        except Exception:  # noqa: BLE001 -- a digest is a nice-to-have, never worth failing sync over
+            held_feeds = []
+
+        # Pull the third-party feeds `also_pull` asked for that THIS peer
+        # actually advertised holding. The advertised-set gate is load-bearing:
+        # it is what stops us sending a pubkey'd get_feed to a peer too old to
+        # understand the pubkey param (which would answer with its *own* feed
+        # under the wrong identity). Every pulled feed is verified against its
+        # claimed pubkey; a holder that serves garbage only wastes one round.
+        pulled_feeds: list = []
+        if also_pull:
+            advertised = {d["pubkey"] for d in held_feeds}
+            for target in also_pull:
+                if target in (peer_pubkey_hex, identity.public_key_hex):
+                    continue
+                if target not in advertised:
+                    continue
+                try:
+                    if await _pull_third_party_feed(conn, target, peer_feeds_root, limits):
+                        pulled_feeds.append(target)
+                except Exception:  # noqa: BLE001 -- one bad feed must not abort the sync
+                    continue
+
         return SyncReport(
             peer_pubkey_hex=peer_pubkey_hex,
             new_entry_count=len(new_entries),
@@ -689,6 +977,8 @@ async def sync_with_peer(
             quota=quota_result,
             peers_known=len(local_peers),
             profile=peer_profile,
+            held_feeds=held_feeds,
+            pulled_feeds=pulled_feeds,
         )
     finally:
         await ep.close()

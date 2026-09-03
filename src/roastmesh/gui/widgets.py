@@ -480,6 +480,10 @@ class ResultsTable(ttk.Frame):
             title = row.get("title") or ""
             if row.get("hidden"):
                 title = t("{title} (hidden)", title=title) if title else t("(hidden)")
+            if row.get("blob_local") is False:
+                # A stub: indexed and searchable, but the .alog bytes were
+                # evicted to reclaim disk -- fetched on demand when opened.
+                title = "☁ " + (title or t("(not downloaded)"))
             drop_c = units.convert_temp(row.get("drop_bt_c"), unit)
             dtr = f"{row['dtr_pct']:.1f}" if row.get("dtr_pct") is not None else ""
             drop = f"{drop_c:.0f}" if drop_c is not None else ""

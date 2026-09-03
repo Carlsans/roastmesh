@@ -117,3 +117,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS roasts_fts USING fts5(
     roast_type,
     machine_display
 );
+
+-- Replication ledger (replication.py). Every feed this node knows *exists*,
+-- whether or not it currently holds the bytes -- so search can show a roast we
+-- have evicted to a stub, and the retention policy can reason about feeds we
+-- do not hold yet. Brand-new tables, so CREATE TABLE IF NOT EXISTS populates
+-- them on an upgraded database exactly as on a fresh one (unlike a new *column*
+-- on an existing table, which needs db._apply_added_columns).
+CREATE TABLE IF NOT EXISTS known_feeds (
+    feed_pubkey   TEXT PRIMARY KEY,
+    latest_seq    INTEGER,
+    total_bytes   INTEGER,
+    entry_count   INTEGER,
+    held_local    INTEGER NOT NULL DEFAULT 0,  -- 1 once we hold the blobs, 0 for a stub or never-fetched hint
+    pinned        INTEGER NOT NULL DEFAULT 0,  -- never evicted (own feed, manual peer, favorite)
+    last_updated  TEXT
+);
+
+-- Who reports holding each feed -- the replica estimate that drives rarity-first
+-- eviction. A row is only trusted toward the count if its holder is a peer we
+-- ourselves could reach (see net.record_feed_holder); a stranger cannot inflate
+-- a feed's apparent replication to get it evicted.
+CREATE TABLE IF NOT EXISTS feed_holders (
+    feed_pubkey    TEXT NOT NULL,
+    holder_pubkey  TEXT NOT NULL,
+    latest_seq     INTEGER,
+    last_reported  TEXT NOT NULL,
+    PRIMARY KEY (feed_pubkey, holder_pubkey)
+);
+CREATE INDEX IF NOT EXISTS idx_feed_holders_feed ON feed_holders(feed_pubkey);

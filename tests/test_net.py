@@ -600,10 +600,10 @@ async def test_sync_completes_cleanly_against_a_peer_that_does_not_know_get_prof
 
     real_build_response = net._build_response
 
-    def old_peer_build_response(request, feed_dir, peers_path, profile_path=None):
+    def old_peer_build_response(request, feed_dir, peers_path, profile_path=None, *args):
         if request.get("op") == "get_profile":
             return {"error": "unknown op 'get_profile'"}
-        return real_build_response(request, feed_dir, peers_path, profile_path)
+        return real_build_response(request, feed_dir, peers_path, profile_path, *args)
 
     monkeypatch.setattr(net, "_build_response", old_peer_build_response)
 
@@ -749,8 +749,8 @@ async def test_sync_tolerates_a_gossiped_peer_dict_with_an_unknown_field(tmp_pat
 
     real_build_response = net._build_response
 
-    def build_response_with_extra_peer_field(request, feed_dir, peers_path, profile_path=None):
-        response = real_build_response(request, feed_dir, peers_path, profile_path)
+    def build_response_with_extra_peer_field(request, feed_dir, peers_path, profile_path=None, *args):
+        response = real_build_response(request, feed_dir, peers_path, profile_path, *args)
         if request.get("op") == "get_peers":
             for peer_dict in response["peers"]:
                 peer_dict["a_future_field_this_version_does_not_know_about"] = "surprise"
