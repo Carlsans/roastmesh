@@ -630,3 +630,58 @@ def test_find_distinct_machine_keys(conn) -> None:
     assert "hottop" in keys
     assert "kaleido_serial" in keys
     assert keys.count("hottop") == 1
+
+
+def test_concurrent_migrate_does_not_race_on_added_columns(tmp_path: Path) -> None:
+    """serve() opens two connections at startup -- the version-gated refresh and
+    the replication loop -- and both call migrate(). On the first launch after
+    an upgrade that adds a column they raced to ALTER TABLE ADD COLUMN: one won,
+    the other had read the pre-ALTER schema and failed with "duplicate column
+    name". Observed live on the Pi's first 0.6.15 launch as "replication: pass
+    failed: OperationalError('duplicate column name: blob_local')".
+
+    Reproduces the real scenario: an *existing* WAL database (an upgrade, not a
+    fresh file) that is missing only the newest column, then concurrent
+    connect()s racing on the one ALTER. _apply_added_columns must treat a
+    concurrently-added column as done, not as an error.
+    """
+    import threading
+    from roastmesh.index import db as dbmod
+
+    db = tmp_path / "index.sqlite3"
+
+    # Build a pre-upgrade DB: fully migrated and WAL-mode, but without the
+    # newest added column -- exactly what a node carries into its first launch
+    # on a version that introduces one.
+    original = dbmod._ADDED_COLUMNS
+    dbmod._ADDED_COLUMNS = [c for c in original if c != ("sources", "blob_local", "INTEGER NOT NULL DEFAULT 1")]
+    try:
+        connect(db).close()
+    finally:
+        dbmod._ADDED_COLUMNS = original
+    import sqlite3
+    pre = sqlite3.connect(db)
+    assert "blob_local" not in {r[1] for r in pre.execute("PRAGMA table_info(sources)")}
+    pre.close()
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(4)
+
+    def worker() -> None:
+        try:
+            barrier.wait()          # release all threads into the ALTER race at once
+            connect(db).close()
+        except Exception as exc:    # noqa: BLE001 -- the whole point is to catch it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    conn = connect(db)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sources)")}
+    conn.close()
+    assert "blob_local" in cols     # the migration still actually happened

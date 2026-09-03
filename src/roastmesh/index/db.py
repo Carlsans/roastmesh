@@ -55,8 +55,19 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
 def _apply_added_columns(conn: sqlite3.Connection) -> None:
     for table, column, sql_type in _ADDED_COLUMNS:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in existing:
+        if column in existing:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+        except sqlite3.OperationalError as exc:
+            # "duplicate column name" means a *concurrent* connection added it
+            # between the PRAGMA read above and this ALTER -- a real race now
+            # that serve() opens two connections at startup (the version-gated
+            # refresh and the replication loop) that both migrate(). The column
+            # is present either way, so this is the winner having already done
+            # our work, not a failure. Any other OperationalError is real.
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def migrate(conn: sqlite3.Connection) -> None:
