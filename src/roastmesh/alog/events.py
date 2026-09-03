@@ -55,7 +55,14 @@ def extract_milestones(raw: dict, warnings: list[str]) -> list[Milestone]:
     timex = raw.get("timex") or []
 
     charge_abs_s: float | None = None
-    if timeindex and timeindex[0] and 0 <= timeindex[0] < len(timex):
+    # `0 <= timeindex[0]` (not a plain `timeindex[0]` truthiness check): CHARGE
+    # at index 0 is a real, common case for logs that start recording *at*
+    # charge -- Artisan .alog files carry pre-charge data so their CHARGE index
+    # is > 0, but CSV/RoasTime exports (formats/) routinely put CHARGE at the
+    # first sample. Artisan's own unset sentinel is -1, which the range check
+    # still excludes. Without this, an index-0 CHARGE was read as "unset" and
+    # every other milestone's time collapsed to None.
+    if timeindex and 0 <= timeindex[0] < len(timex):
         charge_abs_s = timex[timeindex[0]]
 
     milestones: list[Milestone] = []

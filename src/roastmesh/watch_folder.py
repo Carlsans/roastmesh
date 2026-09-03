@@ -39,7 +39,8 @@ def publish_new_files(
     feed_dir: Path, identity: Identity, watch_dir: Path, *, db_path: Path | None = None,
     skip_cache: dict[Path, tuple[float, int]] | None = None,
 ) -> list[FeedEntry]:
-    """Publish every `.alog` file directly under `watch_dir` that isn't
+    """Publish every supported roast file (.alog, .json, .csv) directly under
+    `watch_dir` that isn't
     already in the feed (by content hash), in filename order. Safe to call
     repeatedly -- already-published files are skipped, not re-published.
 
@@ -65,7 +66,9 @@ def publish_new_files(
 
     existing_hashes = {e.content_sha256 for e in read_entries(feed_dir)}
     published: list[FeedEntry] = []
-    for path in sorted(watch_dir.glob("*.alog")):
+    from roastmesh import formats
+    watch_files = sorted(f for pat in formats.SUPPORTED_GLOBS for f in watch_dir.glob(pat))
+    for path in watch_files:
         if not path.is_file():
             continue
         stat = path.stat()

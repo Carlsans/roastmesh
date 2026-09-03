@@ -11,7 +11,8 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
-from roastmesh.alog.parser import AlogParseError, SourceMeta, parse_alog_text
+from roastmesh.alog.parser import SourceMeta
+from roastmesh import formats
 from roastmesh.alog.record import to_roast_record
 from roastmesh.index import repository as repo
 from roastmesh.models import RoastRecord
@@ -83,14 +84,12 @@ def ingest_file(
     content_sha256 = repo.sha256_bytes(raw_bytes)
     existing = repo.find_source_by_hash(conn, content_sha256)
 
+    # Dispatch by CONTENT, not extension: a blob may be .alog, RoasTime/
+    # roast.world JSON, or CSV (formats/). Every adapter uses a safe parser
+    # (ast.literal_eval / json / csv), never eval/pickle -- ARCHITECTURE.md.
     try:
-        text = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw_bytes.decode("latin-1")
-
-    try:
-        raw = parse_alog_text(text)
-    except AlogParseError as exc:
+        raw, _fmt = formats.detect_and_parse(raw_bytes)
+    except formats.RoastParseError as exc:
         return IngestResult(None, False, f"{path}: {exc}")
 
     source_meta = SourceMeta(source_type=source_type, source_ref=source_ref, source_url=source_url)
@@ -146,10 +145,12 @@ def ingest_file(
 
 
 def ingest_path(conn: sqlite3.Connection, path: Path, **kwargs) -> list[IngestResult]:
-    """Ingest a single .alog file, or every .alog file directly under a directory."""
+    """Ingest a single roast file, or every supported roast file (.alog, .json,
+    .csv) directly under a directory."""
     path = Path(path)
     if path.is_dir():
-        return [ingest_file(conn, p, **kwargs) for p in sorted(path.glob("*.alog"))]
+        files = sorted(p for pat in formats.SUPPORTED_GLOBS for p in path.glob(pat))
+        return [ingest_file(conn, p, **kwargs) for p in files]
     return [ingest_file(conn, path, **kwargs)]
 
 

@@ -1,0 +1,15 @@
+{
+  "roastName": "Synthesized Bullet R1 test roast",
+  "beanName": "Ethiopia Guji washed",
+  "roastNotes": "synthesized fixture, not a real export",
+  "temperatureUnit": "C",
+  "sampleInterval": 30,
+  "weightGreen": 100.0,
+  "weightRoasted": 84.5,
+  "beanTemperature": [200, 120, 95, 100, 120, 145, 168, 188, 202, 210, 214, 205],
+  "drumTemperature": [230, 210, 190, 185, 190, 200, 210, 220, 228, 232, 234, 220],
+  "chargeIndex": 0,
+  "yellowingIndex": 4,
+  "firstCrackIndex": 9,
+  "dropIndex": 10
+}
