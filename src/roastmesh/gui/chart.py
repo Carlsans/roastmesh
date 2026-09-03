@@ -29,25 +29,43 @@ from tkinter import ttk
 from roastmesh.alog import curves
 from roastmesh.gui import units
 from roastmesh.gui.i18n import t
-from roastmesh.gui.widgets import BG, FG, FONT_MONO, MUTED, lw, sp
+from roastmesh.gui import theme
+from roastmesh.gui.widgets import FONT_MONO, lw, sp
 
-_BT_COLOR = "#c8102e"
-_ET_COLOR = "#1f5fa9"
-_ROR_COLOR = "#e0607e"
-_SV_COLOR = "#ff9300"
 # Artisan's own default device colors, confirmed against real .alog fixtures
 # (extradevicecolor1/2).
 _CONTROL_COLORS = {"Burner": "#ad0427", "Air": "#48abff", "Drum": "#80531a", "Damper": "#7a4a2b"}
 _CONTROL_ORDER = ("Burner", "Drum", "Air", "Damper")
 
-_DEV_BAND = "#fdf6c3"
-_COOL_BAND = "#dce9f5"
-_BAND_ALT = "#eeece6"
-_GRID = "#d8d5cd"
 
 _CONTROL_FRAC = 0.22  # bottom slice of the plot body reserved for burner/air/drum -- a ratio, not a pixel size
 _TICK_FONT = ("TkDefaultFont", 7)
 _LABEL_FONT = ("TkDefaultFont", 7)
+
+
+def _phase_shade(name: str) -> str:
+    """Phase-bar colour by segment name, read from the active theme so the bar
+    tracks light/dark. Echoes Artisan's drying/Maillard/development language."""
+    return {
+        "Drying": theme.PHASE_DRY, "Maillard": theme.PHASE_MAILLARD,
+        "Development": theme.PHASE_DEV, "Cooling": theme.PHASE_COOL,
+    }.get(name, theme.PHASE_DRY)
+
+
+# Open charts, so a live theme switch can redraw their Canvas items (the widget
+# walk in theme.retheme recolours canvas *backgrounds* by value, but not the
+# lines/text drawn on them). WeakSet: a closed detail window drops out on its own.
+import weakref as _weakref
+_LIVE_CHARTS: "_weakref.WeakSet" = _weakref.WeakSet()
+
+
+def refresh_open_charts() -> None:
+    for chart in list(_LIVE_CHARTS):
+        try:
+            chart._draw_phase_bar()
+            chart._redraw()
+        except Exception:  # noqa: BLE001 -- a chart being torn down mustn't break the switch
+            pass
 
 
 class RoastChart(ttk.Frame):
@@ -72,12 +90,12 @@ class RoastChart(ttk.Frame):
         self._margin_t = sp(12)
         self._margin_b = sp(26)
 
-        self.phase_canvas = tk.Canvas(self, height=sp(46), bg=BG, highlightthickness=0)
+        self.phase_canvas = tk.Canvas(self, height=sp(46), bg=theme.BG, highlightthickness=0)
         self.phase_canvas.pack(fill="x", pady=(4, 0))
         self.phase_canvas.bind("<Configure>", lambda _e: self._draw_phase_bar())
 
-        self.plot = tk.Canvas(self, bg="#ffffff", highlightthickness=1,
-                               highlightbackground=_GRID, height=sp(340))
+        self.plot = tk.Canvas(self, bg=theme.SURFACE, highlightthickness=1,
+                               highlightbackground=theme.GRID, height=sp(340))
         self.plot.pack(fill="both", expand=True, pady=(6, 0))
         self.plot.bind("<Configure>", lambda _e: self._redraw())
         self.plot.bind("<Motion>", self._on_motion)
@@ -87,13 +105,14 @@ class RoastChart(ttk.Frame):
         readout.pack(fill="x", pady=(4, 8))
         self.readout_line1 = tk.StringVar(value=t("Hover the chart for a reading at that time."))
         self.readout_line2 = tk.StringVar(value="")
-        tk.Label(readout, textvariable=self.readout_line1, font=FONT_MONO, fg=FG, bg=BG,
+        tk.Label(readout, textvariable=self.readout_line1, font=FONT_MONO, fg=theme.FG, bg=theme.BG,
                  anchor="w").pack(fill="x")
-        tk.Label(readout, textvariable=self.readout_line2, font=FONT_MONO, fg=MUTED, bg=BG,
+        tk.Label(readout, textvariable=self.readout_line2, font=FONT_MONO, fg=theme.MUTED, bg=theme.BG,
                  anchor="w").pack(fill="x")
 
         self._draw_phase_bar()
         self._redraw()
+        _LIVE_CHARTS.add(self)
 
     # -- data prep --------------------------------------------------------
 
@@ -142,9 +161,6 @@ class RoastChart(ttk.Frame):
 
     # -- phase bar ----------------------------------------------------------
 
-    _PHASE_SHADES = {"Drying": "#e7e4dc", "Maillard": "#cfcbc0",
-                      "Development": _DEV_BAND, "Cooling": _COOL_BAND}
-
     def _draw_phase_bar(self) -> None:
         c = self.phase_canvas
         c.delete("all")
@@ -158,15 +174,15 @@ class RoastChart(ttk.Frame):
         x = 0.0
         for seg in segments:
             w = seg.duration_s / total * width
-            c.create_rectangle(x, sp(20), x + w, sp(34), fill=self._PHASE_SHADES.get(seg.name, "#e7e4dc"),
+            c.create_rectangle(x, sp(20), x + w, sp(34), fill=_phase_shade(seg.name),
                                 outline="")
             label = curves.format_mmss(seg.duration_s)
             if seg.pct is not None:
                 label += f"  {seg.pct:.1f}%"
-            c.create_text(x + w / 2, sp(10), text=label, font=_LABEL_FONT, fill=FG)
+            c.create_text(x + w / 2, sp(10), text=label, font=_LABEL_FONT, fill=theme.FG)
             if seg.rise_c is not None:
                 c.create_text(x + w / 2, sp(40), text=f"{seg.rise_c:.1f}°{self._unit}",
-                              font=_LABEL_FONT, fill=MUTED)
+                              font=_LABEL_FONT, fill=theme.MUTED)
             x += w
 
     # -- main plot ----------------------------------------------------------
@@ -177,7 +193,7 @@ class RoastChart(ttk.Frame):
         s = self._series
         if not s["times"]:
             c.create_text(sp(16), sp(16), text=t("No curve data in this profile."), anchor="nw",
-                          font=("TkDefaultFont", 10), fill=MUTED)
+                          font=("TkDefaultFont", 10), fill=theme.MUTED)
             self._transform = None
             return
 
@@ -238,11 +254,11 @@ class RoastChart(ttk.Frame):
                         temp_lo, temp_hi, ror_lo, ror_hi, t_min, t_max, x_of)
         self._draw_controls(c, s["controls"], x_of, y_ctrl, t_max)
         self._draw_ror(c, times, s["ror"], x_of, y_ror)
-        self._draw_temp_line(c, times, s["et_c"], x_of, y_temp, _ET_COLOR, lw(1))
+        self._draw_temp_line(c, times, s["et_c"], x_of, y_temp, theme.ET, lw(1))
         if s["sv"] is not None:
             sv_times, sv_vals = s["sv"]
-            self._draw_temp_line(c, sv_times, sv_vals, x_of, y_temp, _SV_COLOR, lw(1))
-        self._draw_temp_line(c, times, s["bt_c"], x_of, y_temp, _BT_COLOR, lw(2))
+            self._draw_temp_line(c, sv_times, sv_vals, x_of, y_temp, theme.SV, lw(1))
+        self._draw_temp_line(c, times, s["bt_c"], x_of, y_temp, theme.BT, lw(2))
         self._draw_milestones(c, s["milestones"], x_of, y_temp, t_min, t_max, temp_top)
         self._draw_legend(c, body_right, body_top, bool(ror_vals), s["sv"] is not None, s["controls"])
 
@@ -253,7 +269,7 @@ class RoastChart(ttk.Frame):
                 continue
             y0 = top + (bottom - top) * i / stripes
             y1 = top + (bottom - top) * (i + 1) / stripes
-            c.create_rectangle(left, y0, right, y1, fill=_BAND_ALT, outline="")
+            c.create_rectangle(left, y0, right, y1, fill=theme.ROW_ALT, outline="")
 
     @staticmethod
     def _draw_phase_backgrounds(c, by_name, x_of, t_min, t_max, top, bottom) -> None:
@@ -269,10 +285,10 @@ class RoastChart(ttk.Frame):
 
         dev = span("FC_START", "DROP")
         if dev:
-            c.create_rectangle(x_of(dev[0]), top, x_of(dev[1]), bottom, fill=_DEV_BAND, outline="")
+            c.create_rectangle(x_of(dev[0]), top, x_of(dev[1]), bottom, fill=theme.PHASE_DEV, outline="")
         cool = span("DROP", "COOL_END")
         if cool:
-            c.create_rectangle(x_of(cool[0]), top, x_of(cool[1]), bottom, fill=_COOL_BAND, outline="")
+            c.create_rectangle(x_of(cool[0]), top, x_of(cool[1]), bottom, fill=theme.PHASE_COOL, outline="")
 
     @staticmethod
     def _draw_axes(c, left, right, temp_top, temp_bottom, body_bottom,
@@ -283,22 +299,22 @@ class RoastChart(ttk.Frame):
             frac = i / 4
             y = temp_bottom - frac * (temp_bottom - temp_top)
             v = temp_lo + frac * (temp_hi - temp_lo)
-            c.create_line(left - tick, y, left, y, fill=MUTED)
-            c.create_text(left - label_gap, y, text=f"{v:.0f}", font=_TICK_FONT, fill=MUTED, anchor="e")
+            c.create_line(left - tick, y, left, y, fill=theme.MUTED)
+            c.create_text(left - label_gap, y, text=f"{v:.0f}", font=_TICK_FONT, fill=theme.MUTED, anchor="e")
             rv = ror_lo + frac * (ror_hi - ror_lo)
-            c.create_line(right, y, right + tick, y, fill=MUTED)
-            c.create_text(right + label_gap, y, text=f"{rv:.0f}", font=_TICK_FONT, fill=MUTED, anchor="w")
+            c.create_line(right, y, right + tick, y, fill=theme.MUTED)
+            c.create_text(right + label_gap, y, text=f"{rv:.0f}", font=_TICK_FONT, fill=theme.MUTED, anchor="w")
 
-        c.create_line(left, temp_bottom, right, temp_bottom, fill=_GRID)
+        c.create_line(left, temp_bottom, right, temp_bottom, fill=theme.GRID)
 
         min_tick_spacing = sp(90)
         n_ticks = max(2, int((right - left) // min_tick_spacing))
         for i in range(n_ticks + 1):
             t = t_min + (i / n_ticks) * (t_max - t_min)
             x = x_of(t)
-            c.create_line(x, body_bottom, x, body_bottom + tick, fill=MUTED)
+            c.create_line(x, body_bottom, x, body_bottom + tick, fill=theme.MUTED)
             c.create_text(x, body_bottom + label_gap, text=curves.format_mmss(t), font=_TICK_FONT,
-                          fill=MUTED, anchor="n")
+                          fill=theme.MUTED, anchor="n")
 
     @staticmethod
     def _step_coords(points: list[tuple[float, float]], x_of, y_of, t_end: float) -> list[float]:
@@ -321,7 +337,7 @@ class RoastChart(ttk.Frame):
                 continue
             coords = self._step_coords(points, x_of, y_ctrl, t_max)
             if len(coords) >= 4:
-                c.create_line(*coords, fill=_CONTROL_COLORS.get(label, MUTED), width=lw(2))
+                c.create_line(*coords, fill=_CONTROL_COLORS.get(label, theme.MUTED), width=lw(2))
 
     @staticmethod
     def _draw_ror(c, times, ror, x_of, y_ror) -> None:
@@ -332,12 +348,12 @@ class RoastChart(ttk.Frame):
         for t, v in zip(times, ror):
             if v is None:
                 if len(coords) >= 4:
-                    c.create_line(*coords, fill=_ROR_COLOR, width=width)
+                    c.create_line(*coords, fill=theme.ROR, width=width)
                 coords = []
                 continue
             coords += [x_of(t), y_ror(v)]
         if len(coords) >= 4:
-            c.create_line(*coords, fill=_ROR_COLOR, width=width)
+            c.create_line(*coords, fill=theme.ROR, width=width)
 
     @staticmethod
     def _draw_temp_line(c, times, values, x_of, y_temp, color, width) -> None:
@@ -371,24 +387,24 @@ class RoastChart(ttk.Frame):
         for i, m in enumerate(ordered):
             x, y = x_of(m["time_s"]), y_temp(m["bt_c"])
             label_y = temp_top + sp(9) + (i % 2) * row_h
-            c.create_line(x, label_y + row_h, x, y, fill=MUTED, dash=dash)
-            c.create_oval(x - dot_r, y - dot_r, x + dot_r, y + dot_r, fill=_BT_COLOR, outline="")
+            c.create_line(x, label_y + row_h, x, y, fill=theme.MUTED, dash=dash)
+            c.create_oval(x - dot_r, y - dot_r, x + dot_r, y + dot_r, fill=theme.BT, outline="")
             c.create_text(x, label_y, text=f"{self._MILESTONE_LABELS[m['name']]} {m['bt_c']:.1f}°{self._unit}",
-                          font=_LABEL_FONT, fill=FG, anchor="s")
+                          font=_LABEL_FONT, fill=theme.FG, anchor="s")
 
     @staticmethod
     def _draw_legend(c, body_right, body_top, has_ror, has_sv, controls) -> None:
         # BT/ET/RoR/SV are universal roasting notation (identical in every
         # language, including French Artisan) -- not translated, same
         # reasoning as the milestone abbreviations in _MILESTONE_LABELS.
-        items = [("BT", _BT_COLOR), ("ET", _ET_COLOR)]
+        items = [("BT", theme.BT), ("ET", theme.ET)]
         if has_ror:
-            items.append(("ΔBT", _ROR_COLOR))
+            items.append(("ΔBT", theme.ROR))
         if has_sv:
-            items.append(("SV", _SV_COLOR))
+            items.append(("SV", theme.SV))
         for label in _CONTROL_ORDER:
             if controls.get(label):
-                items.append((t(label), _CONTROL_COLORS.get(label, MUTED)))
+                items.append((t(label), _CONTROL_COLORS.get(label, theme.MUTED)))
 
         swatch_w = sp(14)
         text_gap = sp(18)
@@ -397,7 +413,7 @@ class RoastChart(ttk.Frame):
         lx, ly = body_right - sp(72), body_top + sp(6)
         for label, color in items:
             c.create_line(lx, ly, lx + swatch_w, ly, fill=color, width=swatch_width)
-            c.create_text(lx + text_gap, ly, text=label, font=_LABEL_FONT, fill=FG, anchor="w")
+            c.create_text(lx + text_gap, ly, text=label, font=_LABEL_FONT, fill=theme.FG, anchor="w")
             ly += row_h
 
     # -- hover --------------------------------------------------------------
@@ -455,12 +471,12 @@ class RoastChart(ttk.Frame):
         c = self.plot
         c.delete("hover")
         x = tr["x_of"](times[i])
-        c.create_line(x, tr["temp_top"], x, tr["temp_bottom"], fill="#999999",
+        c.create_line(x, tr["temp_top"], x, tr["temp_bottom"], fill=theme.MUTED,
                       dash=(sp(3), sp(2)), tags="hover")
         y_temp = tr["y_temp"]
         dot_r = sp(3)
         dot_w = lw(2)
-        for v, color in ((bt, _BT_COLOR), (et, _ET_COLOR)):
+        for v, color in ((bt, theme.BT), (et, theme.ET)):
             if v is None:
                 continue
             y = y_temp(v)

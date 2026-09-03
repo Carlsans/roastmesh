@@ -37,13 +37,12 @@ from roastmesh.gui.chart import RoastChart
 from roastmesh.gui.i18n import t, tn
 from roastmesh.gui.runner import Task, describe, parse_json_output, roastmesh_argv, stream_into
 from roastmesh.models import weight_loss_pct
+from roastmesh.gui import chart as chart_mod
+from roastmesh.gui import theme
 from roastmesh.gui.widgets import (
-    BG,
-    FG,
     FONT_BOLD,
     FONT_H2,
     FONT_MONO,
-    MUTED,
     AutocompleteField,
     Choice,
     Console,
@@ -312,7 +311,7 @@ class SearchTab(Tab):
 
         mode_row = ttk.Frame(self)
         mode_row.pack(fill="x", padx=10, pady=(0, 2))
-        tk.Label(mode_row, text=t("Show:"), font=FONT_BOLD, bg=BG, fg=FG).pack(side="left")
+        tk.Label(mode_row, text=t("Show:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG).pack(side="left")
         self.mode = tk.StringVar(value=self.MODE_ALL)
         ttk.Radiobutton(mode_row, text=t("All users"), value=self.MODE_ALL, variable=self.mode,
                         command=self._on_mode_changed).pack(side="left", padx=(8, 0))
@@ -359,7 +358,7 @@ class SearchTab(Tab):
         self.like_btn.pack(side="left", padx=(6, 0))
         self.user_status = tk.StringVar(value="")
         tk.Label(self.one_user_frame, textvariable=self.user_status, font=("TkDefaultFont", 9),
-                 fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=10, pady=(0, 4))
+                 fg=theme.MUTED, bg=theme.BG, anchor="w").pack(fill="x", padx=10, pady=(0, 4))
 
         self.all_users_frame.pack(fill="x")  # default mode is MODE_ALL
 
@@ -648,7 +647,7 @@ class RoastDetailWindow(tk.Toplevel):
         self.roast_id = roast_id
         self.hidden = hidden
         self.on_change = on_change
-        self.configure(bg=BG)
+        self.configure(bg=theme.BG)
         self.geometry(screen_geometry(self, 1040, 820))
         # Same on Windows: the chart is the point of this window, and it reads
         # far better with the whole screen than in a 1040px box.
@@ -668,10 +667,10 @@ class RoastDetailWindow(tk.Toplevel):
         def row(label: str, value) -> None:
             r = ttk.Frame(info)
             r.pack(fill="x", pady=1)
-            tk.Label(r, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=18,
+            tk.Label(r, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=18,
                      anchor="w").pack(side="left")
             tk.Label(r, text=str(value) if value not in (None, "") else t("?"), font=FONT_MONO,
-                     bg=BG, fg=MUTED, anchor="w", wraplength=sp(600), justify="left").pack(side="left")
+                     bg=theme.BG, fg=theme.MUTED, anchor="w", wraplength=sp(600), justify="left").pack(side="left")
 
         row(t("Machine"), f"{record.get('machine_key')} ({record.get('roaster_type_raw')})")
         roast_type_value = (
@@ -691,7 +690,7 @@ class RoastDetailWindow(tk.Toplevel):
 
         milestones = record.get("milestones") or []
         if milestones:
-            tk.Label(self, text=t("Milestones"), font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
+            tk.Label(self, text=t("Milestones"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
                 fill="x", padx=14, pady=(10, 2))
             for m in milestones:
                 time_text = format_mmss(m["time_s"]) if m.get("time_s") is not None else t("?")
@@ -705,7 +704,7 @@ class RoastDetailWindow(tk.Toplevel):
 
         notes = record.get("roasting_notes") or record.get("cupping_notes")
         if notes:
-            tk.Label(self, text=t("Notes"), font=FONT_H2, fg=FG, bg=BG, anchor="w").pack(
+            tk.Label(self, text=t("Notes"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
                 fill="x", padx=14, pady=(10, 2))
             explain(self, notes)
 
@@ -723,7 +722,7 @@ class RoastDetailWindow(tk.Toplevel):
         ttk.Button(btn_row, text=t("Close"), command=self.destroy).pack(side="right")
 
         if raw_path and blob_local:
-            tk.Label(self, text=raw_path, font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
+            tk.Label(self, text=raw_path, font=FONT_MONO, fg=theme.MUTED, bg=theme.BG, anchor="w",
                      wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
         elif not blob_local:
             # A stub whose bytes are not local (opening it already tried to
@@ -732,12 +731,12 @@ class RoastDetailWindow(tk.Toplevel):
             tk.Label(self, text=t("Not downloaded -- held by other peers, none reachable "
                                   "right now. It will download automatically when a holder "
                                   "comes online."),
-                     font=FONT_MONO, fg=MUTED, bg=BG, anchor="w",
+                     font=FONT_MONO, fg=theme.MUTED, bg=theme.BG, anchor="w",
                      wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
 
         self.status_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self.status_var, font=("TkDefaultFont", 9), fg=MUTED,
-                 bg=BG, anchor="w", wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(2, 12))
+        tk.Label(self, textvariable=self.status_var, font=("TkDefaultFont", 9), fg=theme.MUTED,
+                 bg=theme.BG, anchor="w", wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(2, 12))
 
     def _on_open_file(self, path: str) -> None:
         error = _open_alog_file(path)
@@ -780,19 +779,19 @@ class PublishTab(Tab):
 
         identity_row = ttk.Frame(self)
         identity_row.pack(fill="x", padx=14, pady=(0, 6))
-        tk.Label(identity_row, text=t("Feed address:"), font=FONT_BOLD, bg=BG, fg=FG).pack(side="left")
+        tk.Label(identity_row, text=t("Feed address:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG).pack(side="left")
         self.identity_var = tk.StringVar(value=t("(loading...)"))
-        tk.Label(identity_row, textvariable=self.identity_var, font=FONT_MONO, bg=BG,
-                 fg=MUTED).pack(side="left", padx=(6, 0))
+        tk.Label(identity_row, textvariable=self.identity_var, font=FONT_MONO, bg=theme.BG,
+                 fg=theme.MUTED).pack(side="left", padx=(6, 0))
 
         folder_section = section(self, t("Shared folder (recommended)"))
         tk.Label(folder_section, text=t("Drop .alog files here and they're published automatically, "
                  "as long as the Network tab is serving -- no button to click per file:"),
-                 font=("TkDefaultFont", 9), fg=MUTED, bg=BG, wraplength=sp(840), justify="left",
+                 font=("TkDefaultFont", 9), fg=theme.MUTED, bg=theme.BG, wraplength=sp(840), justify="left",
                  anchor="w").pack(fill="x", padx=10, pady=(6, 2))
         folder_row = ttk.Frame(folder_section)
         folder_row.pack(fill="x", padx=10, pady=(0, 2))
-        tk.Label(folder_row, textvariable=self.app.watch_dir, font=FONT_MONO, bg=BG, fg=FG).pack(
+        tk.Label(folder_row, textvariable=self.app.watch_dir, font=FONT_MONO, bg=theme.BG, fg=theme.FG).pack(
             side="left")
         ttk.Button(folder_row, text=t("Open folder"), command=self._open_watch_folder).pack(
             side="left", padx=(8, 0))
@@ -801,7 +800,7 @@ class PublishTab(Tab):
             side="left", padx=(6, 0))
         self.folder_status_var = tk.StringVar(value="")
         tk.Label(folder_section, textvariable=self.folder_status_var, font=("TkDefaultFont", 9),
-                 fg=MUTED, bg=BG, anchor="w", wraplength=sp(840), justify="left").pack(
+                 fg=theme.MUTED, bg=theme.BG, anchor="w", wraplength=sp(840), justify="left").pack(
             fill="x", padx=10, pady=(0, 8))
 
         single_file_section = section(self, t("Publish a single file"))
@@ -892,7 +891,7 @@ class NetworkTab(Tab):
                          "Changes made in Settings apply the next time you Stop then Start serving."))
 
         serve_section = section(self, t("Serve your feed"))
-        tk.Label(serve_section, text=t("Your ticket:"), font=FONT_BOLD, bg=BG, fg=FG).pack(
+        tk.Label(serve_section, text=t("Your ticket:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG).pack(
             anchor="w", padx=10, pady=(6, 0))
         ticket_row = ttk.Frame(serve_section)
         ticket_row.pack(fill="x", padx=10, pady=(0, 6))
@@ -930,11 +929,11 @@ class NetworkTab(Tab):
             ("peers", t("Peers on the swarm")),
             ("advice", t("What to do")),
         )):
-            tk.Label(grid, text=label + ":", font=FONT_BOLD, bg=BG, fg=FG).grid(
+            tk.Label(grid, text=label + ":", font=FONT_BOLD, bg=theme.BG, fg=theme.FG).grid(
                 row=row, column=0, sticky="nw", padx=(0, 8), pady=1)
             var = tk.StringVar(value=t("waiting..."))
             self.diag_vars[key] = var
-            tk.Label(grid, textvariable=var, bg=BG, fg=MUTED, anchor="w",
+            tk.Label(grid, textvariable=var, bg=theme.BG, fg=theme.MUTED, anchor="w",
                      justify="left", wraplength=520).grid(row=row, column=1, sticky="w", pady=1)
         self.diag_runbar = RunBar(diag_section, t("Run a full check"),
                                   self._on_diag, self._on_cancel_diag)
@@ -1247,8 +1246,8 @@ class SettingsTab(Tab):
         self.machine_field.combo.bind("<Return>", self._on_profile_field_changed)
         self.machine_field.combo.bind("<<ComboboxSelected>>", self._on_profile_field_changed)
         self.you_status = tk.StringVar(value="")
-        tk.Label(you_section, textvariable=self.you_status, font=("TkDefaultFont", 9), fg=MUTED,
-                 bg=BG, anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(you_section, textvariable=self.you_status, font=("TkDefaultFont", 9), fg=theme.MUTED,
+                 bg=theme.BG, anchor="w").pack(fill="x", padx=10, pady=(0, 8))
         self._machine_by_display: dict[str, str] = {}
         self._load_profile()
         self._load_machine_catalogue()
@@ -1308,6 +1307,16 @@ class SettingsTab(Tab):
                         variable=self.app.temp_unit).pack(side="left")
         ttk.Radiobutton(unit_row, text=t("Fahrenheit (°F)"), value=units.FAHRENHEIT,
                         variable=self.app.temp_unit).pack(side="left", padx=(12, 0))
+
+        theme_section = section(container, t("Appearance"))
+        explain(theme_section,
+                t("Light or dark. \"System\" follows your operating system where roastmesh can "
+                  "tell, otherwise light. The change applies right away."))
+        theme_row = ttk.Frame(theme_section)
+        theme_row.pack(anchor="w", padx=10, pady=(0, 8))
+        for value, label in (("system", t("System")), ("light", t("Light")), ("dark", t("Dark"))):
+            ttk.Radiobutton(theme_row, text=label, value=value,
+                            variable=self.app.theme).pack(side="left", padx=(0, 12))
 
         language_section = section(container, t("Language"))
         explain(language_section,
@@ -1452,21 +1461,11 @@ class RoastmeshApp(tk.Tk):
         # the screen, and the search results table has more columns than a
         # 900px window shows comfortably.
         widgets.maximize(self)
-        self.configure(bg=BG)
-        try:
-            style = ttk.Style(self)
-            style.theme_use("clam")
-            # "clam"'s Treeview row height is a fixed pixel value baked
-            # into the theme, not derived from the active font -- confirmed
-            # on a real 4K display: it stayed at 20px after the 3x
-            # font-scaling bump above (which needs ~55px of linespace),
-            # clipping almost every row's text down to unreadable
-            # fragments (only the outer edges of each glyph fit). Recompute
-            # it from the font actually in use, now that scaling is set.
-            row_font = tkfont.nametofont("TkDefaultFont")
-            style.configure("Treeview", rowheight=round(row_font.metrics("linespace") * 1.3))
-        except tk.TclError:
-            pass
+        # Apply the theme -- Sun Valley chrome + our light/dark token palette +
+        # the Treeview row-height fix (all in gui/theme.py) -- BEFORE any tab is
+        # built, so every widget is created with the active theme's colours.
+        self.resolved_theme = theme.apply(self, cfg.theme)
+        self.configure(bg=theme.BG)
 
         # Must happen before any tab is built below -- every widget label is
         # baked in at construction time (see gui/i18n.py's module docstring
@@ -1483,6 +1482,12 @@ class RoastmeshApp(tk.Tk):
         for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled, self.public_port,
                     self.temp_unit, self.language):
             var.trace_add("write", lambda *_args: self._save_config())
+
+        # Theme has its own trace: unlike the others it also re-themes the live
+        # window (Sun Valley switch + a token remap of raw tk widgets + a chart
+        # redraw), not just a save. See _on_theme_changed / gui/theme.retheme.
+        self.theme = tk.StringVar(value=cfg.theme)
+        self.theme.trace_add("write", lambda *_a: self._on_theme_changed())
 
         # Your own profile (display name, declared machine) -- NOT part of
         # the trace_add loop above. Those write to gui_config.json on every
@@ -1596,7 +1601,19 @@ class RoastmeshApp(tk.Tk):
             temp_unit=self.temp_unit.get(),
             language=self.language.get(),
             ui_scale=self._ui_scale_override,
+            theme=self.theme.get(),
         ))
+
+    def _on_theme_changed(self) -> None:
+        """Apply a runtime theme switch: swap Sun Valley's chrome, remap every
+        raw tk widget's colour by value (gui/theme.retheme), redraw open charts,
+        and persist the choice."""
+        previous = theme.current()
+        mode = theme.apply(self, self.theme.get())
+        if mode != previous:
+            theme.retheme(self, previous, mode)
+            chart_mod.refresh_open_charts()
+        self._save_config()
 
     def _on_close(self) -> None:
         for tab in self.tabs:

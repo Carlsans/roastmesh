@@ -14,17 +14,9 @@ import tkinter as tk
 from collections.abc import Callable
 from tkinter import ttk
 
+from roastmesh.gui import theme
 from roastmesh.gui import units
 from roastmesh.gui.i18n import t, tn
-
-# Palette. Deliberately muted -- this is a tool for reading search results,
-# not a dashboard to be impressed by.
-BG = "#f7f6f3"
-FG = "#2b2b2b"
-MUTED = "#6b6b6b"
-ACCENT = "#7a4a2b"  # roasted-bean brown, used sparingly for headings
-CONSOLE_BG = "#1e1e1e"
-CONSOLE_FG = "#d8d8d8"
 
 FONT = ("TkDefaultFont", 10)
 FONT_BOLD = ("TkDefaultFont", 10, "bold")
@@ -160,16 +152,16 @@ def heading(parent: tk.Widget, text: str, sub: str = "") -> ttk.Frame:
     """A tab's title and one-line purpose."""
     frame = ttk.Frame(parent)
     frame.pack(fill="x", padx=14, pady=(12, 4))
-    tk.Label(frame, text=text, font=FONT_H1, fg=ACCENT, bg=BG, anchor="w").pack(fill="x")
+    tk.Label(frame, text=text, font=FONT_H1, fg=theme.ACCENT, bg=theme.BG, anchor="w").pack(fill="x")
     if sub:
-        tk.Label(frame, text=sub, font=FONT, fg=MUTED, bg=BG, anchor="w",
+        tk.Label(frame, text=sub, font=FONT, fg=theme.MUTED, bg=theme.BG, anchor="w",
                  wraplength=sp(900), justify="left").pack(fill="x", pady=(2, 0))
     return frame
 
 
 def explain(parent: tk.Widget, text: str) -> tk.Label:
     """A block of plain-language explanation of what a screen is for."""
-    lbl = tk.Label(parent, text=text.strip(), font=FONT, fg=FG, bg=BG,
+    lbl = tk.Label(parent, text=text.strip(), font=FONT, fg=theme.FG, bg=theme.BG,
                    wraplength=sp(900), justify="left", anchor="w")
     lbl.pack(fill="x", padx=14, pady=(6, 4))
     return lbl
@@ -195,7 +187,7 @@ class Field(ttk.Frame):
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=22,
+        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=22,
                  anchor="w").pack(side="left")
         # `variable`, when given, is a StringVar owned by the caller (e.g.
         # RoastmeshApp) rather than one this Field creates for itself -- lets
@@ -211,8 +203,8 @@ class Field(ttk.Frame):
         self.entry = ttk.Entry(row, textvariable=self.var, width=width)
         self.entry.pack(side="left", fill="x", expand=True)
         if help_text:
-            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=MUTED,
-                     bg=BG, wraplength=sp(840), justify="left", anchor="w").pack(
+            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=theme.MUTED,
+                     bg=theme.BG, wraplength=sp(840), justify="left", anchor="w").pack(
                 fill="x", padx=(sp(224), 0), pady=(1, 0))
 
     def get(self) -> str:
@@ -231,14 +223,14 @@ class Choice(ttk.Frame):
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=22,
+        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=22,
                  anchor="w").pack(side="left")
         self.var = tk.StringVar(value=default or (options[0] if options else ""))
         ttk.Combobox(row, textvariable=self.var, values=options, width=26,
                      state="readonly").pack(side="left")
         if help_text:
-            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=MUTED,
-                     bg=BG, wraplength=sp(840), justify="left", anchor="w").pack(
+            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=theme.MUTED,
+                     bg=theme.BG, wraplength=sp(840), justify="left", anchor="w").pack(
                 fill="x", padx=(sp(224), 0), pady=(1, 0))
 
     def get(self) -> str:
@@ -268,7 +260,7 @@ class AutocompleteField(ttk.Frame):
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=FONT_BOLD, bg=BG, fg=FG, width=22,
+        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=22,
                  anchor="w").pack(side="left")
         self._all_values: list[str] = list(values or [])
         if variable is not None:
@@ -285,8 +277,8 @@ class AutocompleteField(ttk.Frame):
         # a value that isn't in the list at all (e.g. a custom machine).
         self.combo.bind("<KeyRelease>", self._on_key_release)
         if help_text:
-            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=MUTED,
-                     bg=BG, wraplength=sp(840), justify="left", anchor="w").pack(
+            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=theme.MUTED,
+                     bg=theme.BG, wraplength=sp(840), justify="left", anchor="w").pack(
                 fill="x", padx=(sp(224), 0), pady=(1, 0))
 
     def set_values(self, values: list[str]) -> None:
@@ -330,13 +322,13 @@ class Console(ttk.Frame):
 
         self.cmd_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.cmd_var, font=("TkFixedFont", 8),
-                 fg=MUTED, bg=BG, anchor="w", wraplength=sp(900),
+                 fg=theme.MUTED, bg=theme.BG, anchor="w", wraplength=sp(900),
                  justify="left").pack(fill="x", pady=(0, 3))
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True)
-        self.text = tk.Text(wrap, height=height, wrap="none", bg=CONSOLE_BG,
-                            fg=CONSOLE_FG, insertbackground=CONSOLE_FG,
+        self.text = tk.Text(wrap, height=height, wrap="none", bg=theme.CONSOLE_BG,
+                            fg=theme.CONSOLE_FG, insertbackground=theme.CONSOLE_FG,
                             font=FONT_MONO, relief="flat")
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
         xbar = ttk.Scrollbar(self, orient="horizontal", command=self.text.xview)
@@ -382,7 +374,7 @@ class RunBar(ttk.Frame):
                                      state="disabled")
         self.cancel_btn.pack(side="left", padx=(8, 0))
         self.status = tk.StringVar(value=t("ready"))
-        tk.Label(self, textvariable=self.status, font=FONT, fg=MUTED, bg=BG,
+        tk.Label(self, textvariable=self.status, font=FONT, fg=theme.MUTED, bg=theme.BG,
                  anchor="w").pack(side="left", padx=(14, 0))
 
     def set_running(self, running: bool, status: str = "") -> None:
@@ -395,7 +387,7 @@ class RunBar(ttk.Frame):
 def scrollable(parent: tk.Widget) -> ttk.Frame:
     """A vertically scrollable region, for tabs with more content than fits
     on a laptop screen."""
-    canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
+    canvas = tk.Canvas(parent, bg=theme.BG, highlightthickness=0)
     bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
     inner = ttk.Frame(canvas)
     inner.bind("<Configure>",
@@ -469,7 +461,7 @@ class ResultsTable(ttk.Frame):
         xbar.pack(fill="x")
 
         self.count_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self.count_var, font=FONT, fg=MUTED, bg=BG,
+        tk.Label(self, textvariable=self.count_var, font=FONT, fg=theme.MUTED, bg=theme.BG,
                  anchor="w").pack(fill="x", pady=(4, 0))
 
     def set_rows(self, rows: list[dict], unit: str = units.CELSIUS) -> None:

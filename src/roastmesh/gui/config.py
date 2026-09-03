@@ -42,6 +42,9 @@ class GuiConfig:
     # it is required. Kept as text because it comes straight from an entry box,
     # and both an empty box and the word "auto" have to survive a round trip.
     public_port: str = ""
+    # UI theme: "system" (follow the OS where detectable, else light), "light",
+    # or "dark". See gui/theme.py. A stale/unknown value falls back to "system".
+    theme: str = "system"
 
 
 def default_config() -> GuiConfig:
@@ -53,6 +56,7 @@ def default_config() -> GuiConfig:
         language=DEFAULT_LANGUAGE,
         ui_scale=None,
         public_port="",
+        theme="system",
     )
 
 
@@ -73,6 +77,7 @@ def load_config() -> GuiConfig:
         language=data.get("language") if data.get("language") in LANGUAGES else defaults.language,
         ui_scale=_valid_ui_scale(data.get("ui_scale")),
         public_port=_valid_port(data.get("public_port")),
+        theme=data.get("theme") if data.get("theme") in ("system", "light", "dark") else defaults.theme,
     )
 
 

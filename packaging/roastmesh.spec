@@ -53,6 +53,11 @@ SRC = ROOT / "src"
 from PyInstaller.utils.hooks import collect_all
 
 iroh_datas, iroh_binaries, iroh_hiddenimports = collect_all("iroh")
+# sv_ttk (Sun Valley theme) loads Tcl theme files and PNG sprites at runtime
+# by sourcing .tcl -- invisible to static analysis, same as iroh, so collect
+# everything it ships or the GUI falls back to the default ttk theme in the
+# packaged binary (works, but not the intended look).
+sv_datas, sv_binaries, sv_hiddenimports = collect_all("sv_ttk")
 
 # schema.sql and the gui/locales/*.json translation catalogs are both read
 # at runtime via importlib.resources (index/db.py's migrate(), gui/i18n.py's
@@ -66,6 +71,7 @@ package_datas = [
     (str(SRC / "roastmesh" / "index" / "schema.sql"), "roastmesh/index"),
     (str(SRC / "roastmesh" / "gui" / "locales"), "roastmesh/gui/locales"),
     *iroh_datas,
+    *sv_datas,
 ]
 
 # Windows shows this in the taskbar, Alt-Tab, the title bar, Explorer and
@@ -77,7 +83,7 @@ ICON = str(ROOT / "packaging" / "roastmesh.ico")
 
 common_kwargs = dict(
     pathex=[str(SRC)],
-    binaries=iroh_binaries,
+    binaries=[*iroh_binaries, *sv_binaries],
     datas=package_datas,
     hiddenimports=iroh_hiddenimports,
     hookspath=[],
@@ -93,7 +99,7 @@ cli_pyz = PYZ(cli_analysis.pure)
 # -- GUI ------------------------------------------------------------------
 gui_analysis = Analysis(
     [str(ROOT / "packaging" / "entry_gui.py")],
-    **{**common_kwargs, "hiddenimports": [*iroh_hiddenimports, "tkinter"]},
+    **{**common_kwargs, "hiddenimports": [*iroh_hiddenimports, *sv_hiddenimports, "tkinter", "sv_ttk"]},
 )
 gui_pyz = PYZ(gui_analysis.pure)
 

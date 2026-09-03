@@ -479,3 +479,17 @@ real in-process DHT swarm, including a check that the *previous*, broken lookup 
   doc's aspirational "~10-20 MB" — that
   number describes the JS/Bare or Rust/Iroh-native stacks it lists as alternatives to the Python
   stack actually used here.
+
+## License
+
+roastmesh is licensed under the **[PolyForm Noncommercial License 1.0.0](./LICENSE)**.
+
+In plain terms: it's **free**, and you're welcome to use it, study it, modify it, and
+**fork it** — for any **noncommercial** purpose (personal use, hobby roasting, research,
+education, nonprofits). What the license does not grant is **commercial** use: selling it,
+or building a paid product or service on it. Money is deliberately kept out of it.
+
+This makes roastmesh **source-available**, not "open source" in the [OSI](https://opensource.org/osd)
+sense (an OSI license can't restrict commercial use) — so please describe it as *free and
+noncommercial*, not *open source*. Third-party components it builds on are permissively licensed;
+their notices are in [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md).
