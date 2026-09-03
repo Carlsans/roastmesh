@@ -282,6 +282,19 @@ async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile
 REPLICATION_INTERVAL_S = 15 * 60.0
 
 
+def _truncate_mirror_to(mirror: Path, valid_count: int) -> None:
+    """Delete every entry at or after `valid_count` (and any blob left with no
+    remaining entry pointing at it), leaving only the verified prefix on disk.
+    read_entries is sorted by filename, which is the seq, so entries[valid_count:]
+    is exactly the unverified tail."""
+    entries = read_entries(mirror)
+    kept_hashes = {e.content_sha256 for e in entries[:valid_count]}
+    for e in entries[valid_count:]:
+        (mirror / "entries" / f"{e.seq:08d}.json").unlink(missing_ok=True)
+        if e.content_sha256 not in kept_hashes:
+            blob_path_for(mirror, e).unlink(missing_ok=True)
+
+
 async def _pull_third_party_feed(conn_iroh, target_pubkey_hex: str, peer_feeds_root: Path,
                                  limits: QuotaLimits) -> bool:
     """Pull a feed we did NOT author from a peer that holds it, into that
@@ -319,13 +332,21 @@ async def _pull_third_party_feed(conn_iroh, target_pubkey_hex: str, peer_feeds_r
     if wrote == 0:
         return False
     result = verify_feed(mirror, expected_pubkey_hex=target_pubkey_hex)
-    if result.valid_count <= since:
-        # Nothing new verified. If we planted this dir from empty and it won't
-        # verify, drop it so a good holder can supply it fresh.
-        if since == 0 and result.error:
-            shutil.rmtree(mirror, ignore_errors=True)
+    total_on_disk = len(read_entries(mirror))
+    if result.valid_count < total_on_disk:
+        # Keep only the verified prefix. A malicious holder can serve a real
+        # prefix followed by a forged tail entry: verify_feed rejects the tail
+        # (so it never reaches the index), but left on disk that tail both lets
+        # us re-serve unverifiable bytes AND wedges since_seq -- we would think
+        # we already hold that seq and never pull the feed's real later entries
+        # from a good holder. Truncating to the verified prefix closes both.
+        _truncate_mirror_to(mirror, result.valid_count)
+    if result.valid_count == 0:
+        # Nothing verified at all -- drop the dir so a good holder can supply
+        # it fresh (there is no valid prefix to protect).
+        shutil.rmtree(mirror, ignore_errors=True)
         return False
-    return True
+    return result.valid_count > since
 
 
 def record_sync_replication(conn, report: "SyncReport", peer_feeds_root: Path) -> None:

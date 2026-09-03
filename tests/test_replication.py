@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 from roastmesh import net, replication
-from roastmesh.feed import append_entry, feed_is_fully_held, held_feeds_digest, read_entries
+from roastmesh.feed import (append_entry, blob_path_for, feed_is_fully_held,
+                            held_feeds_digest, read_entries, verify_feed)
 from roastmesh.identity import generate_identity
 from roastmesh.index.db import connect
 from roastmesh.index.ingest import ingest_feed
@@ -214,7 +215,9 @@ async def test_oversized_third_party_feed_is_refused_by_quota(tmp_path: Path) ->
         await _stop(a_task)
 
 
-async def test_a_tampered_relayed_feed_fails_verification_and_is_not_kept(tmp_path: Path) -> None:
+async def test_a_wholly_forged_relayed_feed_is_rejected_and_dropped(tmp_path: Path) -> None:
+    # Every blob A serves is garbage -- nothing verifies, so B pulls nothing
+    # and leaves no half-written mirror behind.
     c_identity = generate_identity()
     c_feed = tmp_path / "c_feed"
     _publish(c_feed, c_identity, FIXTURES)
@@ -222,9 +225,8 @@ async def test_a_tampered_relayed_feed_fails_verification_and_is_not_kept(tmp_pa
     a_identity = generate_identity()
     a_feeds = tmp_path / "a_feeds"
     shutil.copytree(c_feed, a_feeds / c_pubkey)
-    # Corrupt one of A's mirrored blobs -- a malicious relay serving garbage.
-    blob = next((a_feeds / c_pubkey / "blobs").glob("*.alog"))
-    blob.write_bytes(b"not the signed bytes")
+    for blob in (a_feeds / c_pubkey / "blobs").glob("*.alog"):
+        blob.write_bytes(b"not the signed bytes")     # corrupt them all
     a_task, a_ticket = await _start_server(
         a_identity, tmp_path / "a_own", tmp_path / "a_peers.json", a_feeds)
     try:
@@ -233,7 +235,38 @@ async def test_a_tampered_relayed_feed_fails_verification_and_is_not_kept(tmp_pa
             relay=False, also_pull=[c_pubkey],
         )
         assert c_pubkey not in report.pulled_feeds          # forgery detected
-        assert not (tmp_path / "b_feeds" / c_pubkey).exists()  # garbage rolled back
+        assert not (tmp_path / "b_feeds" / c_pubkey).exists()  # nothing left behind
+    finally:
+        await _stop(a_task)
+
+
+async def test_a_forged_tail_is_truncated_to_the_verified_prefix(tmp_path: Path) -> None:
+    # A malicious holder serves C's real entries plus a forged LAST entry. B
+    # keeps the verified prefix but must NOT retain the forged tail -- retaining
+    # it would both let B re-serve unverifiable bytes and wedge since_seq so B
+    # could never pull C's real later entries from a good holder.
+    c_identity = generate_identity()
+    c_feed = tmp_path / "c_feed"
+    _publish(c_feed, c_identity, FIXTURES)
+    c_pubkey = c_identity.public_key_hex
+    a_identity = generate_identity()
+    a_feeds = tmp_path / "a_feeds"
+    shutil.copytree(c_feed, a_feeds / c_pubkey)
+    entries = read_entries(a_feeds / c_pubkey)
+    blob_path_for(a_feeds / c_pubkey, entries[-1]).write_bytes(b"forged tail")  # only the last
+    a_task, a_ticket = await _start_server(
+        a_identity, tmp_path / "a_own", tmp_path / "a_peers.json", a_feeds)
+    try:
+        report = await net.sync_with_peer(
+            a_ticket, generate_identity(), tmp_path / "b_feeds", tmp_path / "b_peers.json",
+            relay=False, also_pull=[c_pubkey],
+        )
+        b_mirror = tmp_path / "b_feeds" / c_pubkey
+        # The valid prefix was pulled...
+        assert c_pubkey in report.pulled_feeds
+        # ...but only the verified entries survive on disk, and they verify clean.
+        assert len(read_entries(b_mirror)) == len(FIXTURES) - 1
+        assert verify_feed(b_mirror, expected_pubkey_hex=c_pubkey).ok
     finally:
         await _stop(a_task)
 
