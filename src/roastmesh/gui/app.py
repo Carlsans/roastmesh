@@ -1744,6 +1744,19 @@ def main(*, single_instance_port: int = single_instance.PORT) -> None:
     if single_instance.another_instance_is_running(port=single_instance_port):
         return  # asked it to focus itself instead -- nothing else to do here
 
+    # Bind the single-instance listener *before* building the app. The first-run
+    # setup wizard runs modally inside RoastmeshApp.__init__ (blocking on
+    # wait_window), so binding afterwards would leave the port unbound for the
+    # whole time the wizard is open: a second launch during setup would start a
+    # duplicate instead of focusing this one, and an automated startup probe sees
+    # a live process that never bound its port (exactly what the Windows CI
+    # smoke-test caught). The listener's callback only enqueues onto
+    # focus_requests -- no Tk access -- so a request that arrives before
+    # _poll_focus_requests starts just waits in the queue.
+    focus_requests: queue.Queue = queue.Queue()
+    listener = single_instance.start_focus_listener(
+        lambda: focus_requests.put(None), port=single_instance_port)
+
     app = RoastmeshApp()
 
     # A plain SIGTERM (killed via `kill`/`pkill`, a session manager logging
@@ -1768,16 +1781,11 @@ def main(*, single_instance_port: int = single_instance.PORT) -> None:
     if hasattr(signal, "SIGTERM") and sys.platform != "win32":
         signal.signal(signal.SIGTERM, _handle_terminate)
 
-    focus_requests: queue.Queue = queue.Queue()
-    # start_focus_listener's callback runs on a background thread -- Tk
-    # widgets may only be touched from the thread that created them, so
-    # it just drops a marker in the queue and _poll_focus_requests (on
-    # the Tk main thread, via app.after, same pattern gui/runner.py's
-    # stream_into uses for task output) is what actually raises the
-    # window.
-    listener = single_instance.start_focus_listener(
-        lambda: focus_requests.put(None), port=single_instance_port)
-
+    # start_focus_listener (bound above, before the app) runs its callback on a
+    # background thread and just drops a marker on focus_requests; Tk widgets may
+    # only be touched from the thread that created them, so _poll_focus_requests
+    # (on the Tk main thread, via app.after -- the pattern gui/runner.py's
+    # stream_into uses for task output) is what actually raises the window.
     def _poll_focus_requests() -> None:
         try:
             while True:

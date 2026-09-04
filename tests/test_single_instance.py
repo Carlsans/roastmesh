@@ -44,3 +44,56 @@ def test_multiple_focus_requests_each_trigger_the_callback() -> None:
             events.get(timeout=2.0)
     finally:
         listener.close()
+
+
+def test_main_binds_single_instance_port_before_building_the_app(monkeypatch) -> None:
+    """Regression: the first-run setup wizard runs modally inside
+    RoastmeshApp.__init__ (blocking on wait_window), so the single-instance
+    listener must already be bound by the time the app is built -- otherwise a
+    launch during setup is not deduplicated and an automated startup probe sees
+    a live process that never bound its port (the Windows CI smoke-test failure).
+    Simulate the wizard blocking by asserting, from the fake app's constructor,
+    that the port is already reachable."""
+    from roastmesh.gui import app as app_module
+
+    port = BASE_PORT + 5
+    order: list[str] = []
+    created: dict = {}
+    real_start = single_instance.start_focus_listener
+
+    def spy_start(cb, port):
+        order.append("listener")
+        listener = real_start(cb, port=port)
+        created["listener"] = listener
+        return listener
+
+    monkeypatch.setattr(app_module.single_instance, "start_focus_listener", spy_start)
+
+    class FakeApp:
+        _relaunch_requested = False
+
+        def __init__(self) -> None:
+            order.append("app")
+            # As if the modal wizard were open right here: the port must be live.
+            assert single_instance.another_instance_is_running(port=port, timeout=2.0) is True
+
+        def after(self, *a, **k):
+            return None
+
+        def deiconify(self) -> None: ...
+        def lift(self) -> None: ...
+        def focus_force(self) -> None: ...
+        def _on_close(self) -> None: ...
+
+        def mainloop(self) -> None:
+            order.append("mainloop")
+
+    monkeypatch.setattr(app_module, "RoastmeshApp", FakeApp)
+
+    try:
+        app_module.main(single_instance_port=port)
+    finally:
+        if created.get("listener") is not None:
+            created["listener"].close()
+
+    assert order[:2] == ["listener", "app"], order
