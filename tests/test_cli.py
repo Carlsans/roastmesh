@@ -865,3 +865,132 @@ def test_doctor_offers_both_explanations_for_a_disagreement() -> None:
     text = _render(_doctor_report(router_external_ip="216.209.221.161", double_nat="disagrees"))
     assert "VPN" in text
     assert "not caught up" in text
+
+
+# --- device pairing / private folder sync -----------------------------------
+
+def _seed_device(pubkey: str, name: str = "Carl's Pi") -> None:
+    from roastmesh.devices import Device, add_device
+    add_device(Device(pubkey=pubkey, name=name, platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
+
+
+def test_device_list_json_empty_shape(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == []
+
+
+def test_device_list_text_with_no_paired_devices(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "list"])
+    assert result.exit_code == 0, result.output
+    assert "no paired devices" in result.output
+
+
+def test_device_list_json_reports_a_seeded_device_as_not_online_without_a_real_probe(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    pubkey = "a" * 64
+    _seed_device(pubkey, "Carl's Pi")
+    runner = CliRunner()
+    # --no-probe: no real network listen, so this is safe and instant under test.
+    result = runner.invoke(main, ["device", "list", "--json", "--no-probe"])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)
+    assert len(rows) == 1
+    assert rows[0]["pubkey"] == pubkey
+    assert rows[0]["name"] == "Carl's Pi"
+    assert rows[0]["online"] is False
+
+
+def test_device_remove_a_seeded_device(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.devices import load_devices
+
+    _isolate_home(monkeypatch, tmp_path)
+    pubkey = "b" * 64
+    _seed_device(pubkey, "Carl's Pi")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "remove", pubkey])
+    assert result.exit_code == 0, result.output
+    assert "removed" in result.output
+    assert "Carl's Pi" in result.output
+    assert load_devices() == []
+
+
+def test_device_remove_by_name(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.devices import load_devices
+
+    _isolate_home(monkeypatch, tmp_path)
+    _seed_device("c" * 64, "Kitchen Pi")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "remove", "Kitchen Pi"])
+    assert result.exit_code == 0, result.output
+    assert load_devices() == []
+
+
+def test_device_remove_reports_no_match_for_an_unknown_device(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "remove", "d" * 64])
+    assert result.exit_code != 0
+    assert "no paired device" in result.output
+
+
+def test_device_pair_json_emits_the_expected_event_shape(tmp_path: Path, monkeypatch) -> None:
+    """pair_over_lan itself does real network I/O (device_sync.py) -- monkeypatched
+    here so this test exercises only the CLI's event emission and stdin-driven
+    confirm/pick plumbing, with the match answer ('y') fed through stdin the
+    same way the real `--json` contract expects."""
+    from roastmesh import cli as cli_mod
+    from roastmesh.lan_discovery import PairingCandidate
+    from roastmesh.pairing import PairResult
+
+    _isolate_home(monkeypatch, tmp_path)
+
+    async def fake_pair_over_lan(identity, *, confirm, timeout, on_status, name):
+        candidates = [PairingCandidate(pubkey="a" * 64, ticket="t", code="4821", hostname="other-host")]
+        picked = on_status(candidates)  # exactly one candidate -> no stdin read here
+        assert picked is None
+        sas = [("🐶", "Dog")] * 7
+        matched = confirm(sas)  # this is what reads the 'y' from stdin in --json mode
+        return PairResult(ok=bool(matched), remote_pubkey_hex=("a" * 64) if matched else None, sas=sas)
+
+    monkeypatch.setattr(cli_mod.device_sync, "pair_over_lan", fake_pair_over_lan)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "pair", "--json"], input="y\n")
+    assert result.exit_code == 0, result.output
+
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert [e["event"] for e in events] == ["discovered", "sas", "result"]
+    assert events[0]["devices"] == [{"pubkey": "a" * 64, "code": "4821", "hostname": "other-host"}]
+    assert events[1]["emoji"][0] == ["🐶", "Dog"]
+    assert events[2] == {"event": "result", "ok": True, "pubkey": "a" * 64, "name": None}
+
+
+def test_device_pair_json_reports_a_declined_match(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh import cli as cli_mod
+    from roastmesh.lan_discovery import PairingCandidate
+    from roastmesh.pairing import PairResult
+
+    _isolate_home(monkeypatch, tmp_path)
+
+    async def fake_pair_over_lan(identity, *, confirm, timeout, on_status, name):
+        on_status([PairingCandidate(pubkey="a" * 64, ticket="t", code="1", hostname="h")])
+        matched = confirm([("🐶", "Dog")] * 7)
+        return PairResult(ok=bool(matched), remote_pubkey_hex=None, sas=[("🐶", "Dog")] * 7,
+                          error="not confirmed on this device")
+
+    monkeypatch.setattr(cli_mod.device_sync, "pair_over_lan", fake_pair_over_lan)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["device", "pair", "--json"], input="n\n")
+    assert result.exit_code == 0, result.output
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert events[-1]["ok"] is False

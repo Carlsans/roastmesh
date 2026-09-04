@@ -59,11 +59,33 @@ class Task:
         self._thread = threading.Thread(target=self._run, args=(cwd,), daemon=True)
         self._thread.start()
 
+    def send_line(self, text: str) -> None:
+        """Write one line to the child's stdin -- how the GUI drives an
+        interactively-prompting subprocess (the Devices tab's pairing modal
+        answering `roastmesh device pair --json`'s "pick a device" / "do
+        the emoji match" prompts) the same way a person typing at a
+        terminal would.
+
+        A no-op, not an error, when there is no process yet, it has
+        already exited, or the pipe has gone away out from under us --
+        every one of those is an ordinary race (a click landing just as
+        pairing finishes) rather than something the caller did wrong.
+        """
+        proc = self._proc
+        if proc is None or proc.stdin is None or proc.poll() is not None:
+            return
+        try:
+            proc.stdin.write(text.rstrip("\n") + "\n")
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass  # the pipe closed under us mid-write -- nothing more to do
+
     def _run(self, cwd: str | None) -> None:
         try:
             self._proc = subprocess.Popen(
                 self.argv,
                 cwd=cwd,
+                stdin=subprocess.PIPE,   # so send_line can drive a prompt (e.g. `device pair`'s)
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # interleave, so failures appear in order
                 text=True,

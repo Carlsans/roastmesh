@@ -7,7 +7,7 @@ import pytest
 
 from roastmesh import lan_discovery
 from roastmesh.interfaces import Interface
-from roastmesh.lan_discovery import run_beacon
+from roastmesh.lan_discovery import PairingCandidate, discover_pairing_beacons, probe_reachable_devices, run_beacon
 
 # a dedicated test port so this never collides with a real roastmesh node
 # (or another test run) using the production default
@@ -113,6 +113,100 @@ async def test_repeated_beacons_are_debounced_within_resync_window() -> None:
                 await t
             except asyncio.CancelledError:
                 pass
+
+
+# --- pairing-mode beacons ---------------------------------------------------
+
+@_needs_broadcast_loopback
+async def test_two_pairing_beacons_discover_each_other() -> None:
+    """The LAN half of device_sync.pair_over_lan: two devices in pairing
+    mode find each other's pubkey/ticket/code/hostname, same broadcast/
+    multicast machinery as the always-on beacon, just time-bounded."""
+    results = await asyncio.gather(
+        discover_pairing_beacons(
+            "aa" + "0" * 62, "ticket-a", code="1111", hostname="host-a",
+            port=TEST_PORT + 10, interval_s=0.1, listen_s=1.0,
+        ),
+        discover_pairing_beacons(
+            "bb" + "0" * 62, "ticket-b", code="2222", hostname="host-b",
+            port=TEST_PORT + 10, interval_s=0.1, listen_s=1.0,
+        ),
+    )
+    candidates_a, candidates_b = results
+    assert candidates_a == [PairingCandidate("bb" + "0" * 62, "ticket-b", "2222", "host-b")]
+    assert candidates_b == [PairingCandidate("aa" + "0" * 62, "ticket-a", "1111", "host-a")]
+
+
+async def test_pairing_beacon_ignores_a_plain_non_pairing_beacon() -> None:
+    """A regular (non-pairing) discovery beacon running on the same LAN at
+    the same time must never show up as a pairing candidate -- pairing mode
+    only ever wants to find another device that is ALSO actively pairing
+    right now."""
+    port = TEST_PORT + 11
+    plain_task = asyncio.create_task(run_beacon(
+        "cc" + "0" * 62, "ticket-c", lambda p, t: asyncio.sleep(0), port=port, interval_s=0.1,
+    ))
+    try:
+        candidates = await discover_pairing_beacons(
+            "aa" + "0" * 62, "ticket-a", code="1111", hostname="host-a",
+            port=port, interval_s=0.1, listen_s=0.6,
+        )
+        assert candidates == []
+    finally:
+        plain_task.cancel()
+        try:
+            await plain_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_pairing_beacon_never_reports_its_own_broadcast() -> None:
+    candidates = await discover_pairing_beacons(
+        "dd" + "0" * 62, "ticket-d", code="9999", hostname="solo",
+        port=TEST_PORT + 12, interval_s=0.1, listen_s=0.4,
+    )
+    assert candidates == []
+
+
+# --- probe_reachable_devices ------------------------------------------------
+
+@_needs_broadcast_loopback
+async def test_probe_reachable_devices_hears_a_regular_beacon() -> None:
+    port = TEST_PORT + 20
+    beacon_task = asyncio.create_task(run_beacon(
+        "ff" + "0" * 62, "ticket-f", lambda p, t: asyncio.sleep(0), port=port, interval_s=0.1,
+    ))
+    try:
+        seen = await probe_reachable_devices(port=port, duration_s=0.5)
+        assert seen == {"ff" + "0" * 62: "ticket-f"}
+    finally:
+        beacon_task.cancel()
+        try:
+            await beacon_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_probe_reachable_devices_ignores_a_pairing_mode_beacon() -> None:
+    port = TEST_PORT + 21
+    pairing_task = asyncio.create_task(discover_pairing_beacons(
+        "11" + "0" * 62, "ticket-pairing", code="1234", hostname="pairing-host",
+        port=port, interval_s=0.1, listen_s=1.0,
+    ))
+    try:
+        seen = await probe_reachable_devices(port=port, duration_s=0.5)
+        assert seen == {}
+    finally:
+        pairing_task.cancel()
+        try:
+            await pairing_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_probe_reachable_devices_finds_nothing_when_nobody_is_beaconing() -> None:
+    seen = await probe_reachable_devices(port=TEST_PORT + 22, duration_s=0.3)
+    assert seen == {}
 
 
 # --- announcing on every interface, not just the default route's -----------

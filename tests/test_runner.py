@@ -6,10 +6,13 @@ being available, and these need no Tk at all.
 from __future__ import annotations
 
 import json
+import queue
+import sys
+import time
 
 import pytest
 
-from roastmesh.gui.runner import describe, parse_json_output
+from roastmesh.gui.runner import Task, describe, parse_json_output
 
 
 def test_parses_ordinary_json_output() -> None:
@@ -54,3 +57,48 @@ def test_still_raises_when_there_is_no_json_at_all() -> None:
 def test_describe_quotes_arguments_containing_spaces() -> None:
     assert describe(["roastmesh", "search", "washed ethiopian"]) == \
         'roastmesh search "washed ethiopian"'
+
+
+def test_send_line_reaches_an_input_reading_child() -> None:
+    """The Devices tab's pairing modal drives `roastmesh device pair
+    --json`'s prompts this exact way -- a real subprocess actually blocked
+    on input(), fed a line the same way a person typing at a terminal
+    would, proving stdin=subprocess.PIPE plus send_line's write+flush
+    actually reaches it."""
+    task = Task(argv=[
+        sys.executable, "-c",
+        "line = input(); print('GOT:' + line, flush=True)",
+    ])
+    task.start()
+    # Give the child a moment to actually start and block on input() --
+    # send_line before that would just be racing the process's own startup.
+    time.sleep(0.3)
+    task.send_line("hello")
+
+    lines: list[str] = []
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            kind, payload = task.output.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if kind == "line":
+            lines.append(payload)
+        elif kind == "done":
+            break
+
+    assert "GOT:hello" in lines
+
+
+def test_send_line_is_a_no_op_before_the_process_has_started() -> None:
+    task = Task(argv=[sys.executable, "-c", "pass"])
+    task.send_line("hello")  # must not raise -- no process exists yet
+
+
+def test_send_line_is_a_no_op_after_the_process_has_exited() -> None:
+    task = Task(argv=[sys.executable, "-c", "pass"])
+    task.start()
+    deadline = time.monotonic() + 5
+    while task.running and time.monotonic() < deadline:
+        time.sleep(0.02)
+    task.send_line("hello")  # must not raise -- the pipe is long gone

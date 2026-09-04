@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 import click
 
 import roastmesh
+from roastmesh import device_sync
+from roastmesh import devices as devices_mod
 from roastmesh import net
 from roastmesh import replication
 from roastmesh.bootstrap import BOOTSTRAP_TICKETS
@@ -19,7 +22,9 @@ from roastmesh.identity import load_or_create_identity
 from roastmesh.index import repository as repo
 from roastmesh.index.db import connect, get_meta, set_meta
 from roastmesh.index.ingest import ingest_feed, ingest_file, ingest_path, refresh_known_sources
+from roastmesh.lan_discovery import probe_reachable_devices
 from roastmesh.machines import list_machines, slugify
+from roastmesh.paths import default_devices_dir, device_sync_state_path as default_device_sync_state_path
 from roastmesh.peers import (Peer, default_peers_path, load_peers, node_id_from_ticket,
                              prune_stale, public_ip_from_ticket, save_peers, upsert_peer)
 from roastmesh.profile import load_or_default_profile, update_and_sign
@@ -488,6 +493,13 @@ def node() -> None:
               help="Max disk for mirrored peer feeds, e.g. 500MB or 2GB (default: 500MB). "
                    "When full, the rarest feeds are kept and the most-replicated evicted "
                    "to search-only stubs, fetched again on demand. 0 disables replication.")
+@click.option("--no-device-sync", is_flag=True,
+              help="Don't run the private folder mirror between your own paired devices "
+                   "(see `device pair`/`device folder`) while serving. Unrelated to the "
+                   "public feed -- disabling this only stops device-sync activity.")
+@click.option("--devices-dir", default=None, type=click.Path(path_type=Path),
+              help="Private folder that mirrors between your own paired devices "
+                   "(default: ~/RoastMeshDevices). Never published to the public feed.")
 @click.pass_context
 def node_serve(
     ctx: click.Context, feed_dir: Path | None, peers_file: Path | None,
@@ -495,6 +507,7 @@ def node_serve(
     wan_port: int | None, public_port: str | None,
     publish_watch_dir: Path | None, no_publish_watch: bool,
     no_replicate: bool, replication_budget: str | None, debug_logging: bool,
+    no_device_sync: bool, devices_dir: Path | None,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
@@ -509,6 +522,11 @@ def node_serve(
     Unless --no-publish-watch, also auto-publishes any .alog file dropped
     into --publish-watch-dir (default ~/RoastMeshShare) -- no `feed publish`
     needed for files placed there.
+
+    Unless --no-device-sync, also mirrors --devices-dir with any of your own
+    devices you've paired (`device pair`) that this node can reach -- a
+    completely separate, private folder from --publish-watch-dir, never
+    published to the public feed.
     """
     auto_port, fixed_port = _parse_public_port(public_port)
     ident, created = load_or_create_identity()
@@ -523,6 +541,7 @@ def node_serve(
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
         enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
         replicate=not no_replicate, replication_budget=budget, debug=debug_logging,
+        enable_device_sync=not no_device_sync, devices_dir=devices_dir,
         **({"wan_discovery_port": wan_port} if wan_port else {}),
         **({"wan_public_port": fixed_port} if fixed_port else {}),
         **({"wan_auto_port": True} if auto_port else {}),
@@ -1076,6 +1095,218 @@ def peer_replication(ctx: click.Context, as_json: bool) -> None:
             click.echo(f"  {pk[:16]}...  other holders: {holder_counts.get(pk, 0)}")
     else:
         click.echo("no held feed is at risk -- every one has other reachable holders")
+
+
+@main.group()
+def device() -> None:
+    """Pair your own other devices and manage the private folder that
+    mirrors between them.
+
+    A device pairing is a *different* trust relationship from a public-feed
+    peer (see `peer`): it's added only after a human compares 7 emoji shown
+    on both screens (`device pair`), it records no separate identity of its
+    own (public-feed identities are never merged), and the folder it mirrors
+    (`device folder`) is never published to the public feed -- see
+    ARCHITECTURE.md's "Device pairing & private sync" section.
+    """
+
+
+def _emit_json_event(as_json: bool, event: dict) -> None:
+    if as_json:
+        click.echo(json.dumps(event))
+
+
+def _find_paired_device(pubkey_or_name: str):
+    paired = devices_mod.load_devices()
+    exact = next((d for d in paired if d.pubkey == pubkey_or_name), None)
+    if exact is not None:
+        return exact
+    matches = [d for d in paired if d.pubkey.startswith(pubkey_or_name) or d.name == pubkey_or_name]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise click.ClickException(
+            f"{pubkey_or_name!r} matches {len(matches)} paired devices -- use more of the pubkey")
+    return None
+
+
+@device.command("pair")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit newline-delimited JSON events instead of interactive prompts. Reads the "
+                   "device pick (when more than one is found) and the match confirmation as one "
+                   "line each from stdin: 'y'/'n' for confirmation, an index number for a pick.")
+@click.option("--name", default=None,
+              help="This device's advertised label, shown on the other device (default: hostname).")
+@click.option("--timeout", default=60.0, show_default=True, type=float,
+              help="Seconds to look for another device in pairing mode and complete the handshake "
+                   "before giving up.")
+def device_pair(as_json: bool, name: str | None, timeout: float) -> None:
+    """Pair this device with another one on the same local network.
+
+    Both devices run this at roughly the same time: each broadcasts a
+    pairing beacon and listens for the other's, connects, and derives 7
+    emoji from a fresh (ephemeral, not your identity's own) key exchange
+    between them. Compare the two screens -- if the 7 emoji match on both,
+    confirm on both, and each device adds the other to its own trusted-
+    device set (`device list`). An attacker on the LAN can spoof the
+    beacon and get you to connect to the wrong device, but cannot make its
+    own screen show the same 7 emoji your real second device does; matching
+    emoji is what actually proves you paired with the device you meant to.
+    """
+    ident, created = load_or_create_identity()
+    _remind_backup_if_new(ident, created)
+
+    def _on_status(candidates: list):
+        _emit_json_event(as_json, {"event": "discovered", "devices": [
+            {"pubkey": c.pubkey, "code": c.code, "hostname": c.hostname} for c in candidates
+        ]})
+        if len(candidates) <= 1:
+            return None  # nothing to pick -- pair_over_lan auto-selects the one, or reports "none"
+        if as_json:
+            line = sys.stdin.readline().strip()
+        else:
+            click.echo("Found multiple devices in pairing mode:")
+            for i, c in enumerate(candidates):
+                click.echo(f"  [{i}] {c.hostname or '?'}  code={c.code or '?'}  {c.pubkey[:16]}...")
+            line = click.prompt("Pick one by index (blank to cancel)", default="", show_default=False).strip()
+        if not line:
+            return None
+        try:
+            index = int(line)
+        except ValueError:
+            return None
+        return candidates[index] if 0 <= index < len(candidates) else None
+
+    def _confirm(sas: list) -> bool:
+        _emit_json_event(as_json, {"event": "sas", "emoji": [[emoji, name_] for emoji, name_ in sas]})
+        if as_json:
+            line = sys.stdin.readline().strip().lower()
+            return line in ("y", "yes")
+        click.echo("Compare these 7 with the other device's screen:")
+        for emoji, emoji_name in sas:
+            click.echo(f"  {emoji}  {emoji_name}")
+        return click.confirm("Do they match?", default=False)
+
+    result = asyncio.run(device_sync.pair_over_lan(
+        ident, confirm=_confirm, timeout=timeout, on_status=_on_status, name=name,
+    ))
+
+    paired_name = None
+    if result.ok and result.remote_pubkey_hex:
+        match = next((d for d in devices_mod.load_devices() if d.pubkey == result.remote_pubkey_hex), None)
+        paired_name = match.name if match else None
+
+    _emit_json_event(as_json, {
+        "event": "result", "ok": result.ok, "pubkey": result.remote_pubkey_hex, "name": paired_name,
+    })
+    if as_json:
+        return
+    if result.ok:
+        click.echo(f"Paired with {paired_name or (result.remote_pubkey_hex or '?')[:16] + '...'}.")
+        return
+    detail = f": {result.error}" if result.error else "."
+    click.echo(f"Pairing failed or was cancelled{detail}", err=True)
+    raise SystemExit(1)
+
+
+@device.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Output paired devices as a JSON array instead of text.")
+@click.option("--no-probe", is_flag=True,
+              help="Skip the brief LAN listen for the online flag (faster; every device then shows "
+                   "as not-currently-seen).")
+def device_list(as_json: bool, no_probe: bool) -> None:
+    """List devices paired with this one, with a best-effort "online" flag
+    (a brief passive listen for their regular discovery beacon on the LAN --
+    a real, reachable device that isn't currently beaconing there, or
+    whose beacon just didn't land in the short listen window, simply won't
+    show as online; see lan_discovery.probe_reachable_devices)."""
+    paired = devices_mod.load_devices()
+    online: dict[str, str] = {}
+    if paired and not no_probe:
+        online = asyncio.run(probe_reachable_devices())
+    if as_json:
+        click.echo(json.dumps([
+            {**asdict(d), "online": d.pubkey in online} for d in paired
+        ]))
+        return
+    if not paired:
+        click.echo("no paired devices -- see `roastmesh device pair`")
+        return
+    for d in paired:
+        status = "online" if d.pubkey in online else "not seen"
+        click.echo(f"{d.pubkey[:16]}...  {d.name:<24} {d.platform:<8} paired={d.paired_at}  {status}")
+
+
+@device.command("remove")
+@click.argument("pubkey_or_name")
+def device_remove(pubkey_or_name: str) -> None:
+    """Remove a paired device (its full pubkey, a pubkey prefix, or its
+    name). The devices folder itself is left completely untouched -- this
+    only stops future syncs with that device."""
+    match = _find_paired_device(pubkey_or_name)
+    if match is None:
+        raise click.ClickException(f"no paired device matching {pubkey_or_name!r}")
+    devices_mod.remove_device(match.pubkey)
+    click.echo(f"removed {match.name} ({match.pubkey[:16]}...) -- the devices folder itself is untouched")
+
+
+@device.command("sync")
+@click.option("--once", is_flag=True, default=True, show_default=True,
+              help="Reconcile once and exit -- the only mode today (kept explicit for a future "
+                   "continuous mode).")
+def device_sync_cmd(once: bool) -> None:
+    """Reconcile the private devices folder with every paired device this
+    can currently find on the LAN (see lan_discovery.probe_reachable_devices
+    -- devices.json itself stores no address, only the pubkey a human
+    already verified via SAS, so finding one to actually dial is a fresh,
+    best-effort LAN listen every time this runs)."""
+    paired = devices_mod.load_devices()
+    if not paired:
+        click.echo("no paired devices -- see `roastmesh device pair`")
+        return
+
+    async def _run() -> None:
+        ident, created = load_or_create_identity()
+        _remind_backup_if_new(ident, created)
+        reachable = await probe_reachable_devices(duration_s=5.0)
+        devices_dir = default_devices_dir()
+        state_path = default_device_sync_state_path()
+        synced = 0
+        for dev in paired:
+            ticket = reachable.get(dev.pubkey)
+            if ticket is None:
+                click.echo(f"{dev.name}: not found on the LAN right now")
+                continue
+            try:
+                report = await device_sync.reconcile_with_device(ticket, ident, devices_dir, state_path)
+            except Exception as exc:  # noqa: BLE001 -- one unreachable/misbehaving device shouldn't abort the rest
+                click.echo(f"{dev.name}: sync failed: {exc!r}", err=True)
+                continue
+            click.echo(f"{dev.name}: {report.pulled} pulled, {report.pushed} pushed")
+            synced += 1
+        if synced == 0:
+            click.echo("no paired device was reachable")
+
+    asyncio.run(_run())
+
+
+@device.command("folder")
+@click.option("--set", "set_path", default=None, type=click.Path(path_type=Path),
+              help="Set the private devices folder path (persisted to the GUI config).")
+def device_folder(set_path: Path | None) -> None:
+    """Print, or (--set) change, the private devices folder path -- add/
+    change/delete a file here and it mirrors to every paired device, same
+    full-mirror model `device sync` drives, never published to the public
+    feed."""
+    from roastmesh.gui import config as gui_config
+
+    cfg = gui_config.load_config()
+    if set_path is not None:
+        cfg.devices_dir = str(set_path)
+        gui_config.save_config(cfg)
+        click.echo(f"devices folder set to {set_path}")
+        return
+    click.echo(cfg.devices_dir or str(default_devices_dir()))
 
 
 @main.group()

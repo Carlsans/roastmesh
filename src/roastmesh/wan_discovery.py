@@ -521,7 +521,10 @@ async def run_wan_discovery(
         decoded = decode_hello(data)
         if decoded is None:
             return
-        pubkey, ticket = decoded
+        # Internet-wide discovery never runs pairing mode -- it only ever
+        # sends/expects a plain hello, so pairing/code/hostname are unpacked
+        # and ignored here rather than in lan_discovery specifically.
+        pubkey, ticket, _pairing, _code, _hostname = decoded
         if pubkey == own_pubkey_hex:
             return
         _acked.add(addr)  # heard from them -- no need to keep retransmitting

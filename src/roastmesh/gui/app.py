@@ -45,10 +45,12 @@ from roastmesh.gui.widgets import (
     FONT_BOLD,
     FONT_SMALL,
     FONT_H2,
+    FONT_H1,
     FONT_MONO,
     AutocompleteField,
     Choice,
     Console,
+    DeviceTable,
     Field,
     PeerTable,
     ResultsTable,
@@ -1026,6 +1028,12 @@ class NetworkTab(Tab):
                 # on, --public-port is what we tell other nodes to use. A
                 # forward is only useful if the port it delivers to is ours.
                 argv += ["--wan-port", port, "--public-port", port]
+        if self.app.enable_device_sync.get():
+            devices_dir = self.app.devices_dir.get().strip()
+            if devices_dir:
+                argv += ["--devices-dir", devices_dir]
+        else:
+            argv.append("--no-device-sync")
         self.serve_console.clear()
         self.serve_console.set_command(describe(argv))
         self.ticket_var.set("")
@@ -1285,6 +1293,311 @@ class NetworkTab(Tab):
         except json.JSONDecodeError:
             return
         self.peers_table.set_rows(peers)
+
+
+class DevicesTab(Tab):
+    """Pair this identity's own other devices (Matrix-style SAS over the
+    LAN) and manage the private folder that mirrors between them. Every
+    action here shells out to `roastmesh device ...` -- see cli.py's
+    `device` group, the single source of truth this tab is just a face for
+    (gui/runner.py's Task pattern, same as every other tab).
+
+    Deliberately its own tab, not folded into Network: a paired device is a
+    *different* trust relationship from a public-feed peer -- added only
+    after a human compares 7 emoji on both screens, never merged with the
+    public-feed identity, and the folder below is never published there.
+    See ARCHITECTURE.md's "Device pairing & private sync" section.
+    """
+
+    _REFRESH_INTERVAL_MS = 30_000
+
+    def __init__(self, parent: tk.Widget, app: "RoastmeshApp") -> None:
+        super().__init__(parent, app)
+        self._closed = False
+
+        heading(self, t("Devices"),
+                t("Pair your own other devices, and mirror a private folder between them."))
+        explain(self, t("A paired device is not a public-feed peer: it's added only after you compare "
+                         "7 emoji shown on both screens, and nothing here is ever published to the "
+                         "public feed. Add, change, or delete a file in the folder below and it mirrors "
+                         "to every paired device that's currently reachable."))
+
+        folder_section = section(self, t("Private devices folder"))
+        tk.Label(folder_section,
+                 text=t("Drop any file here and it mirrors to your paired devices -- including a "
+                        "delete, unlike the Publish tab's shared folder."),
+                 font=("TkDefaultFont", 9), fg=theme.MUTED, bg=theme.BG, wraplength=sp(840),
+                 justify="left", anchor="w").pack(fill="x", padx=10, pady=(6, 2))
+        folder_row = ttk.Frame(folder_section)
+        folder_row.pack(fill="x", padx=10, pady=(0, 2))
+        self.devices_dir_var = tk.StringVar(value=self._resolved_devices_dir())
+        tk.Label(folder_row, textvariable=self.devices_dir_var, font=FONT_MONO, bg=theme.BG,
+                 fg=theme.FG).pack(side="left")
+        ttk.Button(folder_row, text=t("Open folder"), command=self._open_devices_folder).pack(
+            side="left", padx=(8, 0))
+        self.folder_status_var = tk.StringVar(value="")
+        tk.Label(folder_section, textvariable=self.folder_status_var, font=("TkDefaultFont", 9),
+                 fg=theme.MUTED, bg=theme.BG, anchor="w", wraplength=sp(840), justify="left").pack(
+            fill="x", padx=10, pady=(0, 4))
+        ttk.Checkbutton(folder_section, text=t("Sync automatically while serving"),
+                        variable=self.app.enable_device_sync).pack(anchor="w", padx=10, pady=(0, 8))
+
+        paired_section = section(self, t("Paired devices"))
+        button_row = ttk.Frame(paired_section)
+        button_row.pack(fill="x", padx=10, pady=(4, 2))
+        ttk.Button(button_row, text=t("Pair a new device"), command=self._open_pairing_modal).pack(
+            side="left")
+        self.remove_btn = ttk.Button(button_row, text=t("Remove"), command=self._on_remove,
+                                     state="disabled")
+        self.remove_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(button_row, text=t("Refresh"), command=self._refresh_devices).pack(
+            side="left", padx=(6, 0))
+        self.device_table = DeviceTable(paired_section)
+        self.device_table.tree.bind("<<TreeviewSelect>>", self._on_selection_changed)
+        self.status_var = tk.StringVar(value="")
+        tk.Label(paired_section, textvariable=self.status_var, font=("TkDefaultFont", 9),
+                 fg=theme.MUTED, bg=theme.BG, anchor="w").pack(fill="x", padx=10, pady=(0, 2))
+        self.console = Console(paired_section, height=4)
+
+        # Gated on ROASTMESH_SKIP_DEVICE_SYNC (mirrors ROASTMESH_SKIP_UPDATE_CHECK's
+        # own gate on _start_update_check) so constructing this tab under
+        # test never starts a background subprocess/timer, or the real LAN
+        # listen `device list` does for its online flag -- see conftest.py.
+        if not os.environ.get("ROASTMESH_SKIP_DEVICE_SYNC"):
+            self._schedule_refresh()
+
+    def cancel(self) -> None:
+        self._closed = True
+        super().cancel()
+
+    def _resolved_devices_dir(self) -> str:
+        path = self.app.devices_dir.get().strip()
+        if path:
+            return path
+        from roastmesh.paths import default_devices_dir
+        return str(default_devices_dir())
+
+    def _open_devices_folder(self) -> None:
+        path = self._resolved_devices_dir()
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.folder_status_var.set(t("Couldn't create {path}: {error}", path=path, error=exc))
+            return
+        error = _open_with_default_app(path)
+        self.folder_status_var.set(
+            t("Couldn't open it: {error}. The folder itself is at: {path}", error=error, path=path)
+            if error else ""
+        )
+
+    def _schedule_refresh(self) -> None:
+        if self._closed:
+            return
+        self._refresh_devices()
+        self.after(self._REFRESH_INTERVAL_MS, self._schedule_refresh)
+
+    def _refresh_devices(self) -> None:
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("device", "list", "--json"))
+        task.start()
+        stream_into(task, buf.append, lambda code: self._devices_loaded(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _devices_loaded(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            return
+        try:
+            rows = parse_json_output("".join(buf))
+        except json.JSONDecodeError:
+            return
+        self.device_table.set_rows(rows)
+
+    def _on_selection_changed(self, _event: tk.Event | None = None) -> None:
+        selection = self.device_table.tree.selection()
+        self.remove_btn.configure(state="normal" if selection else "disabled")
+
+    def _on_remove(self) -> None:
+        selection = self.device_table.tree.selection()
+        if not selection:
+            return
+        pubkey = selection[0]
+        argv = roastmesh_argv("device", "remove", pubkey)
+        self.console.clear()
+        self.console.set_command(describe(argv))
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, self.console.append, lambda _code: self._refresh_devices(),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _open_pairing_modal(self) -> None:
+        # Kept on self (not just a local variable) so tests can reach the
+        # live modal instance without hunting through the widget tree.
+        self._pairing_modal = _PairingModal(self, self.app, on_paired=self._refresh_devices)
+
+
+class _PairingModal(tk.Toplevel):
+    """Modal Toplevel driving `roastmesh device pair --json` -- the same
+    Toplevel pattern gui/wizard.py's setup wizard uses, and the same
+    Task/stream_into shell-to-CLI pattern every other tab uses
+    (gui/runner.py), just with stream_into's `widget_append` callback
+    parsing each streamed line as a JSON event (parse_json_output) instead
+    of appending plain text to a Console.
+    """
+
+    def __init__(self, master: tk.Widget, app: "RoastmeshApp", on_paired: Callable[[], None]) -> None:
+        super().__init__(master)
+        self.title(t("Pair a new device"))
+        self.configure(bg=theme.BG)
+        self.transient(master.winfo_toplevel())
+        self._app = app
+        self._on_paired = on_paired
+        self._task: Task | None = None
+        self._buffer = ""
+        self._spinner_frame = 0
+        self._got_sas = False
+        self._got_result = False
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=sp(18), pady=sp(14))
+
+        tk.Label(body, text=t("Pair a new device"), font=FONT_H1, fg=theme.ACCENT, bg=theme.BG,
+                 anchor="w").pack(fill="x", pady=(0, sp(6)))
+        tk.Label(body, text=t("Make sure the other device is on this network and also pressed Pair."),
+                 font=("TkDefaultFont", 10), fg=theme.FG, bg=theme.BG, anchor="w", wraplength=sp(480),
+                 justify="left").pack(fill="x", pady=(0, sp(10)))
+
+        self.status_var = tk.StringVar(value=t("Discovering") + ".")
+        tk.Label(body, textvariable=self.status_var, font=FONT_BOLD, fg=theme.FG, bg=theme.BG,
+                 anchor="w", wraplength=sp(480), justify="left").pack(fill="x", pady=(0, sp(8)))
+
+        self.emoji_var = tk.StringVar(value="")
+        self.emoji_label = tk.Label(body, textvariable=self.emoji_var, font=("TkDefaultFont", 28),
+                                    bg=theme.BG, fg=theme.FG, wraplength=sp(480), justify="center")
+        self.names_var = tk.StringVar(value="")
+        self.names_label = tk.Label(body, textvariable=self.names_var, font=FONT_SMALL,
+                                    fg=theme.MUTED, bg=theme.BG, wraplength=sp(480), justify="center")
+
+        buttons = ttk.Frame(body)
+        buttons.pack(pady=(sp(2), 0))
+        self.match_btn = ttk.Button(buttons, text=t("They match"), command=self._on_match, state="disabled")
+        self.match_btn.pack(side="left")
+        self.no_match_btn = ttk.Button(buttons, text=t("They don't match"), command=self._on_no_match,
+                                       state="disabled")
+        self.no_match_btn.pack(side="left", padx=(sp(8), 0))
+
+        self.close_btn = ttk.Button(body, text=t("Close"), command=self._on_close)
+        self.close_btn.pack(pady=(sp(12), 0))
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.update_idletasks()
+        self.geometry(screen_geometry(self, 520, 360))
+        self.grab_set()
+        self.focus_set()
+
+        # Gated the same way DevicesTab's own refresh timer is: under test
+        # (ROASTMESH_SKIP_DEVICE_SYNC) this modal must build and be
+        # inspectable without ever spawning `device pair`'s real subprocess
+        # -- which would itself try real LAN discovery.
+        if os.environ.get("ROASTMESH_SKIP_DEVICE_SYNC"):
+            self.status_var.set(t("(pairing disabled for this test run)"))
+        else:
+            self._start()
+
+    def _start(self) -> None:
+        argv = roastmesh_argv("device", "pair", "--json")
+        self._task = Task(argv=argv)
+        self._task.start()
+        stream_into(self._task, self._on_output, self._on_finished, lambda ms, fn: self.after(ms, fn))
+        self.after(500, self._tick_spinner)
+
+    def _tick_spinner(self) -> None:
+        """A minimal text spinner ("Discovering." -> ".." -> "...") while
+        waiting for the other device -- no graphical spinner widget exists
+        in this app, and a growing/shrinking ellipsis reads clearly enough
+        as "still working" without one."""
+        if self._task is None or not self._task.running or self._got_sas:
+            return
+        dots = "." * (1 + self._spinner_frame % 3)
+        self._spinner_frame += 1
+        self.status_var.set(t("Discovering") + dots)
+        self.after(500, self._tick_spinner)
+
+    def _on_output(self, text: str) -> None:
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = parse_json_output(line)
+            except json.JSONDecodeError:
+                continue  # a stray notice line (e.g. a first-run identity notice) -- ignore
+            if isinstance(event, dict):
+                self._handle_event(event)
+
+    def _handle_event(self, event: dict) -> None:
+        kind = event.get("event")
+        if kind == "discovered":
+            if not event.get("devices"):
+                self.status_var.set(t("No other device found nearby yet..."))
+        elif kind == "sas":
+            emoji = event.get("emoji") or []
+            self._got_sas = True
+            self.emoji_var.set("   ".join(str(e) for e, _n in emoji))
+            self.names_var.set("   ".join(str(n) for _e, n in emoji))
+            self.emoji_label.pack(pady=(0, sp(2)))
+            self.names_label.pack(pady=(0, sp(8)))
+            self.status_var.set(t("Compare these 7 with the other device's screen:"))
+            self.match_btn.configure(state="normal")
+            self.no_match_btn.configure(state="normal")
+        elif kind == "result":
+            self._show_result(event)
+
+    def _on_match(self) -> None:
+        if self._task is not None:
+            self._task.send_line("y")
+        self.match_btn.configure(state="disabled")
+        self.no_match_btn.configure(state="disabled")
+        self.status_var.set(t("Waiting for the other device..."))
+
+    def _on_no_match(self) -> None:
+        if self._task is not None:
+            self._task.send_line("n")
+        self.match_btn.configure(state="disabled")
+        self.no_match_btn.configure(state="disabled")
+
+    def _show_result(self, event: dict) -> None:
+        self._got_result = True
+        self.match_btn.configure(state="disabled")
+        self.no_match_btn.configure(state="disabled")
+        if event.get("ok"):
+            pubkey = event.get("pubkey") or ""
+            name = event.get("name") or (pubkey[:16] + "..." if pubkey else t("(unknown)"))
+            self.status_var.set(t("Paired with {name}", name=name))
+            self._on_paired()
+        else:
+            self.status_var.set(t("Pairing failed or was cancelled"))
+
+    def _on_finished(self, _code: int) -> None:
+        # The "result" event (_show_result) already reflects the outcome in
+        # the normal case. This only fires when the subprocess exited
+        # *without* ever emitting one -- e.g. it crashed, or was killed by
+        # Close/cancel before pairing could conclude -- so the modal must
+        # not just sit showing a stale "Discovering..." forever.
+        if not self._got_result:
+            self.match_btn.configure(state="disabled")
+            self.no_match_btn.configure(state="disabled")
+            self.status_var.set(t("Pairing failed or was cancelled"))
+
+    def _on_close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
 
 
 class SettingsTab(Tab):
@@ -1609,8 +1922,19 @@ class RoastmeshApp(tk.Tk):
         self.temp_unit = tk.StringVar(value=cfg.temp_unit)
         self.language = tk.StringVar(value=i18n.current_language())
         self.check_for_updates = tk.BooleanVar(value=cfg.check_for_updates)
+        # The private device-sync folder (Devices tab) -- "" means "whatever
+        # paths.default_devices_dir() resolves to", same empty-means-default
+        # convention public_port uses, so a fresh config file never has to
+        # hardcode a HOME-dependent path. enable_device_sync is on by
+        # default, same posture wan_discovery_enabled takes: harmless with
+        # nothing paired yet (net.serve only starts device-sync activity
+        # once devices.json is non-empty), off only for someone who
+        # deliberately doesn't want the feature running at all.
+        self.devices_dir = tk.StringVar(value=cfg.devices_dir)
+        self.enable_device_sync = tk.BooleanVar(value=cfg.enable_device_sync)
         for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled, self.public_port,
-                    self.temp_unit, self.language, self.check_for_updates):
+                    self.temp_unit, self.language, self.check_for_updates,
+                    self.devices_dir, self.enable_device_sync):
             var.trace_add("write", lambda *_args: self._save_config())
 
         # Auto-update banner state. _update_info holds the last check's result
@@ -1644,12 +1968,14 @@ class RoastmeshApp(tk.Tk):
         search_tab = SearchTab(notebook, self)
         publish_tab = PublishTab(notebook, self)
         network_tab = NetworkTab(notebook, self)
+        devices_tab = DevicesTab(notebook, self)
         settings_tab = SettingsTab(notebook, self)
         notebook.add(search_tab, text=t("Search"))
         notebook.add(publish_tab, text=t("Publish"))
         notebook.add(network_tab, text=t("Network"))
+        notebook.add(devices_tab, text=t("Devices"))
         notebook.add(settings_tab, text=t("Settings"))
-        self.tabs: list[Tab] = [search_tab, publish_tab, network_tab, settings_tab]
+        self.tabs: list[Tab] = [search_tab, publish_tab, network_tab, devices_tab, settings_tab]
         self.network_tab = network_tab
         # Ticking "find peers over the whole internet" has to actually turn it
         # on. Serving auto-starts at launch and `--wan-discovery` is decided
@@ -1659,6 +1985,11 @@ class RoastmeshApp(tk.Tk):
         # an evening of "it's supposed to be on" while their node never
         # announced itself.
         self.wan_discovery_enabled.trace_add(
+            "write", lambda *_args: self._apply_discovery_change())
+        # Same immediate-restart posture for the Devices tab's "sync
+        # automatically" toggle -- see _apply_discovery_change's own
+        # docstring for why a restart is what actually applies either.
+        self.enable_device_sync.trace_add(
             "write", lambda *_args: self._apply_discovery_change())
 
         # Resizing (Ctrl+scroll or Ctrl+plus/minus, Ctrl+0 to go back to
@@ -1753,6 +2084,8 @@ class RoastmeshApp(tk.Tk):
             theme=self.theme.get(),
             check_for_updates=self.check_for_updates.get(),
             update_dismissed_version=self._update_dismissed_version,
+            enable_device_sync=self.enable_device_sync.get(),
+            devices_dir=self.devices_dir.get(),
         ))
 
     def _on_theme_changed(self) -> None:

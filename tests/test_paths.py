@@ -81,6 +81,33 @@ def test_the_real_modules_route_through_the_resolver(monkeypatch, tmp_path: Path
     assert watch_folder.default_watch_dir() == home / "RoastMeshShare"
 
 
+def test_devices_dir_honors_a_monkeypatched_home_and_falls_back_to_the_legacy_name(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    assert paths.default_devices_dir() == home / "RoastMeshDevices"
+
+    (home / "RoastNetDevices").mkdir()
+    assert paths.default_devices_dir() == home / "RoastNetDevices", (
+        "an existing pre-release folder under the old project name should keep being used"
+    )
+
+    (home / "RoastMeshDevices").mkdir()
+    assert paths.default_devices_dir() == home / "RoastMeshDevices", (
+        "the new name wins once it exists too, same as every other visible folder"
+    )
+
+
+def test_device_sync_state_path_honors_a_monkeypatched_home(monkeypatch, tmp_path: Path) -> None:
+    home = _fake_home(monkeypatch, tmp_path)
+    assert paths.device_sync_state_path() == home / ".local" / "share" / "roastmesh" / "device_sync_state.json"
+
+    # It follows data_dir()'s own legacy fallback (it's just a filename under
+    # data_dir()), not a separate fallback of its own.
+    (home / ".local" / "share" / "roastnet").mkdir(parents=True)
+    assert paths.device_sync_state_path() == home / ".local" / "share" / "roastnet" / "device_sync_state.json"
+
+
 def test_the_swarm_info_hash_did_not_change_with_the_rename() -> None:
     """The DHT rendezvous point is derived from the *old* project name, and has
     to stay that way.

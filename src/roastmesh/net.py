@@ -263,13 +263,53 @@ async def _handle_request(bi, feed_dir: Path, peers_path: Path, profile_path: Pa
         pass  # peer likely disconnected mid-response; nothing more to do
 
 
-async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile_path: Path | None = None,
-                             peer_feeds_root: Path | None = None, own_pubkey_hex: str | None = None) -> None:
+async def _handle_connection(
+    incoming, feed_dir: Path, peers_path: Path, profile_path: Path | None = None,
+    peer_feeds_root: Path | None = None, own_pubkey_hex: str | None = None,
+    devices_dir: Path | None = None, device_sync_state_path: Path | None = None,
+) -> None:
+    """Accept one incoming connection and route it by ALPN.
+
+    serve() now binds a single endpoint that answers three protocols (see
+    its own docstring and the module docstring's "Verified facts"): the
+    public feed's peer-sync (`ALPN`, unchanged below -- every existing
+    behavior for it is untouched), the private folder mirror's sync
+    (device_sync.SYNC_ALPN, trusted-devices-only), and device pairing
+    (device_sync.PAIR_ALPN). `conn.alpn()` is only known once the handshake
+    itself has completed (after `accepting.connect()`), which is why the
+    routing decision happens here and not earlier.
+    """
+    from roastmesh import device_sync  # local: device_sync.py imports net.py right back
+
     try:
         accepting = await incoming.accept()
         conn = await accepting.connect()
     except Exception:
         return
+
+    alpn = conn.alpn()
+
+    if alpn == device_sync.SYNC_ALPN:
+        if devices_dir is None or device_sync_state_path is None:
+            # This node isn't configured for device sync at all (e.g.
+            # enable_device_sync=False) -- refuse outright rather than
+            # silently answering with no folder to serve.
+            _close_quietly(conn)
+            return
+        await device_sync.handle_sync_connection(conn, devices_dir, device_sync_state_path)
+        return
+
+    if alpn == device_sync.PAIR_ALPN:
+        # Real pairing is driven end-to-end by device_sync.pair_over_lan's
+        # own dedicated endpoint on both sides -- see that function's
+        # docstring for why a short-lived, human-attended exchange binds its
+        # own connection rather than sharing this long-running node's. A
+        # PAIR_ALPN dial that lands here regardless (e.g. an old ticket, or
+        # a misdirected one) still gets a clean, immediate close instead of
+        # an unanswered hang.
+        _close_quietly(conn)
+        return
+
     while True:
         try:
             bi = await conn.accept_bi()
@@ -277,6 +317,13 @@ async def _handle_connection(incoming, feed_dir: Path, peers_path: Path, profile
             return  # connection closed
         asyncio.create_task(_handle_request(bi, feed_dir, peers_path, profile_path,
                                             peer_feeds_root, own_pubkey_hex))
+
+
+def _close_quietly(conn) -> None:
+    try:
+        conn.close(0, b"")
+    except Exception:
+        pass
 
 
 # How often serve() re-enforces the disk budget and refreshes the acquire set.
@@ -510,12 +557,30 @@ async def _auto_sync_discovered_peer(
     relay: bool,
     source: str = "lan",
     also_pull: list[str] | None = None,
+    known_tickets: dict[str, str] | None = None,
+    devices_dir: Path | None = None,
+    device_sync_state_path: Path | None = None,
 ) -> None:
     """Shared by LAN and internet (DHT) auto-discovery -- `source` (used
     both as a log-line prefix and as the peer's `added_via` tag) is the
     only thing that differs between the two callers. `also_pull` is the
     replication acquire set: third-party feeds to pull from this peer if it
-    holds them (replication.py)."""
+    holds them (replication.py).
+
+    `known_tickets`, if given, is updated with this peer's ticket
+    unconditionally, before anything below can fail -- it is serve()'s "who
+    did we last hear from and how do we reach them" memory, read by
+    `_device_watch_loop` to push a local device-sync change out immediately
+    to a currently-reachable paired device. `devices_dir`/
+    `device_sync_state_path`, if given, are what let this function ALSO
+    reconcile the private folder mirror with this peer when it turns out to
+    be one of our own paired devices (devices.is_trusted) -- this is how a
+    device that went offline catches up the moment it's discovered again,
+    independent of whether the unrelated public-feed sync below succeeds.
+    """
+    if known_tickets is not None:
+        known_tickets[peer_pubkey_hex] = peer_ticket
+
     print(f"{source}: discovered {peer_pubkey_hex[:16]}..., syncing", flush=True)
     try:
         report = await sync_with_peer(
@@ -524,49 +589,62 @@ async def _auto_sync_discovered_peer(
         )
     except Exception as exc:  # noqa: BLE001 -- a bad/unreachable peer hint shouldn't kill serve()
         print(f"{source}: sync with {peer_pubkey_hex[:16]}... failed: {exc!r}", flush=True)
-        return
+    else:
+        verify_msg = "OK" if report.verify.ok else f"INVALID: {report.verify.error}"
+        print(f"{source}: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
+              flush=True)
+        if _DEBUG:
+            print(f"{source}: debug: peer advertised {len(report.held_feeds)} feed(s), "
+                  f"pulled {len(report.pulled_feeds)}, quota held_back={report.quota.held_back}, "
+                  f"peers_known={report.peers_known}", flush=True)
 
-    verify_msg = "OK" if report.verify.ok else f"INVALID: {report.verify.error}"
-    print(f"{source}: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
-          flush=True)
-    if _DEBUG:
-        print(f"{source}: debug: peer advertised {len(report.held_feeds)} feed(s), "
-              f"pulled {len(report.pulled_feeds)}, quota held_back={report.quota.held_back}, "
-              f"peers_known={report.peers_known}", flush=True)
+        # Two independent things can each need the DB, and neither implies the
+        # other: new feed entries to ingest, and a profile to persist so this
+        # peer gets a name/machine even on a sync that pulled nothing new (the
+        # trap this comment exists to flag -- a peer who has already published
+        # everything they ever will still deserves to stop showing up as a bare
+        # pubkey). So the connection is opened whenever db_path is given at
+        # all, not gated on new_entry_count.
+        if db_path is not None:
+            conn = connect(db_path)
+            try:
+                mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
+                # "Nothing new arrived" is not the same as "nothing to ingest".
+                # A mirror can hold entries the index does not: every feed
+                # published before the roastnet -> roastmesh rename failed
+                # verification on arrival, so its entries were mirrored to disk
+                # and then dropped. Upgrading fixed the verification, but this
+                # path still asked only "did new entries arrive?" -- the answer
+                # was 0, ingest was skipped, and those roasts stayed invisible
+                # forever unless the user happened to run `peer sync` by hand.
+                # Comparing what the mirror holds against what the index has for
+                # that author costs one COUNT and makes the upgrade self-healing.
+                if report.new_entry_count > 0 or _index_is_behind_mirror(conn, peer_pubkey_hex, mirror_dir):
+                    ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
+                if report.profile is not None:
+                    persist_peer_profile(conn, report.profile)
+                # Replication: note who holds what, and ingest any third-party
+                # feeds this sync pulled (marking their blobs local).
+                record_sync_replication(conn, report, Path(peer_feeds_root))
+                if report.pulled_feeds:
+                    print(f"{source}: replicated {len(report.pulled_feeds)} feed(s) held by others",
+                          flush=True)
+            finally:
+                conn.close()
 
-    # Two independent things can each need the DB, and neither implies the
-    # other: new feed entries to ingest, and a profile to persist so this
-    # peer gets a name/machine even on a sync that pulled nothing new (the
-    # trap this comment exists to flag -- a peer who has already published
-    # everything they ever will still deserves to stop showing up as a bare
-    # pubkey). So the connection is opened whenever db_path is given at
-    # all, not gated on new_entry_count.
-    if db_path is not None:
-        conn = connect(db_path)
-        try:
-            mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex
-            # "Nothing new arrived" is not the same as "nothing to ingest".
-            # A mirror can hold entries the index does not: every feed
-            # published before the roastnet -> roastmesh rename failed
-            # verification on arrival, so its entries were mirrored to disk
-            # and then dropped. Upgrading fixed the verification, but this
-            # path still asked only "did new entries arrive?" -- the answer
-            # was 0, ingest was skipped, and those roasts stayed invisible
-            # forever unless the user happened to run `peer sync` by hand.
-            # Comparing what the mirror holds against what the index has for
-            # that author costs one COUNT and makes the upgrade self-healing.
-            if report.new_entry_count > 0 or _index_is_behind_mirror(conn, peer_pubkey_hex, mirror_dir):
-                ingest_feed(conn, mirror_dir, expected_pubkey_hex=peer_pubkey_hex)
-            if report.profile is not None:
-                persist_peer_profile(conn, report.profile)
-            # Replication: note who holds what, and ingest any third-party
-            # feeds this sync pulled (marking their blobs local).
-            record_sync_replication(conn, report, Path(peer_feeds_root))
-            if report.pulled_feeds:
-                print(f"{source}: replicated {len(report.pulled_feeds)} feed(s) held by others",
+    if devices_dir is not None and device_sync_state_path is not None:
+        # Local import: device_sync.py imports net.py right back.
+        from roastmesh import device_sync
+        from roastmesh import devices as devices_mod
+
+        if devices_mod.is_trusted(peer_pubkey_hex):
+            try:
+                await device_sync.reconcile_with_device(
+                    peer_ticket, identity, devices_dir, device_sync_state_path, relay=relay,
+                )
+            except Exception as exc:  # noqa: BLE001 -- catch-up must not kill serve()
+                print(f"{source}: device-sync catch-up with {peer_pubkey_hex[:16]}... failed: {exc!r}",
                       flush=True)
-        finally:
-            conn.close()
 
 
 async def _prune_peers_loop(peers_path) -> None:
@@ -645,6 +723,56 @@ async def _watch_publish_loop(
         await asyncio.sleep(interval_s)
 
 
+DEVICE_WATCH_INTERVAL_S = 5.0
+
+
+async def _device_watch_loop(
+    devices_dir: Path, state_path: Path, identity: Identity, relay: bool,
+    known_tickets: dict[str, str], interval_s: float = DEVICE_WATCH_INTERVAL_S,
+) -> None:
+    """Poll the private device-sync folder on a timer (device_sync.scan_folder's
+    cheap mtime/size fingerprint pass -- see its own docstring) and, the
+    moment a change is noticed, push it out right away to every paired
+    device this node currently knows how to reach -- this is what makes
+    "drop a file on one device" show up on the other "within seconds"
+    rather than waiting for the next scheduled discovery round.
+
+    The sync db is saved on every pass regardless of whether anything
+    changed, so a SYNC_ALPN request served concurrently (net._handle_connection)
+    always sees state at least as fresh as this loop's last pass.
+
+    A folder with no paired device reachable right now is not an error --
+    this loop's job is "notice and try immediately", not "guarantee
+    delivery this instant". A device that's offline (not in `known_tickets`)
+    catches up the moment it's next discovered instead
+    (_auto_sync_discovered_peer's own device-sync catch-up, above).
+    """
+    # Local import: device_sync.py imports net.py right back.
+    from roastmesh import device_sync
+    from roastmesh import devices as devices_mod
+
+    while True:
+        try:
+            prev = device_sync.load_state(state_path)
+            manifest = device_sync.scan_folder(devices_dir, prev)
+            changed = manifest != prev
+            device_sync.save_state(manifest, state_path)
+            if changed:
+                for device in devices_mod.load_devices():
+                    ticket = known_tickets.get(device.pubkey)
+                    if ticket is None:
+                        continue  # not currently known-reachable -- catches up on discovery
+                    try:
+                        await device_sync.reconcile_with_device(
+                            ticket, identity, devices_dir, state_path, relay=relay,
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- one unreachable device must not kill the loop
+                        print(f"device-sync: push to {device.name!r} failed: {exc!r}", flush=True)
+        except Exception as exc:  # noqa: BLE001 -- housekeeping must not kill serve()
+            print(f"device-sync: watch loop error: {exc!r}", flush=True)
+        await asyncio.sleep(interval_s)
+
+
 def _discovery_is_offline() -> bool:
     """True when ROASTMESH_DISCOVERY_OFFLINE is set to something truthy.
 
@@ -693,6 +821,9 @@ async def serve(
     replicate: bool = True,
     replication_budget: int = replication.DEFAULT_REPLICATION_BUDGET,
     debug: bool = False,
+    enable_device_sync: bool = True,
+    devices_dir: Path | None = None,
+    device_sync_state_path: Path | None = None,
 ) -> None:
     """Bind a node and serve get_peers/get_feed requests forever.
 
@@ -731,6 +862,27 @@ async def serve(
 
     Setting ROASTMESH_DISCOVERY_OFFLINE=1 forces both discovery mechanisms
     off regardless of what the caller asked for. See _discovery_is_offline.
+
+    `enable_device_sync` (on by default) is the private folder mirror
+    between this identity's own paired devices (device_sync.py) -- a
+    completely separate trust boundary and protocol from everything above:
+    public-feed peers are never involved, and nothing here is ever
+    published to the public feed. The endpoint always advertises
+    device_sync.SYNC_ALPN/PAIR_ALPN (see net._handle_connection's own
+    "Verified facts": one endpoint, three ALPNs, branched by conn.alpn())
+    regardless of this flag, so a dial to either gets a clean, immediate
+    close rather than a transport-level failure; `enable_device_sync=False`
+    is what makes that close unconditional, i.e. this node never actually
+    serves a SYNC_ALPN request or starts device-sync activity of its own.
+    `devices_dir`/`device_sync_state_path` default to
+    paths.default_devices_dir()/paths.device_sync_state_path() when not
+    given. The background watch loop that pushes a local change out
+    immediately, and the reconcile-on-discovery catch-up, both additionally
+    only start when `roastmesh.devices.load_devices()` is non-empty
+    (nothing paired yet -- no reason to poll a folder or dial anyone) and
+    when discovery isn't forced offline (ROASTMESH_DISCOVERY_OFFLINE -- see
+    _discovery_is_offline; with discovery off there is no peer to reach
+    anyway).
     """
     if _discovery_is_offline():
         # Only the *shared* channels are closed: the production LAN beacon
@@ -755,7 +907,12 @@ async def serve(
     if debug:
         print("serve: debug logging enabled -- verbose discovery/sync detail follows", flush=True)
 
-    ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
+    # Local import: device_sync.py imports net.py right back (for
+    # bind_endpoint/dial_with_fallback/_send_message/_recv_message).
+    from roastmesh import device_sync
+    from roastmesh import devices as devices_mod
+
+    ep = await bind_endpoint(identity, alpns=[ALPN, device_sync.PAIR_ALPN, device_sync.SYNC_ALPN], relay=relay)
     if relay:
         # Wait for a home relay before minting the ticket. Immediately after
         # bind, `ep.addr()` knows only local interfaces -- measured here:
@@ -786,12 +943,38 @@ async def serve(
         print(f"ticket: {ticket}", flush=True)
 
     resolved_peer_feeds_root = peer_feeds_root or default_peer_feeds_root()
+    # None (device sync fully disabled) unless enable_device_sync -- passed
+    # straight to _handle_connection, whose SYNC_ALPN branch already treats
+    # "no folder configured" as "refuse", so False here needs no separate
+    # gate at that call site.
+    resolved_devices_dir = None
+    resolved_device_sync_state_path = None
+    if enable_device_sync:
+        from roastmesh.paths import default_devices_dir, device_sync_state_path as default_device_sync_state_path
+        resolved_devices_dir = Path(devices_dir) if devices_dir is not None else default_devices_dir()
+        resolved_device_sync_state_path = Path(device_sync_state_path) if device_sync_state_path is not None \
+            else default_device_sync_state_path()
 
     # The replication acquire set, refreshed each pass by _replication_loop and
     # read by the discovery syncs: the rarest wanted feeds to pull opportunistically
     # from whichever peer we next talk to that holds them. A plain list mutated
     # in place so the closures below always see the latest set.
     acquire_state: list[str] = []
+
+    # Which ticket last reached us for a given pubkey, from EITHER discovery
+    # mechanism -- device_sync's own reachability memory (a dict mutated in
+    # place, same pattern as acquire_state above), read by _device_watch_loop
+    # to push a local change to a currently-reachable paired device right
+    # away instead of waiting for that device to be rediscovered.
+    known_device_tickets: dict[str, str] = {}
+
+    # Device sync only ever runs when there is at least one paired device to
+    # run it for, and only while this node is actually reaching the network
+    # at all -- with discovery forced offline there is nobody it could reach
+    # anyway (see this function's own docstring).
+    device_sync_active = (
+        enable_device_sync and not _discovery_is_offline() and bool(devices_mod.load_devices())
+    )
 
     background_tasks: list[asyncio.Task] = []
     if db_path is not None:
@@ -804,6 +987,9 @@ async def serve(
                 peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
                 db_path=db_path, relay=relay, source="lan",
                 also_pull=list(acquire_state),
+                known_tickets=known_device_tickets if device_sync_active else None,
+                devices_dir=resolved_devices_dir if device_sync_active else None,
+                device_sync_state_path=resolved_device_sync_state_path if device_sync_active else None,
             )
 
         background_tasks.append(asyncio.create_task(run_beacon(
@@ -818,6 +1004,9 @@ async def serve(
                 peer_feeds_root=resolved_peer_feeds_root, peers_path=peers_path,
                 db_path=db_path, relay=relay, source="wan",
                 also_pull=list(acquire_state),
+                known_tickets=known_device_tickets if device_sync_active else None,
+                devices_dir=resolved_devices_dir if device_sync_active else None,
+                device_sync_state_path=resolved_device_sync_state_path if device_sync_active else None,
             )
 
         background_tasks.append(asyncio.create_task(run_wan_discovery(
@@ -839,6 +1028,11 @@ async def serve(
             db_path, replication_budget, acquire_state,
         )))
 
+    if device_sync_active:
+        background_tasks.append(asyncio.create_task(_device_watch_loop(
+            resolved_devices_dir, resolved_device_sync_state_path, identity, relay, known_device_tickets,
+        )))
+
     try:
         while True:
             incoming = await ep.accept_next()
@@ -846,11 +1040,47 @@ async def serve(
                 break
             asyncio.create_task(_handle_connection(
                 incoming, feed_dir, peers_path, profile_path,
-                resolved_peer_feeds_root, identity.public_key_hex))
+                resolved_peer_feeds_root, identity.public_key_hex,
+                resolved_devices_dir, resolved_device_sync_state_path))
     finally:
         for task in background_tasks:
             task.cancel()
         await ep.close()
+
+
+async def dial_with_fallback(ep: iroh.Endpoint, ticket_str: str, alpn: bytes, *,
+                             timeout: float = CONNECT_TIMEOUT_S) -> iroh.Connection:
+    """Dial a peer by its ticket, falling back to dialing by identity alone
+    if the ticket's pinned addresses have gone stale -- the exact two-step
+    dance sync_with_peer below always used, factored out so device_sync.py's
+    device-pairing and device-sync dials (a different ALPN, same iroh
+    endpoint conventions) can reuse it rather than re-deriving it.
+
+    A ticket pins the addresses a peer had when it minted the ticket, and
+    those go stale on its next restart or IP change -- but its identity
+    never does. `preset_n0` (bind_endpoint) publishes every endpoint's
+    current address to iroh's discovery service keyed by that identity, so
+    a node id alone is enough to find it again. Verified end to end:
+    dialling with relay_url=None and no direct addresses connected in ~2s
+    and completed a real exchange. This is what makes a peer, once
+    discovered, stay reachable even after its ticket has gone stale.
+    """
+    ticket = iroh.EndpointTicket.from_string(ticket_str)
+    addr = ticket.endpoint_addr()
+    try:
+        return await asyncio.wait_for(ep.connect(addr, alpn), timeout)
+    except (Exception, asyncio.TimeoutError):
+        peer_id = addr.id()
+        if not str(peer_id):
+            raise
+        try:
+            return await asyncio.wait_for(ep.connect(iroh.EndpointAddr(peer_id, None, []), alpn), timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"could not reach peer {str(peer_id)[:16]}... within "
+                f"{timeout:.0f}s -- it is probably offline, or neither side "
+                "can open a connection to the other"
+            ) from None
 
 
 async def sync_with_peer(
@@ -869,33 +1099,9 @@ async def sync_with_peer(
     checked against cheap metadata before any content is fetched), and merge
     their known-peer list into ours (peer exchange gossip)."""
     limits = limits or QuotaLimits()
-    ticket = iroh.EndpointTicket.from_string(ticket_str)
-    addr = ticket.endpoint_addr()
     ep = await bind_endpoint(identity, relay=relay)
     try:
-        try:
-            conn = await asyncio.wait_for(ep.connect(addr, ALPN), CONNECT_TIMEOUT_S)
-        except (Exception, asyncio.TimeoutError):
-            # A ticket pins the addresses a peer had when it minted the ticket,
-            # and those go stale on its next restart or IP change -- but its
-            # identity never does. `preset_n0` (bind_endpoint) publishes every
-            # endpoint's current address to iroh's discovery service keyed by
-            # that identity, so a node id alone is enough to find it again.
-            # Verified end to end: dialling with relay_url=None and no direct
-            # addresses connected in ~2s and completed a real feed exchange.
-            # This is what makes a peer, once discovered, stay reachable.
-            peer_id = addr.id()
-            if not str(peer_id):
-                raise
-            try:
-                conn = await asyncio.wait_for(
-                    ep.connect(iroh.EndpointAddr(peer_id, None, []), ALPN), CONNECT_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                raise RuntimeError(
-                    f"could not reach peer {str(peer_id)[:16]}... within "
-                    f"{CONNECT_TIMEOUT_S:.0f}s -- it is probably offline, or neither side "
-                    "can open a connection to the other"
-                ) from None
+        conn = await dial_with_fallback(ep, ticket_str, ALPN)
         peer_pubkey_hex = str(conn.remote_id())
 
         mirror_dir = Path(peer_feeds_root) / peer_pubkey_hex

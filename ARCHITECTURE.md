@@ -94,6 +94,66 @@ defense**; add per-peer trust weighting only if it becomes a real problem.
 An always-on node (VPS, Pi) run by the maintainers removes availability concerns
 entirely, without becoming an authority.
 
+## Device pairing & private sync
+
+Everything above is one identity publishing to one public feed shared with
+*everyone*. This is the opposite trust model, for the same person's own
+multiple computers:
+
+|                | Public feed                          | Device sync                              |
+|----------------|---------------------------------------|-------------------------------------------|
+| Direction      | one-way broadcast to all peers        | bidirectional, only between paired devices |
+| Mutability     | append-only, immutable                | files change and delete -- full mirror     |
+| Audience       | everyone                              | only your SAS-verified own devices         |
+| Trust basis    | per-entry Ed25519 signatures          | pairing + a per-connection identity check  |
+
+**Public-feed identities are never merged.** Each device keeps its own
+Ed25519 keypair; two devices signing one hash-chained feed would fork it.
+"Same user, multiple devices" is instead a local **trusted-device set**
+(`devices.json`) recording each other's Ed25519 pubkey, written only after
+a human confirms a SAS.
+
+**Pairing (Matrix-style SAS).** The Iroh QUIC handshake already
+authenticates a connection as a specific Ed25519 identity --
+`conn.remote_id()` *is* the far end's real key, and that cannot be forged
+on the wire. The one real attack is substitution at discovery: a LAN
+attacker spoofs the pairing beacon and offers *their* ticket, so the human
+connects to the attacker's device believing it is their own second laptop.
+Two devices in pairing mode commit-then-reveal an ephemeral X25519 key
+each, derive a shared secret, and turn it into 7 emoji (HKDF-SHA256 over
+the two devices' pubkeys + ephemeral keys, so the emoji are bound to
+*this* connection specifically). Both humans compare the two screens: an
+attacker sitting on a different, real connection to your actual second
+device cannot make its screen show the same 7 emoji this one does. Only on
+a match does each side sign the exchange with its long-term identity and
+add the other's pubkey to its own trusted-device set.
+
+**Sync (full mirror).** Once paired, a private folder mirrors between
+devices: add, change, or delete a file on one and it propagates to every
+other reachable paired device. Newest write wins on a conflict (a
+wall-clock timestamp stamped fresh whenever a change is actually noticed,
+never a file's own mtime, which two machines' clocks cannot be trusted to
+agree on). A delete is a **tombstone**, not silence -- without one, a peer
+that still has the file would just re-supply it on the next sync. Change
+detection is the same mtime/size fingerprint poll the public feed's watch
+folder already uses; content is only re-hashed when a fingerprint
+actually changes.
+
+**Three ALPNs, one endpoint.** `roastmesh/peer-sync/0` (the public feed,
+unchanged), `roastmesh/device-pair/0` (the SAS handshake), and
+`roastmesh/device-sync/0` (the folder mirror) all share one bound Iroh
+endpoint, routed by `conn.alpn()`. A `device-sync` connection is only ever
+answered after `conn.remote_id()` passes the trusted-device check --
+otherwise the connection is closed without a single request answered.
+That check, not anything in the request itself, is the private folder's
+entire access boundary.
+
+**Non-goals.** No feed-identity merge -- a paired device is still its own
+independent public-feed author, if it publishes at all. The device folder
+is **never** published to, or readable from, the public feed; none of the
+quota/abuse-resistance rules above apply to it, because it has no
+stranger-facing audience to defend against in the first place.
+
 ## Search index
 
 The feeds are the only source of truth. The index is a **pure function of the

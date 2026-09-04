@@ -56,3 +56,30 @@ def default_watch_dir() -> Path:
     """
     home = Path.home()
     return _prefer_existing(home / "RoastMeshShare", home / "RoastNetShare")
+
+
+def default_devices_dir() -> Path:
+    """The drop folder that mirrors between a user's own paired devices.
+
+    Deliberately a *different* folder from default_watch_dir: that one is a
+    one-way broadcast to the whole public feed, this one is a private,
+    bidirectional mirror between only your own SAS-verified devices (see
+    device_sync.py) -- conflating them would mean a file dropped for one
+    audience quietly reaching the other. Same legacy-fallback convention as
+    every other visible folder here, on the off chance someone already has a
+    "RoastNetDevices" from a pre-release build of this feature under the old
+    project name.
+    """
+    home = Path.home()
+    return _prefer_existing(home / "RoastMeshDevices", home / "RoastNetDevices")
+
+
+def device_sync_state_path() -> Path:
+    """Internal bookkeeping for the folder mirror: the per-relpath manifest
+    (content hash, size, mtime, tombstone) device_sync.py reconciles against a
+    paired device's own manifest. Lives under data_dir() alongside peers.json
+    and the feed -- it's local state, not something the user edits by hand --
+    and, like every path here, is computed fresh per call rather than cached,
+    so tests that monkeypatch HOME never see a stale value baked in at import
+    time (see this module's own docstring)."""
+    return data_dir() / "device_sync_state.json"

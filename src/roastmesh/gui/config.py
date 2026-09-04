@@ -50,6 +50,19 @@ class GuiConfig:
     # The latest version the user dismissed from the banner -- so a dismissed
     # update doesn't nag again until a newer one appears. See roastmesh.updater.
     update_dismissed_version: str = ""
+    # Whether `node serve` (started by the Network tab) also runs the private
+    # device-sync folder mirror -- see device_sync.py/net.serve's own
+    # enable_device_sync. On by default, same posture as wan_discovery_enabled:
+    # harmless with nothing paired yet (net.serve only starts its background
+    # activity once devices.json is non-empty), and a user who doesn't want
+    # the feature at all can turn it off here.
+    enable_device_sync: bool = True
+    # "" means "use paths.default_devices_dir()" -- same empty-means-default
+    # convention as public_port, so a fresh install's config file doesn't
+    # have to hardcode a path that a HOME-dependent default already covers,
+    # and moving HOME (or the roastnet -> roastmesh legacy fallback) keeps
+    # tracking the right folder instead of a value frozen at first save.
+    devices_dir: str = ""
 
 
 def default_config() -> GuiConfig:
@@ -64,6 +77,8 @@ def default_config() -> GuiConfig:
         theme="system",
         check_for_updates=True,
         update_dismissed_version="",
+        enable_device_sync=True,
+        devices_dir="",
     )
 
 
@@ -87,6 +102,8 @@ def load_config() -> GuiConfig:
         theme=data.get("theme") if data.get("theme") in ("system", "light", "dark") else defaults.theme,
         check_for_updates=bool(data.get("check_for_updates", True)),
         update_dismissed_version=str(data.get("update_dismissed_version") or ""),
+        enable_device_sync=bool(data.get("enable_device_sync", True)),
+        devices_dir=str(data.get("devices_dir") or ""),
     )
 
 

@@ -146,7 +146,7 @@ def test_fr_catalog_is_valid_json_and_covers_every_key_used_in_the_gui_source() 
 # ("Drop °C") is deliberately excluded -- ResultsTable._column_label
 # never passes that exact string through t(); it looks up "Drop" alone and
 # appends the live unit, so "Drop °C" itself is never a real key.
-_COLUMN_TUPLE_NAMES = {"_COLUMNS", "_PEER_COLUMNS", "_USER_COLUMNS"}
+_COLUMN_TUPLE_NAMES = {"_COLUMNS", "_PEER_COLUMNS", "_USER_COLUMNS", "_DEVICE_COLUMNS"}
 _COLUMN_LABELS_NEVER_LOOKED_UP_VERBATIM = {"Drop °C"}
 
 

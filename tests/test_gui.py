@@ -93,7 +93,7 @@ app._on_close()
 print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
-    assert "TABS 4" in r.stdout, r.stdout
+    assert "TABS 5" in r.stdout, r.stdout
 
 
 def test_ui_scale_env_var_overrides_a_persisted_config_value(tmp_path: Path) -> None:
@@ -177,7 +177,7 @@ appmod.main(single_instance_port={port})
         "single-instance guard seeing the old process still holding the port"
     )
     assert "scale=2.5" in marker.read_text(encoding="utf-8")
-    assert "tabs=4" in marker.read_text(encoding="utf-8")
+    assert "tabs=5" in marker.read_text(encoding="utf-8")
 
     saved = json.loads((home / ".local" / "share" / "roastmesh" / "gui_config.json").read_text())
     assert saved["ui_scale"] == 2.5
@@ -500,7 +500,7 @@ from roastmesh.gui.app import RoastmeshApp
 app = RoastmeshApp()
 app.db_path.set({str(db_path)!r})
 app.update()
-tab = app.tabs[3]
+tab = app.tabs[4]
 # Poll for the value rather than sleeping a fixed 3s: the field is seeded
 # by a background `profile show` subprocess, and on a loaded machine that
 # does not always finish inside a fixed window -- which made this test fail
@@ -1226,3 +1226,59 @@ app.destroy()
     assert "port is forwarded" in needs_line and "Settings" in needs_line
     assert "26513 is set" in conf_line          # a different problem, a different sentence
     assert healthy_line == "HEALTHY ''"         # nothing to say when it works
+
+
+def test_devices_tab_builds_and_shows_the_folder_path(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.update()
+tab = app.tabs[3]
+print("IS_DEVICES_TAB", type(tab).__name__)
+print("FOLDER", tab.devices_dir_var.get())
+print("HAS_TABLE", hasattr(tab, "device_table"))
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "IS_DEVICES_TAB DevicesTab" in r.stdout, r.stdout
+    assert "HAS_TABLE True" in r.stdout, r.stdout
+    assert "RoastMeshDevices" in r.stdout, r.stdout
+
+
+def test_opening_the_pairing_modal_creates_a_toplevel_and_starts_no_network_under_test(
+    tmp_path: Path,
+) -> None:
+    """ROASTMESH_SKIP_DEVICE_SYNC (conftest.py, inherited by this subprocess)
+    must stop the modal from ever spawning `device pair --json` -- that
+    subprocess would itself try a real LAN broadcast/listen. Set explicitly
+    here too, as documentation of exactly what this test is proving."""
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+import tkinter as tk
+os.environ["HOME"] = {str(home)!r}
+os.environ["ROASTMESH_SKIP_DEVICE_SYNC"] = "1"
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.update()
+tab = app.tabs[3]
+tab._open_pairing_modal()
+app.update()
+modal = tab._pairing_modal
+print("IS_TOPLEVEL", isinstance(modal, tk.Toplevel))
+print("TASK_IS_NONE", modal._task is None)
+print("TITLE", modal.title())
+modal._on_close()
+app.update()
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "IS_TOPLEVEL True" in r.stdout, r.stdout
+    assert "TASK_IS_NONE True" in r.stdout, r.stdout

@@ -888,3 +888,196 @@ async def test_pruning_never_takes_down_the_node(tmp_path: Path) -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+# --- device sync: ALPN routing in _handle_connection -----------------------
+#
+# Fake iroh.Connection/Accepting/Incoming doubles, just detailed enough to
+# drive _handle_connection's real routing logic (conn.alpn(), conn.remote_id(),
+# conn.close(), conn.accept_bi()) without a real endpoint -- the plan's own
+# "can be tested at the _handle_connection unit level with a fake conn".
+
+class _FakeSendHalf:
+    def __init__(self, sink: list) -> None:
+        self._sink = sink
+
+    async def write_all(self, data: bytes) -> None:
+        self._sink.append(data)
+
+    async def finish(self) -> None:
+        pass
+
+
+class _FakeRecvHalf:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read_to_end(self, _cap: int) -> bytes:
+        return self._data
+
+
+class _FakeBi:
+    """One fake bidirectional stream carrying exactly one JSON request in
+    and collecting whatever gets written back -- net._recv_message/
+    _send_message's own framing (one write_all+finish, one read_to_end)."""
+
+    def __init__(self, request: dict) -> None:
+        self._request_bytes = json.dumps(request).encode()
+        self._response_chunks: list[bytes] = []
+
+    def send(self):
+        return _FakeSendHalf(self._response_chunks)
+
+    def recv(self):
+        return _FakeRecvHalf(self._request_bytes)
+
+    def response(self) -> dict:
+        return json.loads(b"".join(self._response_chunks))
+
+
+class _FakeConn:
+    def __init__(self, *, alpn: bytes, remote_id: str, bi_streams=None) -> None:
+        self._alpn = alpn
+        self._remote_id = remote_id
+        self._bi_streams = list(bi_streams or [])
+        self.closed = False
+        self.close_args = None
+
+    def alpn(self) -> bytes:
+        return self._alpn
+
+    def remote_id(self) -> str:
+        return self._remote_id
+
+    def close(self, code, reason) -> None:
+        self.closed = True
+        self.close_args = (code, reason)
+
+    async def accept_bi(self):
+        if self._bi_streams:
+            return self._bi_streams.pop(0)
+        raise RuntimeError("no more streams -- connection closed")
+
+
+class _FakeAccepting:
+    def __init__(self, conn: _FakeConn) -> None:
+        self._conn = conn
+
+    async def connect(self) -> _FakeConn:
+        return self._conn
+
+
+class _FakeIncoming:
+    def __init__(self, conn: _FakeConn) -> None:
+        self._conn = conn
+
+    async def accept(self) -> _FakeAccepting:
+        return _FakeAccepting(self._conn)
+
+
+async def test_handle_connection_closes_a_sync_alpn_dial_from_an_untrusted_key(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from roastmesh import device_sync
+
+    monkeypatch.setenv("HOME", str(tmp_path))  # isolated devices.json -- nobody paired
+    conn = _FakeConn(alpn=device_sync.SYNC_ALPN, remote_id="a" * 64)
+    await net._handle_connection(
+        _FakeIncoming(conn), tmp_path / "feed", tmp_path / "peers.json",
+        devices_dir=tmp_path / "devices", device_sync_state_path=tmp_path / "device_sync_state.json",
+    )
+    assert conn.closed is True
+
+
+async def test_handle_connection_closes_a_sync_alpn_dial_when_device_sync_is_not_configured(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Even a would-be-trusted key gets refused when this node wasn't given
+    a devices_dir/state_path at all (enable_device_sync=False) -- there is
+    no folder here to answer for."""
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    pubkey = "b" * 64
+    add_device(Device(pubkey=pubkey, name="trusted", platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
+
+    conn = _FakeConn(alpn=device_sync.SYNC_ALPN, remote_id=pubkey)
+    await net._handle_connection(
+        _FakeIncoming(conn), tmp_path / "feed", tmp_path / "peers.json",
+        devices_dir=None, device_sync_state_path=None,
+    )
+    assert conn.closed is True
+
+
+async def test_handle_connection_closes_a_pair_alpn_dial(tmp_path: Path, monkeypatch) -> None:
+    """Real pairing is driven by device_sync.pair_over_lan's own dedicated
+    endpoint (see its docstring) -- a PAIR_ALPN dial that lands on the
+    already-running node's shared endpoint gets a clean, immediate close."""
+    from roastmesh import device_sync
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    conn = _FakeConn(alpn=device_sync.PAIR_ALPN, remote_id="c" * 64)
+    await net._handle_connection(
+        _FakeIncoming(conn), tmp_path / "feed", tmp_path / "peers.json",
+        devices_dir=tmp_path / "devices", device_sync_state_path=tmp_path / "device_sync_state.json",
+    )
+    assert conn.closed is True
+
+
+async def test_handle_connection_serves_a_sync_alpn_dial_from_a_trusted_key(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    pubkey = "d" * 64
+    add_device(Device(pubkey=pubkey, name="trusted", platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
+
+    devices_dir = tmp_path / "devices"
+    devices_dir.mkdir()
+    (devices_dir / "roast.alog").write_bytes(b"content")
+    state_path = tmp_path / "device_sync_state.json"
+
+    bi = _FakeBi({"op": "manifest"})
+    conn = _FakeConn(alpn=device_sync.SYNC_ALPN, remote_id=pubkey, bi_streams=[bi])
+    await net._handle_connection(
+        _FakeIncoming(conn), tmp_path / "feed", tmp_path / "peers.json",
+        devices_dir=devices_dir, device_sync_state_path=state_path,
+    )
+    # The request is handled on a spawned task -- give the loop a moment.
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if bi._response_chunks:
+            break
+
+    assert conn.closed is False
+    assert "roast.alog" in bi.response()["records"]
+
+
+async def test_serve_with_enable_device_sync_false_behaves_exactly_as_before(tmp_path: Path) -> None:
+    """The public-feed peer-sync path must be completely unaffected by
+    disabling device sync -- a plain end-to-end sync, same as every other
+    test in this file, just with the new flag explicitly off."""
+    identity_a = generate_identity()
+    identity_b = generate_identity()
+    feed_a = tmp_path / "feed_a"
+    feed_b = tmp_path / "feed_b"
+    peers_a = tmp_path / "peers_a.json"
+    peers_b = tmp_path / "peers_b.json"
+
+    _publish(feed_a, identity_a, FIXTURES[:1])
+
+    ready: asyncio.Future = asyncio.get_event_loop().create_future()
+    task = asyncio.create_task(net.serve(
+        identity_a, feed_a, peers_a, relay=False, ready_callback=ready.set_result,
+        enable_lan_discovery=False, enable_device_sync=False,
+    ))
+    ticket = await asyncio.wait_for(ready, timeout=10)
+    try:
+        report = await net.sync_with_peer(ticket, identity_b, feed_b, peers_b, relay=False)
+        assert report.new_entry_count == 1
+        assert report.verify.ok
+    finally:
+        await _stop_server(task)

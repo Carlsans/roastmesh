@@ -28,5 +28,12 @@ os.environ.setdefault("ROASTMESH_SKIP_WIZARD", "1")
 # a spawned process for every RoastmeshApp built -- skip it. See
 # RoastmeshApp._start_update_check.
 os.environ.setdefault("ROASTMESH_SKIP_UPDATE_CHECK", "1")
+# The Devices tab refreshes its paired-device list on a timer (a subprocess
+# `device list --json`, which itself does a brief real LAN listen for the
+# online flag unless told not to) as long as the tab exists. Every GUI test
+# that builds a RoastmeshApp would otherwise start that timer and its
+# network probe too -- skip it, same reasoning as ROASTMESH_SKIP_UPDATE_CHECK
+# just above. See gui/app.py's DevicesTab.
+os.environ.setdefault("ROASTMESH_SKIP_DEVICE_SYNC", "1")
 
 asyncio_policy.apply()

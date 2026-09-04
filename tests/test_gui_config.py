@@ -77,3 +77,29 @@ def test_load_config_rejects_a_non_numeric_ui_scale(monkeypatch, tmp_path: Path)
     _isolate(monkeypatch, tmp_path)
     (tmp_path / "gui_config.json").write_text('{"ui_scale": "big"}')
     assert load_config().ui_scale is None
+
+
+def test_default_config_enables_device_sync_with_an_empty_devices_dir(monkeypatch, tmp_path: Path) -> None:
+    _isolate(monkeypatch, tmp_path)
+    cfg = load_config()
+    assert cfg.enable_device_sync is True
+    assert cfg.devices_dir == ""
+
+
+def test_save_then_load_roundtrips_device_sync_fields(monkeypatch, tmp_path: Path) -> None:
+    _isolate(monkeypatch, tmp_path)
+    save_config(GuiConfig(db_path="/x/db.sqlite3", watch_dir="/x/watch",
+                           enable_device_sync=False, devices_dir="/x/devices"))
+    cfg = load_config()
+    assert cfg.enable_device_sync is False
+    assert cfg.devices_dir == "/x/devices"
+
+
+def test_load_config_accepts_a_partial_file_missing_the_device_sync_fields(monkeypatch, tmp_path: Path) -> None:
+    # The exact shape a config saved before this feature existed has --
+    # must still load with sensible defaults, not a crash.
+    _isolate(monkeypatch, tmp_path)
+    (tmp_path / "gui_config.json").write_text('{"language": "fr"}')
+    cfg = load_config()
+    assert cfg.enable_device_sync is True
+    assert cfg.devices_dir == ""

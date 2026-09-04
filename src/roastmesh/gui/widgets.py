@@ -746,3 +746,61 @@ class UserTable(ttk.Frame):
                 row.get("like_count", 0),
                 "★" if row.get("is_favorite") else "",
             ))
+
+
+# A plain green works readably against both this app's light and dark
+# theme.BG (confirmed against both palettes in theme.py) without needing a
+# dedicated theme token of its own for what is, so far, the only place a
+# status dot like this appears.
+_ONLINE_DOT_COLOR = "#2e7d32"
+
+_DEVICE_COLUMNS = [
+    ("name", "Name", 170),
+    ("pubkey", "Pubkey", 170),
+    ("platform", "Platform", 90),
+    ("paired_at", "Paired", 150),
+]
+
+
+class DeviceTable(ttk.Frame):
+    """Paired-device list for the Devices tab: a best-effort online dot (the
+    #0 column, PeerTable's leading-column-carries-a-marker convention, a
+    plain colored dot here rather than a flag image) plus name/pubkey
+    prefix/platform/paired-at. Rows are keyed by the device's full pubkey as
+    the Treeview iid -- UserTable's convention, not PeerTable's -- so
+    Remove can act on whichever row is selected."""
+
+    def __init__(self, parent: tk.Widget, height: int = 6) -> None:
+        super().__init__(parent)
+        self.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            wrap, columns=[c[0] for c in _DEVICE_COLUMNS], show="tree headings", height=height,
+            selectmode="browse",
+        )
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=sp(26), stretch=False, anchor="center")
+        for key, label, width in _DEVICE_COLUMNS:
+            self.tree.heading(key, text=t(label))
+            self.tree.column(key, width=sp(width), anchor="w")
+        self.tree.tag_configure("online", foreground=_ONLINE_DOT_COLOR)
+        self.tree.tag_configure("offline", foreground=theme.MUTED)
+        ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ybar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ybar.pack(side="right", fill="y")
+
+    def set_rows(self, rows: list[dict]) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for row in rows:
+            pubkey = row.get("pubkey") or ""
+            online = bool(row.get("online"))
+            self.tree.insert("", "end", iid=pubkey, text="●", tags=("online" if online else "offline",),
+                             values=(
+                                 row.get("name") or t("?"),
+                                 (pubkey[:16] + "...") if len(pubkey) > 16 else pubkey,
+                                 row.get("platform") or "",
+                                 (row.get("paired_at") or "")[:10],
+                             ))

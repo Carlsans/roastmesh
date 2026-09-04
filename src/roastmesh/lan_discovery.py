@@ -21,6 +21,7 @@ import asyncio
 import socket
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from roastmesh.dht import udp_socket
 from roastmesh.hello import decode_hello, encode_hello
@@ -69,7 +70,11 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
         decoded = decode_hello(data)
         if decoded is None:
             return
-        pubkey, ticket = decoded
+        # The always-on discovery beacon only ever cares about pubkey/ticket
+        # -- pairing/code/hostname exist for discover_pairing_beacons below,
+        # not this one, and a pairing-mode hello from a device also running
+        # regular discovery is harmless noise here, not an error.
+        pubkey, ticket, _pairing, _code, _hostname = decoded
         if pubkey == self._own_pubkey_hex:
             return  # broadcasts loop back to the sender on the same host
         self._handle(pubkey, ticket)
@@ -125,6 +130,127 @@ async def run_beacon(
             await asyncio.sleep(interval_s)
     finally:
         transport.close()
+
+
+@dataclass
+class PairingCandidate:
+    pubkey: str
+    ticket: str
+    code: str | None       # the other side's session code, for a human to cross-check
+    hostname: str | None   # the other side's advertised device label
+
+
+async def discover_pairing_beacons(
+    own_pubkey_hex: str,
+    own_ticket: str,
+    *,
+    code: str,
+    hostname: str,
+    port: int = BEACON_PORT,
+    interval_s: float = 1.0,
+    listen_s: float = 5.0,
+) -> list[PairingCandidate]:
+    """Broadcast our own pairing-mode hello and collect every other one
+    seen within `listen_s`, deduped by pubkey -- the LAN half of
+    device_sync.pair_over_lan.
+
+    Deliberately a separate, time-bounded function rather than a mode of
+    run_beacon: pairing is a brief, human-attended moment (someone is
+    standing at both screens right now), not a background/forever loop, and
+    piling a second exit condition onto run_beacon's `while True` would have
+    made the always-on discovery path -- which must never stop on its own --
+    harder to reason about for no benefit. It does still reuse run_beacon's
+    actual socket setup (_join_multicast, _announce, the same multicast
+    group and per-interface send) rather than re-deriving any of it: a
+    second, subtly different UDP setup here is exactly the kind of drift
+    that made plain LAN discovery flaky before _announce/_join_multicast
+    were written the way they are (see their own docstrings), and this
+    binds its own socket with SO_REUSEPORT (like run_beacon) specifically so
+    it can run *alongside* the always-on beacon on the very same port
+    without disturbing it in either direction.
+
+    A faster default interval than run_beacon's (1s vs 5s): pairing is a
+    short window a human is actively waiting on, where run_beacon's 5s
+    default is tuned for a beacon meant to run for hours unnoticed.
+    """
+    loop = asyncio.get_running_loop()
+    candidates: dict[str, PairingCandidate] = {}
+
+    class _PairingBeaconProtocol(asyncio.DatagramProtocol):
+        def error_received(self, exc: Exception) -> None:
+            print(f"lan: pairing socket error: {exc!r}", flush=True)
+
+        def datagram_received(self, data: bytes, addr) -> None:
+            decoded = decode_hello(data)
+            if decoded is None:
+                return
+            pubkey, ticket, pairing, peer_code, peer_hostname = decoded
+            if not pairing or pubkey == own_pubkey_hex:
+                return  # a plain (non-pairing) beacon, or our own broadcast looping back
+            candidates[pubkey] = PairingCandidate(pubkey, ticket, peer_code, peer_hostname)
+
+    sock = udp_socket(port)
+    if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    _join_multicast(sock)
+
+    transport, _ = await loop.create_datagram_endpoint(_PairingBeaconProtocol, sock=sock)
+    payload = encode_hello(own_pubkey_hex, own_ticket, pairing=True, code=code, hostname=hostname)
+    try:
+        elapsed = 0.0
+        while elapsed < listen_s:
+            _announce(sock, transport, payload, port)
+            await asyncio.sleep(interval_s)
+            elapsed += interval_s
+    finally:
+        transport.close()
+    return list(candidates.values())
+
+
+async def probe_reachable_devices(*, port: int = BEACON_PORT, duration_s: float = 1.5) -> dict[str, str]:
+    """Passively listen for *regular* (non-pairing) discovery beacons for a
+    short, bounded window and return {pubkey: ticket} for everyone heard --
+    a best-effort "who's reachable on this LAN right now" check.
+
+    Used two ways: `device list`'s online flag (is a paired device's pubkey
+    in the result?), and `device sync`'s actual reconciliation (devices.json
+    stores only a pubkey/name/platform -- the human already verified via
+    SAS, never an address -- so this is how a one-shot `roastmesh device
+    sync` invocation finds a ticket to dial a paired device with at all).
+
+    Deliberately does NOT broadcast anything of its own (unlike run_beacon):
+    this is a passive listen for a one-shot command, not a node trying to
+    be found. Only as good as whoever else happens to already be beaconing
+    within this window -- a real, reachable device that isn't currently
+    running with LAN discovery enabled, or whose beacon just didn't land in
+    this short a listen, is simply absent from the result, not "offline".
+    """
+    loop = asyncio.get_running_loop()
+    seen: dict[str, str] = {}
+
+    class _ProbeProtocol(asyncio.DatagramProtocol):
+        def error_received(self, exc: Exception) -> None:
+            print(f"lan: probe socket error: {exc!r}", flush=True)
+
+        def datagram_received(self, data: bytes, addr) -> None:
+            decoded = decode_hello(data)
+            if decoded is None:
+                return
+            pubkey, ticket, pairing, _code, _hostname = decoded
+            if not pairing:  # a regular beacon, not another device mid-pairing
+                seen[pubkey] = ticket
+
+    sock = udp_socket(port)
+    if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    _join_multicast(sock)
+    transport, _ = await loop.create_datagram_endpoint(_ProbeProtocol, sock=sock)
+    try:
+        await asyncio.sleep(duration_s)
+    finally:
+        transport.close()
+    return seen
 
 
 def _join_multicast(sock: socket.socket) -> None:
