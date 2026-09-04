@@ -1,6 +1,6 @@
 [project]
 name = "roastmesh"
-version = "0.6.16"
+version = "0.6.17"
 description = "Local parser, metadata extractor, and search index for Artisan .alog roast profiles -- the standalone building block for a P2P roast-profile sharing network."
 requires-python = ">=3.10"
 # PolyForm Noncommercial License 1.0.0 (see LICENSE): free to use, modify, fork
@@ -48,3 +48,5 @@ where = ["src"]
 [tool.setuptools.package-data]
 "roastmesh.index" = ["schema.sql"]
 "roastmesh.gui" = ["locales/*.json"]
+"roastmesh.gui.data" = ["*.bin.gz"]
+"roastmesh.gui.data.flags" = ["*.png"]

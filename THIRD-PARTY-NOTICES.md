@@ -37,3 +37,13 @@ implementation, which Transmission merely bundles) and from libtorrent
 (BSD-3-Clause). Algorithms and numeric constants are not copyrightable, and no
 verbatim third-party source is included; the file is a clean re-implementation.
 No GPL-licensed source is copied into roastmesh.
+
+## Bundled data
+
+- **IP-to-country database** (`src/roastmesh/gui/data/ip2country.bin.gz`) — built
+  from **DB-IP IP to Country Lite**, licensed **CC-BY-4.0**. IP geolocation by
+  DB-IP (https://db-ip.com). Used offline to show a peer's country; no address
+  ever leaves the machine.
+- **Country flag icons** (`src/roastmesh/gui/data/flags/*.png`) — the
+  **famfamfam "Flag" icon set** by Mark James (https://famfamfam.com), released
+  into the **public domain**.

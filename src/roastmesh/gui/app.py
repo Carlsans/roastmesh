@@ -41,6 +41,7 @@ from roastmesh.gui import chart as chart_mod
 from roastmesh.gui import theme
 from roastmesh.gui.widgets import (
     FONT_BOLD,
+    FONT_SMALL,
     FONT_H2,
     FONT_MONO,
     AutocompleteField,
@@ -362,16 +363,25 @@ class SearchTab(Tab):
 
         self.all_users_frame.pack(fill="x")  # default mode is MODE_ALL
 
-        self.roast_type = Field(self, t("Roast type"), help_text=t("e.g. 'full city', 'vienna'."))
-        self.dtr_min = Field(self, t("DTR min %"), width=8)
-        self.dtr_max = Field(self, t("DTR max %"), width=8)
-        self.drop_after = Field(self, t("Drop after (°C)"), width=8)
+        # Filters in two balanced columns instead of one long single-file stack,
+        # paired by row so DTR min/max sit side by side. Each Field self-packs
+        # vertically within its column frame.
+        filters = ttk.Frame(self)
+        filters.pack(fill="x", padx=6, pady=(2, 0))
+        col_l = ttk.Frame(filters)
+        col_l.pack(side="left", fill="both", expand=True)
+        col_r = ttk.Frame(filters)
+        col_r.pack(side="left", fill="both", expand=True)
+        self.roast_type = Field(col_l, t("Roast type"), help_text=t("e.g. 'full city', 'vienna'."))
+        self.dtr_min = Field(col_l, t("DTR min %"), width=8)
+        self.drop_after = Field(col_l, t("Drop after (°C)"), width=8)
         # Options are logic values compared in _build_args below, not
         # display text -- Choice has no separate display/value split, so
         # the dropdown itself stays in English ("any"/"yes"/"no") while the
         # label above it is translated. A user typing a search filter
         # dropdown is a smaller translation gap than breaking the filter.
-        self.second_crack = Choice(self, t("After second crack?"), ["any", "yes", "no"], default="any")
+        self.second_crack = Choice(col_r, t("After second crack?"), ["any", "yes", "no"], default="any")
+        self.dtr_max = Field(col_r, t("DTR max %"), width=8)
 
         self.lan_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -882,15 +892,19 @@ class NetworkTab(Tab):
         self.diag_task: Task | None = None
         self._closed = False
 
-        heading(self, t("Network"), t("Serve your feed to peers, and pull theirs."))
-        explain(self, t("The network is on automatically while this app is running -- peers on your "
+        # Scrollable so all its sections read without shrinking the whole app --
+        # the consoles/table want full width, so one scrolling column beats two.
+        body = scrollable(self)
+
+        heading(body, t("Network"), t("Serve your feed to peers, and pull theirs."))
+        explain(body, t("The network is on automatically while this app is running -- peers on your "
                          "local network are found and synced with on their own, no clicking needed. "
                          "Internet-wide discovery (Settings tab) finds peers beyond your LAN the same "
                          "way, if you've turned it on. For a peer discovery won't reach, share the "
                          "ticket shown below with them, or paste theirs under 'Sync with a peer'. "
                          "Changes made in Settings apply the next time you Stop then Start serving."))
 
-        serve_section = section(self, t("Serve your feed"))
+        serve_section = section(body, t("Serve your feed"))
         tk.Label(serve_section, text=t("Your ticket:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG).pack(
             anchor="w", padx=10, pady=(6, 0))
         ticket_row = ttk.Frame(serve_section)
@@ -901,14 +915,21 @@ class NetworkTab(Tab):
         ttk.Button(ticket_row, text=t("Copy"), command=self._copy_ticket).pack(side="left", padx=(6, 0))
         self.serve_runbar = RunBar(serve_section, t("Start serving"), self._on_start_serve, self._on_stop_serve)
         self.serve_console = Console(serve_section, height=4)
+        debug_row = ttk.Frame(serve_section)
+        debug_row.pack(fill="x", padx=10, pady=(2, 6))
+        self.debug_logging = tk.BooleanVar(value=False)
+        ttk.Checkbutton(debug_row, text=t("Verbose network logging (for diagnostics)"),
+                        variable=self.debug_logging, command=self._on_toggle_debug).pack(side="left")
+        ttk.Button(debug_row, text=t("Save diagnostics log..."),
+                   command=self._on_save_diag_log).pack(side="left", padx=(12, 0))
 
-        sync_section = section(self, t("Sync with a peer"))
+        sync_section = section(body, t("Sync with a peer"))
         self.peer_ticket_field = Field(sync_section, t("Peer's ticket"),
                                         help_text=t("Paste the ticket they shared with you."))
         self.sync_runbar = RunBar(sync_section, t("Sync"), self._on_sync, self._on_cancel_sync)
         self.sync_console = Console(sync_section, height=4)
 
-        diag_section = section(self, t("Internet discovery"))
+        diag_section = section(body, t("Internet discovery"))
         explain(diag_section, t(
             "Finding peers beyond your local network relies on the public BitTorrent DHT, "
             "and it is the one part of roastmesh that can fail completely while looking "
@@ -939,7 +960,7 @@ class NetworkTab(Tab):
                                   self._on_diag, self._on_cancel_diag)
         self.diag_console = Console(diag_section, height=3)
 
-        peers_section = section(self, t("Known peers"))
+        peers_section = section(body, t("Known peers"))
         self.peers_table = PeerTable(peers_section)
 
         self._on_start_serve()
@@ -988,6 +1009,8 @@ class NetworkTab(Tab):
             return
         argv = roastmesh_argv("--db", self.app.db_path.get(), "node", "serve",
                               "--publish-watch-dir", self.app.watch_dir.get())
+        if getattr(self, "debug_logging", None) is not None and self.debug_logging.get():
+            argv.append("--debug")
         if self.app.wan_discovery_enabled.get():
             argv.append("--wan-discovery")
             port = self.app.public_port.get().strip().lower()
@@ -1041,6 +1064,58 @@ class NetworkTab(Tab):
     def _on_stop_serve(self) -> None:
         if self.serve_task is not None:
             self.serve_task.cancel()
+
+    def _on_toggle_debug(self) -> None:
+        """Apply verbose logging by restarting serving with (or without) --debug --
+        the same stop-then-start the WAN toggle relies on."""
+        if self.serve_task is not None and self.serve_task.running:
+            self._on_stop_serve()
+            self.after(700, self._on_start_serve)
+        else:
+            self._on_start_serve()
+
+    def _on_save_diag_log(self) -> None:
+        """Write everything the Network tab has captured (serve + sync + discovery
+        consoles) plus a fresh `node doctor` to a file the user can attach when
+        reporting a problem. node doctor runs off the UI thread (~a minute); the
+        file is written when it finishes."""
+        path = filedialog.asksaveasfilename(
+            title=t("Save diagnostics log"), defaultextension=".log",
+            initialfile="roastmesh-debug.log",
+            filetypes=[(t("Log file"), "*.log"), (t("All files"), "*.*")])
+        if not path:
+            return
+        import roastmesh
+        header = "\n".join([
+            "=== roastmesh diagnostics log ===",
+            t("Attach this file when reporting a problem."),
+            f"version: {roastmesh.__version__}",
+            "",
+            "--- serve output ---",
+            self.serve_console.text.get("1.0", "end").rstrip(),
+            "",
+            "--- sync output ---",
+            self.sync_console.text.get("1.0", "end").rstrip(),
+            "",
+            "--- internet-discovery output ---",
+            self.diag_console.text.get("1.0", "end").rstrip(),
+            "",
+            "--- node doctor ---",
+            "",
+        ])
+        self.diag_console.append("\n" + t("Saving diagnostics log (running node doctor)...") + "\n")
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("node", "doctor"))
+        task.start()
+
+        def _done(_code: int) -> None:
+            try:
+                Path(path).write_text(header + "".join(buf), encoding="utf-8")
+                self.diag_console.append(t("Saved to {path}", path=path) + "\n")
+            except OSError as exc:
+                self.diag_console.append(t("Could not save log: {error}", error=str(exc)) + "\n")
+
+        stream_into(task, buf.append, _done, lambda ms, fn: self.after(ms, fn))
 
     def _on_serve_finished(self, code: int) -> None:
         self.serve_runbar.set_running(False, t("stopped") if code == 0 else t("stopped (exit {code})", code=code))
@@ -1252,13 +1327,6 @@ class SettingsTab(Tab):
         self._load_profile()
         self._load_machine_catalogue()
 
-        db_section = section(container, t("Database file"))
-        explain(db_section, t("Where your local search index lives. Search, Publish, and Network "
-                               "all use this. Existing tabs pick up a change the next time they run."))
-        self.db_field = Field(db_section, t("Path"), variable=self.app.db_path, width=60)
-        ttk.Button(db_section, text=t("Browse..."), command=self._browse_db).pack(
-            padx=10, pady=(0, 8), anchor="w")
-
         watch_section = section(container, t("Shared publish folder"))
         explain(watch_section, t("Any .alog file dropped here is published automatically while "
                                   "the Network tab is serving -- see the Publish tab."))
@@ -1279,7 +1347,18 @@ class SettingsTab(Tab):
                   "restarts on its own when you change this, so the ticket on the Network "
                   "tab will change."))
         ttk.Checkbutton(wan_section, text=t("Find peers over the whole internet, not just my LAN"),
-                         variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 8))
+                         variable=self.app.wan_discovery_enabled).pack(anchor="w", padx=10, pady=(0, 2))
+        # A visible caution (not just a tooltip) when it's off: without WAN the
+        # app only ever sees LAN peers, which for most people is nobody.
+        self._wan_caution = tk.Label(
+            wan_section,
+            text=t("Off: roastmesh can only find peers on your own network -- for most people "
+                   "that means it won't find or share roasts with anyone. Leave this on unless "
+                   "you have a reason not to."),
+            font=FONT_SMALL, fg=theme.ACCENT, bg=theme.BG, anchor="w",
+            wraplength=sp(840), justify="left")
+        self._update_wan_caution()
+        self.app.wan_discovery_enabled.trace_add("write", lambda *_a: self._update_wan_caution())
         port_field = Field(wan_section, t("Forwarded port (optional)"), variable=self.app.public_port,
               help_text=t("Type 'auto' to ask your router for one, or a number if your "
                           "router or VPN already forwards a port here. Leave empty if "
@@ -1338,14 +1417,37 @@ class SettingsTab(Tab):
                   "Ctrl+plus/Ctrl+minus) to adjust it, Ctrl+0 to go back to auto-detect. "
                   "Restarts roastmesh to apply, the same as Stop-then-Start serving does.",
                   pct=round(widgets.UI_SCALE * 100)))
+        scale_row = ttk.Frame(scale_section)
+        scale_row.pack(anchor="w", padx=10, pady=(0, 8))
+        tk.Label(scale_row, text=t("Scale"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG).pack(side="left")
+        self._scale_var = tk.StringVar(value=f"{widgets.UI_SCALE:.2f}")
+        scale_spin = ttk.Spinbox(scale_row, from_=widgets.MIN_UI_SCALE, to=widgets.MAX_UI_SCALE,
+                                 increment=0.1, width=6, textvariable=self._scale_var)
+        scale_spin.pack(side="left", padx=(8, 0))
+        # Apply (which restarts) on commit only -- Return or leaving the box --
+        # not on every arrow click, and only if the value actually changed.
+        scale_spin.bind("<Return>", lambda _e: self._on_scale_apply())
+        scale_spin.bind("<FocusOut>", lambda _e: self._on_scale_apply())
+        tk.Label(scale_row, text=t("x (e.g. 1.0 = normal, 2.0 = double)"), font=FONT_SMALL,
+                 bg=theme.BG, fg=theme.MUTED).pack(side="left", padx=(6, 0))
 
-    def _browse_db(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title=t("Choose a database file"), defaultextension=".sqlite3",
-            filetypes=[(t("SQLite database"), "*.sqlite3"), (t("All files"), "*.*")],
-        )
-        if path:
-            self.app.db_path.set(path)
+    def _update_wan_caution(self) -> None:
+        if self.app.wan_discovery_enabled.get():
+            self._wan_caution.pack_forget()
+        else:
+            self._wan_caution.pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _on_scale_apply(self) -> None:
+        try:
+            val = float(self._scale_var.get().replace(",", "."))
+        except ValueError:
+            self._scale_var.set(f"{widgets.UI_SCALE:.2f}")
+            return
+        val = max(widgets.MIN_UI_SCALE, min(widgets.MAX_UI_SCALE, val))
+        if abs(val - widgets.UI_SCALE) < 0.01:
+            self._scale_var.set(f"{val:.2f}")   # no real change -> no restart
+            return
+        self.app._relaunch_with_scale(val)   # persists + restarts, like Ctrl+scroll
 
     def _browse_watch_dir(self) -> None:
         path = filedialog.askdirectory(title=t("Choose a folder to auto-publish from"))
@@ -1431,6 +1533,10 @@ class SettingsTab(Tab):
 class RoastmeshApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        # ROASTMESH_SKIP_WIZARD lets tests/automation build the app without the
+        # modal first-run wizard (which would block on wait_window).
+        first_run = (not gui_config.config_path().exists()
+                     and not os.environ.get("ROASTMESH_SKIP_WIZARD"))
         cfg = gui_config.load_config()
         # None until a user overrides it via Ctrl+scroll/Ctrl+plus/minus --
         # kept separately from widgets.UI_SCALE (the resolved, in-effect
@@ -1472,6 +1578,19 @@ class RoastmeshApp(tk.Tk):
         # for why a language switch applies on next launch rather than
         # rebuilding live).
         i18n.set_language(i18n.resolve_language(cfg.language))
+
+        # First launch (no config file yet): run the setup wizard before the
+        # window's tabs exist. It returns the config to save -- the user's
+        # choices, or the defaults unchanged if skipped -- and saving it also
+        # marks first-run as done so it never shows again. Hidden main window
+        # behind it so a new user sees only the wizard.
+        if first_run:
+            from roastmesh.gui import wizard
+            cfg, chosen_lang = wizard.run(self, cfg)
+            self.resolved_theme = theme.apply(self, cfg.theme)   # wizard may have changed theme
+            self.configure(bg=theme.BG)
+            i18n.set_language(i18n.resolve_language(chosen_lang))
+            gui_config.save_config(cfg)
 
         self.db_path = tk.StringVar(value=cfg.db_path)
         self.watch_dir = tk.StringVar(value=cfg.watch_dir)

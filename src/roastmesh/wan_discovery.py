@@ -419,6 +419,7 @@ async def run_wan_discovery(
     allow_loopback: bool = False,
     public_port: int | None = None,
     auto_port: bool = False,
+    debug: bool = False,
 ) -> None:
     """Announce on the public DHT and react to other roastmesh nodes found
     there, until cancelled. `on_peer_discovered(pubkey, ticket)` is
@@ -447,6 +448,8 @@ async def run_wan_discovery(
     `on_round` receives each round's LookupStats (used by the logs and by
     `roastmesh net doctor`) -- without it a failing round is invisible.
     """
+    if debug:
+        print("wan: debug logging enabled -- wan-stats emitted every lookup round", flush=True)
     bootstrap_nodes = bootstrap_nodes if bootstrap_nodes is not None else DEFAULT_DHT_BOOTSTRAP
     state_path = node_cache_path if node_cache_path is not None else default_state_path()
     own_seed = bytes.fromhex(own_pubkey_hex)

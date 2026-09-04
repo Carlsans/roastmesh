@@ -82,6 +82,10 @@ from roastmesh.watch_folder import publish_new_files
 
 ALPN = b"roastmesh/peer-sync/0"
 
+# Verbose network logging, toggled by serve(debug=...) / `node serve --debug`.
+# Read by the discovery/sync loops to print extra detail for a diagnostics log.
+_DEBUG = False
+
 # Peers are dropped after this long unseen, and the sweep runs this often.
 # `peer prune` has existed since early on and nothing ever called it, so in
 # practice the list only grew: measured on a real node at 764 entries, 746 of
@@ -525,6 +529,10 @@ async def _auto_sync_discovered_peer(
     verify_msg = "OK" if report.verify.ok else f"INVALID: {report.verify.error}"
     print(f"{source}: synced with {peer_pubkey_hex[:16]}...: {report.new_entry_count} new entries, feed {verify_msg}",
           flush=True)
+    if _DEBUG:
+        print(f"{source}: debug: peer advertised {len(report.held_feeds)} feed(s), "
+              f"pulled {len(report.pulled_feeds)}, quota held_back={report.quota.held_back}, "
+              f"peers_known={report.peers_known}", flush=True)
 
     # Two independent things can each need the DB, and neither implies the
     # other: new feed entries to ingest, and a profile to persist so this
@@ -684,6 +692,7 @@ async def serve(
     publish_watch_interval_s: float = 10.0,
     replicate: bool = True,
     replication_budget: int = replication.DEFAULT_REPLICATION_BUDGET,
+    debug: bool = False,
 ) -> None:
     """Bind a node and serve get_peers/get_feed requests forever.
 
@@ -740,6 +749,11 @@ async def serve(
         if muted:
             print(f"serve: ROASTMESH_DISCOVERY_OFFLINE is set -- disabled {' and '.join(muted)}",
                   flush=True)
+
+    global _DEBUG
+    _DEBUG = debug
+    if debug:
+        print("serve: debug logging enabled -- verbose discovery/sync detail follows", flush=True)
 
     ep = await bind_endpoint(identity, alpns=[ALPN], relay=relay)
     if relay:
@@ -809,7 +823,7 @@ async def serve(
         background_tasks.append(asyncio.create_task(run_wan_discovery(
             identity.public_key_hex, ticket, _on_wan_discovered,
             port=wan_discovery_port, lookup_interval_s=wan_discovery_interval_s,
-            public_port=wan_public_port, auto_port=wan_auto_port,
+            public_port=wan_public_port, auto_port=wan_auto_port, debug=debug,
         )))
 
     if publish_watch_dir is not None:

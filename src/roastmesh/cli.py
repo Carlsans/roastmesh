@@ -20,7 +20,8 @@ from roastmesh.index import repository as repo
 from roastmesh.index.db import connect, get_meta, set_meta
 from roastmesh.index.ingest import ingest_feed, ingest_file, ingest_path, refresh_known_sources
 from roastmesh.machines import list_machines, slugify
-from roastmesh.peers import Peer, default_peers_path, load_peers, node_id_from_ticket, prune_stale, save_peers, upsert_peer
+from roastmesh.peers import (Peer, default_peers_path, load_peers, node_id_from_ticket,
+                             prune_stale, public_ip_from_ticket, save_peers, upsert_peer)
 from roastmesh.profile import load_or_default_profile, update_and_sign
 from roastmesh.usernames import default_display_name
 from roastmesh.watch_folder import default_watch_dir
@@ -474,6 +475,9 @@ def node() -> None:
                    "(default: ~/RoastMeshShare).")
 @click.option("--no-publish-watch", is_flag=True,
               help="Don't auto-publish files from the watch folder.")
+@click.option("--debug", "debug_logging", is_flag=True,
+              help="Verbose network logging for diagnostics -- extra DHT/sync detail. "
+                   "The GUI's Network tab can turn this on and save the log to send for support.")
 @click.option("--no-replicate", is_flag=True,
               help="Don't mirror other users' feeds for resilience. By default this node "
                    "keeps a bounded cache of feeds it learns about (even ones it never "
@@ -490,7 +494,7 @@ def node_serve(
     no_relay: bool, no_lan_discovery: bool, wan_discovery: bool,
     wan_port: int | None, public_port: str | None,
     publish_watch_dir: Path | None, no_publish_watch: bool,
-    no_replicate: bool, replication_budget: str | None,
+    no_replicate: bool, replication_budget: str | None, debug_logging: bool,
 ) -> None:
     """Listen for peer connections and answer get_peers/get_feed requests.
 
@@ -518,7 +522,7 @@ def node_serve(
         ident, feed_dir, peers_file, relay=not no_relay,
         db_path=ctx.obj["db_path"], enable_lan_discovery=not no_lan_discovery,
         enable_wan_discovery=wan_discovery, publish_watch_dir=watch_dir,
-        replicate=not no_replicate, replication_budget=budget,
+        replicate=not no_replicate, replication_budget=budget, debug=debug_logging,
         **({"wan_discovery_port": wan_port} if wan_port else {}),
         **({"wan_public_port": fixed_port} if fixed_port else {}),
         **({"wan_auto_port": True} if auto_port else {}),
@@ -905,7 +909,9 @@ def peer_list(ctx: click.Context, as_json: bool) -> None:
     """List known peers."""
     peers = load_peers(ctx.obj["peers_file"])
     if as_json:
-        click.echo(json.dumps([asdict(p) for p in peers]))
+        # ip: the peer's public address parsed from its ticket (None if LAN/relay
+        # only) -- the GUI turns it into a country flag. Additive; text output unchanged.
+        click.echo(json.dumps([{**asdict(p), "ip": public_ip_from_ticket(p.ticket)} for p in peers]))
         return
     if not peers:
         click.echo("no known peers")

@@ -19,5 +19,9 @@ import os
 from roastmesh import asyncio_policy
 
 os.environ.setdefault("ROASTMESH_DISCOVERY_OFFLINE", "1")
+# Every GUI test builds RoastmeshApp with a throwaway HOME (no config), which
+# is exactly the first-run condition -- without this the modal setup wizard
+# would appear and block on wait_window. See RoastmeshApp.__init__.
+os.environ.setdefault("ROASTMESH_SKIP_WIZARD", "1")
 
 asyncio_policy.apply()

@@ -80,6 +80,31 @@ def node_id_from_ticket(ticket: str) -> str | None:
         return None
 
 
+@lru_cache(maxsize=8192)
+def public_ip_from_ticket(ticket: str) -> str | None:
+    """The first public IPv4 among a ticket's direct addresses, or None.
+
+    A ticket pins the addresses a peer advertised when it minted the ticket; a
+    WAN-reachable peer's include its public IP, a LAN-only or relay-only peer's
+    do not (so those get no country flag). Cached the same way node_id_from_ticket
+    is -- a ticket is an immutable string."""
+    import ipaddress
+    try:
+        addrs = iroh.EndpointTicket.from_string(ticket).endpoint_addr().direct_addresses()
+    except Exception:
+        return None
+    for a in addrs or []:
+        host = str(a).rsplit(":", 1)[0].strip("[]")
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if ip.version == 4 and not (ip.is_private or ip.is_loopback
+                                    or ip.is_link_local or ip.is_reserved):
+            return str(ip)
+    return None
+
+
 def upsert_peer(peers: list[Peer], new: Peer) -> list[Peer]:
     """Merge `new` into `peers`, deduping by node id. On conflict, `ticket`/
     `last_seen`/`feed_pubkey_hex` always update to the newer values, but a

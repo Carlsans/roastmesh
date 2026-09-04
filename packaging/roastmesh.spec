@@ -70,6 +70,9 @@ sv_datas, sv_binaries, sv_hiddenimports = collect_all("sv_ttk")
 package_datas = [
     (str(SRC / "roastmesh" / "index" / "schema.sql"), "roastmesh/index"),
     (str(SRC / "roastmesh" / "gui" / "locales"), "roastmesh/gui/locales"),
+    # Offline IP->country table + flag PNGs for the peers list, loaded at
+    # runtime via importlib.resources (gui/geoip.py, gui/flags.py).
+    (str(SRC / "roastmesh" / "gui" / "data"), "roastmesh/gui/data"),
     *iroh_datas,
     *sv_datas,
 ]

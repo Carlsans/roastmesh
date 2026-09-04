@@ -18,10 +18,16 @@ from roastmesh.gui import theme
 from roastmesh.gui import units
 from roastmesh.gui.i18n import t, tn
 
-FONT = ("TkDefaultFont", 10)
-FONT_BOLD = ("TkDefaultFont", 10, "bold")
-FONT_H1 = ("TkDefaultFont", 15, "bold")
-FONT_H2 = ("TkDefaultFont", 11, "bold")
+# A single, even type scale so sizes read as a deliberate ladder rather than a
+# handful of near-identical ad-hoc values. Two steps between each: caption 9 <
+# body 10 < section 12 < title 14. Everything below uses these -- no bare
+# ("TkDefaultFont", 9) sprinkled around, which is what made the sizes feel
+# unbalanced before.
+FONT_SMALL = ("TkDefaultFont", 9)          # captions, tooltips, status lines
+FONT = ("TkDefaultFont", 10)               # body text, labels, inputs
+FONT_BOLD = ("TkDefaultFont", 10, "bold")  # field labels
+FONT_H2 = ("TkDefaultFont", 12, "bold")    # section headings
+FONT_H1 = ("TkDefaultFont", 14, "bold")    # tab title
 FONT_MONO = ("TkFixedFont", 9)
 
 
@@ -148,6 +154,83 @@ def maximize(window) -> bool:
         return False
 
 
+class Tooltip:
+    """A hover tooltip: complementary detail shown only when the pointer rests on
+    a widget, so forms stay uncluttered (progressive disclosure). Bound to a
+    small info affordance rather than a whole field, so moving onto the entry
+    never makes it flicker. Themed, and torn down with its widget."""
+
+    def __init__(self, widget: tk.Widget, text: str, *, delay_ms: int = 400) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay = delay_ms
+        self._after: str | None = None
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _schedule(self, _e: tk.Event | None = None) -> None:
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _show(self) -> None:
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + sp(14)
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + sp(4)
+            screen_w = self.widget.winfo_screenwidth()
+        except tk.TclError:
+            return
+        tip = tk.Toplevel(self.widget)
+        # Built withdrawn, then positioned, then shown -- so it never flashes at
+        # a default position (or unpainted) before landing where it belongs.
+        tip.withdraw()
+        tip.wm_overrideredirect(True)
+        # Outer colour is the 1px border; the label is the body -- so the popup
+        # never shows the system default (black) at its edges.
+        tip.configure(bg=theme.BORDER)
+        tk.Label(tip, text=self.text, font=FONT_SMALL, justify="left",
+                 bg=theme.SURFACE, fg=theme.FG, wraplength=sp(360),
+                 padx=sp(9), pady=sp(6)).pack(padx=1, pady=1)
+        # Keep it on-screen: an icon near the right edge would otherwise push
+        # the popup off the display (measured after layout, then clamped).
+        tip.update_idletasks()
+        w = tip.winfo_reqwidth()
+        if x + w > screen_w - sp(8):
+            x = max(sp(8), screen_w - w - sp(8))
+        tip.wm_geometry(f"+{x}+{y}")
+        tip.deiconify()
+        self._tip = tip
+
+    def _hide(self, _e: tk.Event | None = None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except tk.TclError:
+                pass
+            self._after = None
+
+
+def bind_tooltip(widget: tk.Widget, text: str) -> None:
+    if text:
+        Tooltip(widget, text)
+
+
+def _info_icon(parent: tk.Widget) -> tk.Label:
+    """The small muted affordance that reveals a field's help on hover."""
+    return tk.Label(parent, text="\u24d8", font=FONT_SMALL, fg=theme.MUTED,
+                    bg=theme.BG, cursor="question_arrow")
+
+
 def heading(parent: tk.Widget, text: str, sub: str = "") -> ttk.Frame:
     """A tab's title and one-line purpose."""
     frame = ttk.Frame(parent)
@@ -160,10 +243,13 @@ def heading(parent: tk.Widget, text: str, sub: str = "") -> ttk.Frame:
 
 
 def explain(parent: tk.Widget, text: str) -> tk.Label:
-    """A block of plain-language explanation of what a screen is for."""
-    lbl = tk.Label(parent, text=text.strip(), font=FONT, fg=theme.FG, bg=theme.BG,
-                   wraplength=sp(900), justify="left", anchor="w")
-    lbl.pack(fill="x", padx=14, pady=(6, 4))
+    """Plain-language explanation of a screen, shown only on hover. Replaces a
+    big always-on paragraph with a small hoverable "\u24d8" affordance so the
+    screen stays uncluttered but the help is one hover away."""
+    lbl = tk.Label(parent, text="\u24d8", font=FONT_SMALL,
+                   fg=theme.MUTED, bg=theme.BG, anchor="w", cursor="question_arrow")
+    lbl.pack(anchor="w", padx=14, pady=(2, 4))
+    bind_tooltip(lbl, text.strip())
     return lbl
 
 
@@ -187,7 +273,7 @@ class Field(ttk.Frame):
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=22,
+        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
                  anchor="w").pack(side="left")
         # `variable`, when given, is a StringVar owned by the caller (e.g.
         # RoastmeshApp) rather than one this Field creates for itself -- lets
@@ -203,9 +289,9 @@ class Field(ttk.Frame):
         self.entry = ttk.Entry(row, textvariable=self.var, width=width)
         self.entry.pack(side="left", fill="x", expand=True)
         if help_text:
-            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=theme.MUTED,
-                     bg=theme.BG, wraplength=sp(840), justify="left", anchor="w").pack(
-                fill="x", padx=(sp(224), 0), pady=(1, 0))
+            icon = _info_icon(row)
+            icon.pack(side="right", padx=(sp(6), 0))
+            bind_tooltip(icon, help_text)
 
     def get(self) -> str:
         return self.var.get().strip()
@@ -223,15 +309,15 @@ class Choice(ttk.Frame):
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=22,
+        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
                  anchor="w").pack(side="left")
         self.var = tk.StringVar(value=default or (options[0] if options else ""))
         ttk.Combobox(row, textvariable=self.var, values=options, width=26,
                      state="readonly").pack(side="left")
         if help_text:
-            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=theme.MUTED,
-                     bg=theme.BG, wraplength=sp(840), justify="left", anchor="w").pack(
-                fill="x", padx=(sp(224), 0), pady=(1, 0))
+            icon = _info_icon(row)
+            icon.pack(side="right", padx=(sp(6), 0))
+            bind_tooltip(icon, help_text)
 
     def get(self) -> str:
         return self.var.get().strip()
@@ -260,7 +346,7 @@ class AutocompleteField(ttk.Frame):
         self.pack(fill="x", padx=10, pady=(6, 2))
         row = ttk.Frame(self)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG, width=22,
+        tk.Label(row, text=label, font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
                  anchor="w").pack(side="left")
         self._all_values: list[str] = list(values or [])
         if variable is not None:
@@ -277,9 +363,9 @@ class AutocompleteField(ttk.Frame):
         # a value that isn't in the list at all (e.g. a custom machine).
         self.combo.bind("<KeyRelease>", self._on_key_release)
         if help_text:
-            tk.Label(self, text=help_text, font=("TkDefaultFont", 9), fg=theme.MUTED,
-                     bg=theme.BG, wraplength=sp(840), justify="left", anchor="w").pack(
-                fill="x", padx=(sp(224), 0), pady=(1, 0))
+            icon = _info_icon(row)
+            icon.pack(side="right", padx=(sp(6), 0))
+            bind_tooltip(icon, help_text)
 
     def set_values(self, values: list[str]) -> None:
         self._all_values = list(values)
@@ -291,7 +377,19 @@ class AutocompleteField(ttk.Frame):
         # recompute it from whatever partial text happens to be typed.
         if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Tab", "Escape"):
             return
-        self.combo.configure(values=self._filter_values(self._all_values, self.var.get()))
+        typed = self.var.get()
+        filtered = self._filter_values(self._all_values, typed)
+        self.combo.configure(values=filtered)
+        # Show the filtered suggestions live as the user types -- post the
+        # dropdown, then hand focus straight back to the entry so typing keeps
+        # going. Only when there's text and something to suggest.
+        if typed and filtered:
+            try:
+                self.combo.tk.call("ttk::combobox::Post", self.combo)
+                self.combo.focus_set()
+                self.combo.icursor("end")
+            except tk.TclError:
+                pass
 
     @staticmethod
     def _filter_values(values: list[str], typed: str) -> list[str]:
@@ -533,38 +631,65 @@ class ResultsTable(ttk.Frame):
 
 
 _PEER_COLUMNS = [
-    ("feed_pubkey_hex", "Pubkey", 280),
-    ("last_seen", "Last seen", 220),
-    ("added_via", "Via", 90),
+    ("ip", "IP", 150),
+    ("feed_pubkey_hex", "Pubkey", 200),
+    ("last_seen", "Last seen", 180),
+    ("added_via", "Via", 80),
 ]
 
 
 class PeerTable(ttk.Frame):
-    """Known-peer list for the Network tab."""
+    """Known-peer list for the Network tab, with a country flag per peer.
+
+    The leading tree column (#0) carries the flag image + ISO code -- Treeview
+    only renders an image in #0, so that is where it goes; the rest are plain
+    columns. IP/country come from the peer's ticket (peer list --json includes
+    the public IP; gui.geoip maps it to a country, gui.flags to an image)."""
 
     def __init__(self, parent: tk.Widget, height: int = 6) -> None:
         super().__init__(parent)
         self.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        # Hold every flag PhotoImage so Tk's image GC can't reclaim one that a
+        # row still references (the classic "images vanish" tkinter trap).
+        self._flag_refs: list = []
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(
-            wrap, columns=[c[0] for c in _PEER_COLUMNS], show="headings", height=height,
+            wrap, columns=[c[0] for c in _PEER_COLUMNS], show="tree headings", height=height,
         )
+        self.tree.heading("#0", text=t("Country"))
+        self.tree.column("#0", width=sp(110), stretch=False, anchor="w")
         for key, label, width in _PEER_COLUMNS:
             self.tree.heading(key, text=t(label))
             self.tree.column(key, width=sp(width), anchor="w")
         ybar = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=ybar.set)
+        xbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         ybar.pack(side="right", fill="y")
+        xbar.pack(fill="x")
 
     def set_rows(self, rows: list[dict]) -> None:
+        # Lazy import avoids a module cycle (flags imports widgets) and keeps the
+        # geo table off the import path until a peer list is actually shown.
+        from roastmesh.gui import flags, geoip
         self.tree.delete(*self.tree.get_children())
+        self._flag_refs = []
         for row in rows:
-            self.tree.insert("", "end", values=(
-                row.get("feed_pubkey_hex") or t("?"), row.get("last_seen") or "", row.get("added_via") or "",
-            ))
+            ip = row.get("ip")
+            cc = geoip.country_code(ip)
+            img = flags.flag_image(cc) if cc else None
+            if img is not None:
+                self._flag_refs.append(img)
+            pubkey = row.get("feed_pubkey_hex") or "?"
+            self.tree.insert(
+                "", "end",
+                text=(f" {cc}" if cc else ""), image=(img or ""),
+                values=(ip or t("LAN / relay"),
+                        (pubkey[:16] + "...") if len(pubkey) > 16 else pubkey,
+                        row.get("last_seen") or "", row.get("added_via") or ""),
+            )
 
 
 _USER_COLUMNS = [
