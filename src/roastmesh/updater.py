@@ -31,6 +31,7 @@ import json
 import os
 import platform
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,40 @@ def _is_newer(latest: str, current: str) -> bool:
     return _version_tuple(latest) > _version_tuple(current)
 
 
+# -- HTTPS --------------------------------------------------------------------
+
+# System CA bundle locations, most-common first. Debian/Ubuntu/Arch, then
+# Fedora/RHEL, then Alpine/BSD/macOS.
+_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """A verifying TLS context that actually finds a CA bundle inside a frozen
+    build.
+
+    A PyInstaller binary ships its own OpenSSL whose compiled-in cert path
+    (OPENSSLDIR) points at the *build container*, not the user's machine -- so
+    ssl.create_default_context()'s load_default_certs() finds nothing and every
+    HTTPS request fails with CERTIFICATE_VERIFY_FAILED (confirmed: the update
+    check worked only with SSL_CERT_FILE set). On Linux, add the system bundle
+    explicitly. Windows and macOS load the OS trust store here already, so these
+    Unix paths simply don't exist and are skipped."""
+    ctx = ssl.create_default_context()
+    if not ctx.get_ca_certs():
+        for path in _CA_BUNDLES:
+            try:
+                if os.path.exists(path):
+                    ctx.load_verify_locations(path)
+                    break
+            except OSError:
+                continue
+    return ctx
+
+
 # -- the check --------------------------------------------------------------
 
 def check_latest(current: str | None = None, timeout: float = _CHECK_TIMEOUT) -> UpdateInfo | None:
@@ -107,7 +142,7 @@ def check_latest(current: str | None = None, timeout: float = _CHECK_TIMEOUT) ->
                 "User-Agent": f"roastmesh/{roastmesh.__version__}",
             },
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 -- fixed https URL
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:  # noqa: S310
             data = json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 -- a failed check must be silent, never fatal
         return None
@@ -185,7 +220,8 @@ def is_supported() -> bool:
 def _download(url: str, dest: Path, progress: Progress) -> None:
     progress(f"downloading {url.rsplit('/', 1)[-1]} ...")
     req = urllib.request.Request(url, headers={"User-Agent": f"roastmesh/{roastmesh.__version__}"})
-    with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT) as resp, open(dest, "wb") as f:  # noqa: S310
+    with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT, context=_ssl_context()) as resp, \
+            open(dest, "wb") as f:  # noqa: S310
         shutil.copyfileobj(resp, f)
 
 

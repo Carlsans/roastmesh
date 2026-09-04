@@ -58,7 +58,7 @@ class _FakeResp:
 
 
 def _mock_api(monkeypatch, *, payload: dict | None = None, exc: Exception | None = None) -> None:
-    def fake(req, timeout=None):  # noqa: ANN001
+    def fake(req, timeout=None, context=None):  # noqa: ANN001
         if exc is not None:
             raise exc
         return _FakeResp(json.dumps(payload).encode("utf-8"))
