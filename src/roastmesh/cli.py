@@ -1333,5 +1333,57 @@ def gateway_serve(ctx: click.Context, host: str, port: int) -> None:
     server.serve_forever()
 
 
+@main.command("update")
+@click.option("--check", "check_only", is_flag=True,
+              help="Only report whether a newer release exists; do not install.")
+@click.option("--json", "as_json", is_flag=True, help="With --check, emit the result as JSON.")
+@click.option("--yes", is_flag=True, help="Install without the confirmation prompt.")
+@click.option("--relaunch-pid", type=int, default=None, hidden=True,
+              help="Internal: PID the Windows installer helper waits to exit before installing.")
+def update(check_only: bool, as_json: bool, yes: bool, relaunch_pid: int | None) -> None:
+    """Check for a newer roastmesh release and update this installation in place."""
+    from roastmesh import updater
+
+    current = roastmesh.__version__
+    info = updater.check_latest(current)
+    supported = updater.is_supported()
+
+    if check_only:
+        latest = info.latest_version if info else current
+        page = info.page_url if info else updater.RELEASES_PAGE
+        is_newer = bool(info and info.is_newer)
+        if as_json:
+            click.echo(json.dumps({
+                "current": current, "latest": latest, "is_newer": is_newer,
+                "supported": supported, "page_url": page, "checked": info is not None,
+            }))
+        elif info is None:
+            click.echo("could not check for updates (offline?)")
+        elif is_newer:
+            click.echo(f"update available: {latest} (you have {current})")
+        else:
+            click.echo(f"up to date ({current})")
+        return
+
+    if info is None:
+        raise click.ClickException("could not check for updates -- are you online?")
+    if not info.is_newer and not yes:
+        click.echo(f"already up to date ({current}).")
+        return
+    if not supported:
+        click.echo("auto-update isn't supported for this installation.")
+        click.echo(f"download the latest release from: {info.page_url}")
+        raise SystemExit(2)
+    if not yes:
+        click.confirm(f"Update from {current} to {info.latest_version} now?", abort=True)
+    try:
+        updater.perform_update(progress=lambda m: click.echo(m), wait_pid=relaunch_pid)
+    except updater.UpdateError as exc:
+        click.echo(f"update failed: {exc}")
+        click.echo(f"download the latest release from: {exc.page_url}")
+        raise SystemExit(2) from exc
+    click.echo("done.")
+
+
 if __name__ == "__main__":
     main()

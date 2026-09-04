@@ -23,5 +23,10 @@ os.environ.setdefault("ROASTMESH_DISCOVERY_OFFLINE", "1")
 # is exactly the first-run condition -- without this the modal setup wizard
 # would appear and block on wait_window. See RoastmeshApp.__init__.
 os.environ.setdefault("ROASTMESH_SKIP_WIZARD", "1")
+# The GUI checks GitHub for a newer release shortly after launch (a subprocess
+# `roastmesh update --check`). Under test that would be a real network call and
+# a spawned process for every RoastmeshApp built -- skip it. See
+# RoastmeshApp._start_update_check.
+os.environ.setdefault("ROASTMESH_SKIP_UPDATE_CHECK", "1")
 
 asyncio_policy.apply()

@@ -21,12 +21,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import webbrowser
 import tkinter as tk
 import tkinter.font as tkfont
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
+from roastmesh import updater
 from roastmesh.alog.curves import format_mmss
 from roastmesh.gui import config as gui_config
 from roastmesh.gui import i18n
@@ -1431,6 +1433,14 @@ class SettingsTab(Tab):
         tk.Label(scale_row, text=t("x (e.g. 1.0 = normal, 2.0 = double)"), font=FONT_SMALL,
                  bg=theme.BG, fg=theme.MUTED).pack(side="left", padx=(6, 0))
 
+        updates_section = section(container, t("Updates"))
+        explain(updates_section,
+                t("When on, roastmesh checks for a newer release on startup and shows a banner "
+                  "at the top when one is available. Nothing is downloaded or installed until "
+                  "you click that banner and confirm."))
+        ttk.Checkbutton(updates_section, text=t("Check for updates when roastmesh starts"),
+                        variable=self.app.check_for_updates).pack(anchor="w", padx=10, pady=(0, 8))
+
     def _update_wan_caution(self) -> None:
         if self.app.wan_discovery_enabled.get():
             self._wan_caution.pack_forget()
@@ -1598,9 +1608,16 @@ class RoastmeshApp(tk.Tk):
         self.public_port = tk.StringVar(value=cfg.public_port)
         self.temp_unit = tk.StringVar(value=cfg.temp_unit)
         self.language = tk.StringVar(value=i18n.current_language())
+        self.check_for_updates = tk.BooleanVar(value=cfg.check_for_updates)
         for var in (self.db_path, self.watch_dir, self.wan_discovery_enabled, self.public_port,
-                    self.temp_unit, self.language):
+                    self.temp_unit, self.language, self.check_for_updates):
             var.trace_add("write", lambda *_args: self._save_config())
+
+        # Auto-update banner state. _update_info holds the last check's result
+        # (the dict `roastmesh update --check --json` prints); the dismissed
+        # version keeps a passed-over update from nagging until a newer one.
+        self._update_info: dict | None = None
+        self._update_dismissed_version = cfg.update_dismissed_version
 
         # Theme has its own trace: unlike the others it also re-themes the live
         # window (Sun Valley switch + a token remap of raw tk widgets + a chart
@@ -1616,8 +1633,13 @@ class RoastmeshApp(tk.Tk):
         self.display_name = tk.StringVar(value="")
         self.own_machine = tk.StringVar(value="")
 
+        # Update banner: built now (hidden), packed above the notebook by
+        # _show_update_banner when the startup check finds a newer release.
+        self._build_update_banner()
+
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=6, pady=6)
+        self._notebook = notebook
 
         search_tab = SearchTab(notebook, self)
         publish_tab = PublishTab(notebook, self)
@@ -1664,6 +1686,11 @@ class RoastmeshApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Check for a newer release a moment after launch (off the UI thread,
+        # via a subprocess -- see _start_update_check). Delayed so it never
+        # competes with the window actually coming up.
+        self.after(1500, self._start_update_check)
+
     def _apply_discovery_change(self) -> None:
         """Restart serving so the new discovery setting takes effect now."""
         tab = getattr(self, "network_tab", None)
@@ -1700,15 +1727,18 @@ class RoastmeshApp(tk.Tk):
             new_scale = max(widgets.MIN_UI_SCALE, min(widgets.MAX_UI_SCALE, new_scale))
         self._ui_scale_override = new_scale
         self._save_config()
-        # Only *request* the restart here. Actually doing it from inside a Tk
-        # callback is what made this crash on Windows: `sys.exit()` raises
-        # SystemExit through the Tcl call stack, where Tkinter catches it and
-        # reports a traceback instead of exiting -- so the window was already
-        # destroyed, the process stayed alive, and the replacement it had just
-        # spawned immediately quit again because the single-instance guard saw
-        # the old process still holding the port. POSIX never showed this: execv
-        # replaces the process outright, so there is no callback to return to
-        # and no overlap. main() performs the restart after mainloop() ends.
+        self._relaunch()
+
+    def _relaunch(self) -> None:
+        """Request a full process restart, performed by main() after mainloop()
+        ends. Only *requested* here, never done inline: doing it from inside a Tk
+        callback crashed on Windows -- `sys.exit()` raises SystemExit through the
+        Tcl call stack, where Tkinter catches it and reports a traceback instead
+        of exiting, so the window was already destroyed, the process stayed
+        alive, and the replacement it had just spawned immediately quit again
+        because the single-instance guard saw the old process still holding the
+        port. POSIX never showed this: execv replaces the process outright, so
+        there is no callback to return to and no overlap."""
         self._relaunch_requested = True
         self._on_close()
 
@@ -1721,6 +1751,8 @@ class RoastmeshApp(tk.Tk):
             language=self.language.get(),
             ui_scale=self._ui_scale_override,
             theme=self.theme.get(),
+            check_for_updates=self.check_for_updates.get(),
+            update_dismissed_version=self._update_dismissed_version,
         ))
 
     def _on_theme_changed(self) -> None:
@@ -1738,6 +1770,122 @@ class RoastmeshApp(tk.Tk):
         for tab in self.tabs:
             tab.cancel()
         self.destroy()
+
+    # -- auto-update ---------------------------------------------------------
+
+    def _build_update_banner(self) -> None:
+        """A red, clickable bar shown above the tabs when a newer release is
+        found. Built hidden; _show_update_banner packs it before the notebook."""
+        self._update_banner = tk.Frame(self, bg=theme.DANGER, cursor="hand2")
+        self._update_label = tk.Label(
+            self._update_banner, text="", bg=theme.DANGER, fg=theme.DANGER_FG,
+            font=FONT_BOLD, cursor="hand2", anchor="w", padx=sp(12), pady=sp(6))
+        self._update_label.pack(side="left", fill="x", expand=True)
+        dismiss = tk.Label(self._update_banner, text="✕", bg=theme.DANGER, fg=theme.DANGER_FG,
+                           font=FONT_BOLD, cursor="hand2", padx=sp(12))
+        dismiss.pack(side="right")
+        for w in (self._update_banner, self._update_label):
+            w.bind("<Button-1>", lambda _e: self._on_update_clicked())
+        dismiss.bind("<Button-1>", lambda _e: self._dismiss_update_banner())
+
+    def _start_update_check(self) -> None:
+        """Ask the CLI whether a newer release exists (off the UI thread, in a
+        subprocess -- same pattern as every other command). Silent on failure."""
+        if os.environ.get("ROASTMESH_SKIP_UPDATE_CHECK"):
+            return
+        if not self.check_for_updates.get():
+            return
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("update", "--check", "--json"))
+        task.start()
+        stream_into(task, buf.append,
+                    lambda code: self._on_update_check_done(code, "".join(buf)),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_update_check_done(self, code: int, output: str) -> None:
+        if code != 0:
+            return
+        try:
+            data = parse_json_output(output)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(data, dict) or not data.get("checked") or not data.get("is_newer"):
+            return
+        latest = str(data.get("latest") or "")
+        if latest and latest == self._update_dismissed_version:
+            return  # the user already passed on this exact version
+        self._update_info = data
+        self._show_update_banner(latest)
+
+    def _show_update_banner(self, latest: str) -> None:
+        self._update_label.configure(
+            text=t("Update available: {version} -- click to update", version=latest))
+        self._update_banner.pack(side="top", fill="x", before=self._notebook)
+
+    def _dismiss_update_banner(self) -> None:
+        if self._update_info:
+            self._update_dismissed_version = str(self._update_info.get("latest") or "")
+            self._save_config()
+        self._update_banner.pack_forget()
+
+    def _on_update_clicked(self) -> None:
+        info = self._update_info
+        if not info:
+            return
+        latest = str(info.get("latest") or "")
+        page = str(info.get("page_url") or updater.RELEASES_PAGE)
+        if not info.get("supported"):
+            # Can't self-update this install (from source, a portable build, or
+            # an arch with no prebuilt binary) -- send them to the page instead.
+            webbrowser.open(page)
+            return
+        if not messagebox.askokcancel(
+                t("Update roastmesh"),
+                t("Update to {version} now? roastmesh will download it and restart.", version=latest),
+                parent=self):
+            return
+        self._run_update(page)
+
+    def _run_update(self, page: str) -> None:
+        win = tk.Toplevel(self)
+        win.title(t("Updating roastmesh"))
+        win.transient(self)
+        win.configure(bg=theme.BG)
+        tk.Label(win, text=t("Downloading the update..."), font=FONT_BOLD, bg=theme.BG,
+                 fg=theme.FG, anchor="w").pack(fill="x", padx=sp(16), pady=(sp(12), sp(4)))
+        console = Console(win, height=10)
+        argv = ["update", "--yes"]
+        if sys.platform == "win32":
+            # The detached installer helper waits for THIS process to exit.
+            argv += ["--relaunch-pid", str(os.getpid())]
+        cmd_argv = roastmesh_argv(*argv)
+        console.set_command(describe(cmd_argv))
+        win.geometry(screen_geometry(win, 560, 340))
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # no closing mid-update
+        task = Task(argv=cmd_argv)
+        task.start()
+        stream_into(task, console.append,
+                    lambda code: self._on_update_done(code, win, page),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_update_done(self, code: int, win: tk.Toplevel, page: str) -> None:
+        if code == 0:
+            if sys.platform == "win32":
+                # The detached helper reinstalls once we exit, then reopens.
+                self._on_close()
+            else:
+                self._relaunch()
+            return
+        # Failed (or turned out unsupported): let them close the window, and
+        # open the releases page so they can download it by hand.
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        ttk.Button(win, text=t("Close"), command=win.destroy).pack(pady=(0, sp(12)))
+        webbrowser.open(page)
 
 
 def main(*, single_instance_port: int = single_instance.PORT) -> None:

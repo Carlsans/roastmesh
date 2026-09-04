@@ -26,6 +26,10 @@ _LIGHT: dict[str, str] = {
     "BT": "#c8102e", "ET": "#1f5fa9", "ROR": "#e0607e", "SV": "#ff9300",
     "PHASE_DRY": "#f6e7c8", "PHASE_MAILLARD": "#e9c9a3", "PHASE_DEV": "#d8a679",
     "PHASE_COOL": "#dce9f5", "GRID": "#e2ddd6",
+    # Attention banner (e.g. an available update). Deliberately identical in
+    # both palettes -- a red bar reads as "act on this" on either ground, and
+    # retheme() then maps it to itself so it stays red across a theme switch.
+    "DANGER": "#c62828", "DANGER_FG": "#ffece9",
 }
 _DARK: dict[str, str] = {
     "BG": "#1a1613", "SURFACE": "#221d19", "FG": "#ece4dc", "MUTED": "#a99e95",
@@ -35,6 +39,7 @@ _DARK: dict[str, str] = {
     "BT": "#ff5a6e", "ET": "#5b9be0", "ROR": "#f08aa6", "SV": "#ffb04d",
     "PHASE_DRY": "#3a3222", "PHASE_MAILLARD": "#463522", "PHASE_DEV": "#523a22",
     "PHASE_COOL": "#22303f", "GRID": "#2c2620",
+    "DANGER": "#c62828", "DANGER_FG": "#ffece9",
 }
 
 _PALETTES = {"light": _LIGHT, "dark": _DARK}
@@ -60,6 +65,8 @@ PHASE_MAILLARD = _LIGHT["PHASE_MAILLARD"]
 PHASE_DEV = _LIGHT["PHASE_DEV"]
 PHASE_COOL = _LIGHT["PHASE_COOL"]
 GRID = _LIGHT["GRID"]
+DANGER = _LIGHT["DANGER"]
+DANGER_FG = _LIGHT["DANGER_FG"]
 
 _current = "light"
 

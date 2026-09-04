@@ -45,6 +45,11 @@ class GuiConfig:
     # UI theme: "system" (follow the OS where detectable, else light), "light",
     # or "dark". See gui/theme.py. A stale/unknown value falls back to "system".
     theme: str = "system"
+    # Check GitHub for a newer release on startup and show the update banner.
+    check_for_updates: bool = True
+    # The latest version the user dismissed from the banner -- so a dismissed
+    # update doesn't nag again until a newer one appears. See roastmesh.updater.
+    update_dismissed_version: str = ""
 
 
 def default_config() -> GuiConfig:
@@ -57,6 +62,8 @@ def default_config() -> GuiConfig:
         ui_scale=None,
         public_port="",
         theme="system",
+        check_for_updates=True,
+        update_dismissed_version="",
     )
 
 
@@ -78,6 +85,8 @@ def load_config() -> GuiConfig:
         ui_scale=_valid_ui_scale(data.get("ui_scale")),
         public_port=_valid_port(data.get("public_port")),
         theme=data.get("theme") if data.get("theme") in ("system", "light", "dark") else defaults.theme,
+        check_for_updates=bool(data.get("check_for_updates", True)),
+        update_dismissed_version=str(data.get("update_dismissed_version") or ""),
     )
 
 
