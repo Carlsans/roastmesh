@@ -57,7 +57,12 @@ def test_ingest_single_file(tmp_path: Path) -> None:
 def _isolate_home(monkeypatch, tmp_path: Path) -> None:
     # identity/feed default paths live under Path.home(); isolate them per
     # test so this never touches (or depends on) a real user's config.
+    # HOME alone does not isolate anything on Windows -- Path.home() resolves
+    # USERPROFILE there (see the identity-notice test below, which is where
+    # this was first caught), so a Windows CI run would silently share this
+    # helper's config/devices state across every test that uses it.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
 
 def test_identity_show_creates_then_is_stable(tmp_path: Path, monkeypatch) -> None:

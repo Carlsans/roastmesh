@@ -980,7 +980,10 @@ async def test_handle_connection_closes_a_sync_alpn_dial_from_an_untrusted_key(
 ) -> None:
     from roastmesh import device_sync
 
-    monkeypatch.setenv("HOME", str(tmp_path))  # isolated devices.json -- nobody paired
+    # HOME alone does not isolate Path.home() on Windows -- it resolves
+    # USERPROFILE there (see test_cli.py's _isolate_home).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # isolated devices.json -- nobody paired
     conn = _FakeConn(alpn=device_sync.SYNC_ALPN, remote_id="a" * 64)
     await net._handle_connection(
         _FakeIncoming(conn), tmp_path / "feed", tmp_path / "peers.json",
@@ -999,6 +1002,7 @@ async def test_handle_connection_closes_a_sync_alpn_dial_when_device_sync_is_not
     from roastmesh.devices import Device, add_device
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     pubkey = "b" * 64
     add_device(Device(pubkey=pubkey, name="trusted", platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
 
@@ -1017,6 +1021,7 @@ async def test_handle_connection_closes_a_pair_alpn_dial(tmp_path: Path, monkeyp
     from roastmesh import device_sync
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     conn = _FakeConn(alpn=device_sync.PAIR_ALPN, remote_id="c" * 64)
     await net._handle_connection(
         _FakeIncoming(conn), tmp_path / "feed", tmp_path / "peers.json",
@@ -1032,6 +1037,7 @@ async def test_handle_connection_serves_a_sync_alpn_dial_from_a_trusted_key(
     from roastmesh.devices import Device, add_device
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     pubkey = "d" * 64
     add_device(Device(pubkey=pubkey, name="trusted", platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
 
