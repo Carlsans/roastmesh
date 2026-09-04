@@ -13,4 +13,4 @@
 # The policy now lives in roastmesh.asyncio_policy, applied by the modules that
 # actually run an event loop. Keep this file import-free: anything added here is
 # paid for by every entry point, including ones that have no use for it.
-__version__ = "0.6.17"
+__version__ = "0.6.18"
