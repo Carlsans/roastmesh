@@ -56,9 +56,16 @@ RESYNC_INTERVAL_S = 900.0
 
 
 class _BeaconProtocol(asyncio.DatagramProtocol):
-    def __init__(self, own_pubkey_hex: str, handle: Callable[[str, str], None]) -> None:
+    def __init__(
+        self, own_pubkey_hex: str, handle: Callable[[str, str], None],
+        own_local_addrs: set[str] | None = None,
+        on_self_identity_collision: Callable[[str], None] | None = None,
+    ) -> None:
         self._own_pubkey_hex = own_pubkey_hex
         self._handle = handle
+        self._own_local_addrs = own_local_addrs or set()
+        self._on_self_identity_collision = on_self_identity_collision
+        self._self_collision_reported: set[str] = set()
 
     def error_received(self, exc: Exception) -> None:
         # Surfaced rather than swallowed, for the same reason as dht.py's:
@@ -76,7 +83,20 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
         # regular discovery is harmless noise here, not an error.
         pubkey, ticket, _pairing, _code, _hostname = decoded
         if pubkey == self._own_pubkey_hex:
-            return  # broadcasts loop back to the sender on the same host
+            # Routine: broadcasts/multicast loop back to the sender on the
+            # same host, on every single beacon interval -- addr[0] is then
+            # one of this machine's own interface addresses. Only a hello
+            # claiming our pubkey from a DIFFERENT address is the
+            # interesting case: most plausibly a cloned disk image or
+            # copied config directory carrying identity.json along with it,
+            # silently making every one of that other machine's peers look
+            # like "us" and get dropped right here.
+            if (self._on_self_identity_collision is not None
+                    and addr[0] not in self._own_local_addrs
+                    and addr[0] not in self._self_collision_reported):
+                self._self_collision_reported.add(addr[0])
+                self._on_self_identity_collision(addr[0])
+            return
         self._handle(pubkey, ticket)
 
 
@@ -88,6 +108,7 @@ async def run_beacon(
     port: int = BEACON_PORT,
     interval_s: float = BEACON_INTERVAL_S,
     resync_interval_s: float = RESYNC_INTERVAL_S,
+    on_self_identity_collision: Callable[[str], None] | None = None,
 ) -> None:
     """Broadcast our own ticket periodically and react to others' beacons,
     until cancelled. `on_peer_discovered(pubkey, ticket)` is scheduled as a
@@ -97,9 +118,21 @@ async def run_beacon(
     `port`/`interval_s` are parameters rather than hardcoded specifically so
     tests can run two beacons against each other on one host without
     needing two separate machines.
+
+    `on_self_identity_collision(source_ip)`, if given, fires the first time
+    a beacon claiming this device's OWN pubkey arrives from an address that
+    isn't one of this machine's own interfaces -- see _BeaconProtocol's own
+    docstring for why that, and not "any self-pubkey hello", is the actual
+    signal worth surfacing (routine same-host loopback happens on every
+    single beacon interval and must not be reported as a collision).
     """
     loop = asyncio.get_running_loop()
     last_seen: dict[str, float] = {}
+    own_local_addrs = {"127.0.0.1", "::1"}
+    try:
+        own_local_addrs.update(iface.address for iface in local_interfaces())
+    except Exception:  # noqa: BLE001 -- best-effort; worst case is a missed warning, not a crash
+        pass
 
     def _handle(pubkey: str, ticket: str) -> None:
         now = time.monotonic()
@@ -120,7 +153,7 @@ async def run_beacon(
     _join_multicast(sock)
 
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: _BeaconProtocol(own_pubkey_hex, _handle), sock=sock,
+        lambda: _BeaconProtocol(own_pubkey_hex, _handle, own_local_addrs, on_self_identity_collision), sock=sock,
     )
 
     payload = encode_hello(own_pubkey_hex, own_ticket)

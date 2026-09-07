@@ -173,6 +173,88 @@ async def test_reciprocal_hello_reaches_a_node_the_fake_dht_never_told_about_the
         fake_dht_for_b.close()
 
 
+async def test_rendezvous_host_hello_finds_a_peer_immediately_without_the_dht(tmp_path) -> None:
+    """A rendezvous host (bootstrap.RendezvousHost, passed down as plain
+    (host, ip, port) triples so this module never needs to import
+    bootstrap.py) is hello'd directly on startup, with no bootstrap DHT
+    node configured at all -- this is the mechanism that lets a live
+    moduloinfo.ca answer in well under a second instead of waiting for a
+    DHT lookup, whose interval here is set deliberately long so a discovery
+    within the test's short window can only be the rendezvous path."""
+    port_a, port_b = 41995, 41996
+
+    discovered_by_a: list[tuple[str, str]] = []
+
+    async def on_a(pubkey: str, ticket: str) -> None:
+        discovered_by_a.append((pubkey, ticket))
+
+    async def on_b(pubkey: str, ticket: str) -> None:
+        pass
+
+    task_a = asyncio.create_task(run_wan_discovery(
+        "aa" * 32, "ticket-a", on_a, port=port_a, lookup_interval_s=60.0, hello_resync_s=1.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_b)],
+        node_cache_path=tmp_path / "nodes_a.json", allow_loopback=True,
+    ))
+    task_b = asyncio.create_task(run_wan_discovery(
+        "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=60.0, hello_resync_s=1.0,
+        bootstrap_nodes=[], node_cache_path=tmp_path / "nodes_b.json", allow_loopback=True,
+    ))
+    try:
+        for _ in range(100):
+            if discovered_by_a:
+                break
+            await asyncio.sleep(0.1)
+        assert discovered_by_a == [("bb" * 32, "ticket-b")]
+    finally:
+        task_a.cancel()
+        task_b.cancel()
+        for t in (task_a, task_b):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
+async def test_rendezvous_host_falls_back_to_its_literal_ip_when_dns_fails() -> None:
+    from roastmesh.wan_discovery import _resolve_rendezvous_hosts
+
+    resolved = await _resolve_rendezvous_hosts([
+        ("this-host-does-not-exist.invalid", "9.9.9.9", 41890),
+    ])
+    assert resolved == [("9.9.9.9", 41890)]
+
+
+async def test_rendezvous_host_with_no_fallback_and_bad_dns_is_dropped() -> None:
+    from roastmesh.wan_discovery import _resolve_rendezvous_hosts
+
+    resolved = await _resolve_rendezvous_hosts([
+        ("this-host-does-not-exist.invalid", None, 41890),
+    ])
+    assert resolved == []
+
+
+def test_self_collision_ignores_own_local_addresses() -> None:
+    from roastmesh.wan_discovery import _looks_like_self_collision
+
+    own = {"192.168.1.50", "127.0.0.1"}
+    assert _looks_like_self_collision("192.168.1.50", own, None) is False
+    assert _looks_like_self_collision("127.0.0.1", own, None) is False
+
+
+def test_self_collision_ignores_the_adopted_external_ip() -> None:
+    from roastmesh.wan_discovery import _looks_like_self_collision
+
+    assert _looks_like_self_collision("203.0.113.9", set(), "203.0.113.9") is False
+
+
+def test_self_collision_flags_a_genuinely_different_address() -> None:
+    from roastmesh.wan_discovery import _looks_like_self_collision
+
+    own = {"192.168.1.50", "127.0.0.1"}
+    assert _looks_like_self_collision("203.0.113.9", own, "192.168.1.50") is True
+
+
 async def test_resolve_returns_only_ipv4_addresses() -> None:
     """The DHT stack is IPv4-only -- BEP 5 compact addresses are 4 bytes and
     DhtClient binds an IPv4 socket -- so resolution must ask for A records

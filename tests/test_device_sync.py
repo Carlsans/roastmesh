@@ -17,10 +17,14 @@ from roastmesh.device_sync import (
     Action,
     _build_sync_response,
     _safe_relpath,
+    load_staged,
     load_state,
+    push_staged_edits,
     reconcile,
+    save_staged,
     save_state,
     scan_folder,
+    stage_file_for_owner,
 )
 
 # --------------------------------------------------------------------------
@@ -380,3 +384,153 @@ def test_end_to_end_reconcile_converges_two_folders_including_a_deletion(tmp_pat
     local_actions2, remote_actions2 = reconcile(local_manifest2, remote_manifest2)
     assert local_actions2 == []
     assert remote_actions2 == []
+
+
+# --------------------------------------------------------------------------
+# Cross-edit staging: stage_file_for_owner / push_staged_edits
+# --------------------------------------------------------------------------
+
+def _trust(pubkey: str, monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    from roastmesh.devices import Device, add_device
+    add_device(Device(pubkey=pubkey, name="paired", platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
+
+
+def test_stage_file_for_owner_writes_under_staging_and_records_it(tmp_path: Path, monkeypatch) -> None:
+    owner_pubkey = "c" * 64
+    _trust(owner_pubkey, monkeypatch, tmp_path)
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+
+    staging_relpath = stage_file_for_owner(
+        devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath="sub/roast.alog",
+        content=b"edited bytes",
+    )
+
+    assert staging_relpath == f".staging/{owner_pubkey}/sub/roast.alog"
+    assert (devices_dir / staging_relpath).read_bytes() == b"edited bytes"
+    staged = load_staged(state_path)
+    assert staged[staging_relpath]["owner_pubkey"] == owner_pubkey
+    assert staged[staging_relpath]["return_relpath"] == "sub/roast.alog"
+
+
+def test_stage_file_for_owner_refuses_an_untrusted_pubkey(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    import pytest
+    with pytest.raises(ValueError, match="not a paired device"):
+        stage_file_for_owner(
+            tmp_path / "devices", tmp_path / "state.json",
+            owner_pubkey="e" * 64, return_relpath="roast.alog", content=b"x",
+        )
+
+
+def test_stage_file_for_owner_rejects_a_traversing_return_relpath(tmp_path: Path, monkeypatch) -> None:
+    owner_pubkey = "c" * 64
+    _trust(owner_pubkey, monkeypatch, tmp_path)
+    import pytest
+    with pytest.raises(ValueError, match="unsafe"):
+        stage_file_for_owner(
+            tmp_path / "devices", tmp_path / "state.json",
+            owner_pubkey=owner_pubkey, return_relpath="../escape.alog", content=b"x",
+        )
+
+
+def test_staged_files_never_enter_the_normal_mirror_manifest(tmp_path: Path, monkeypatch) -> None:
+    owner_pubkey = "c" * 64
+    _trust(owner_pubkey, monkeypatch, tmp_path)
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+    stage_file_for_owner(
+        devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath="roast.alog", content=b"x",
+    )
+
+    manifest = scan_folder(devices_dir, {})
+    assert manifest == {}  # the staged file is invisible to the ordinary full-mirror scan
+
+
+def test_save_state_and_save_staged_preserve_each_others_section(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    save_state({"a.alog": {"sha256": "x", "size": 1, "mtime_ns": 0, "deleted": False, "updated_at": 1.0}},
+               state_path)
+    save_staged({".staging/x/a.alog": {"owner_pubkey": "c" * 64, "return_relpath": "a.alog",
+                                        "sha256": "x", "updated_at": 1.0}}, state_path)
+
+    assert "a.alog" in load_state(state_path)  # save_staged didn't wipe it
+    assert ".staging/x/a.alog" in load_staged(state_path)
+
+    save_state({"b.alog": {"sha256": "y", "size": 1, "mtime_ns": 0, "deleted": False, "updated_at": 2.0}},
+               state_path)
+    assert ".staging/x/a.alog" in load_staged(state_path)  # save_state didn't wipe it
+    assert "a.alog" not in load_state(state_path)  # save_state DOES replace its own section wholesale
+
+
+async def test_push_staged_edits_delivers_only_to_the_owning_device(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh import device_sync
+    from roastmesh.identity import generate_identity
+
+    owner_pubkey = "c" * 64
+    other_pubkey = "d" * 64
+    _trust(owner_pubkey, monkeypatch, tmp_path)
+    from roastmesh.devices import Device, add_device
+    add_device(Device(pubkey=other_pubkey, name="other", platform="linux", paired_at="2026-01-01T00:00:00+00:00"))
+
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+    staging_relpath = stage_file_for_owner(
+        devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath="roast.alog", content=b"edited bytes",
+    )
+
+    dialed_tickets = []
+    requests_sent = []
+
+    class _FakeEndpoint:
+        async def close(self):
+            pass
+
+    class _FakeConn:
+        pass
+
+    async def fake_bind_endpoint(identity, relay=True):
+        return _FakeEndpoint()
+
+    async def fake_dial_with_fallback(ep, ticket, alpn):
+        dialed_tickets.append(ticket)
+        return _FakeConn()
+
+    async def fake_request(conn, request):
+        requests_sent.append(request)
+        return {"ok": True}
+
+    monkeypatch.setattr(device_sync.net, "bind_endpoint", fake_bind_endpoint)
+    monkeypatch.setattr(device_sync.net, "dial_with_fallback", fake_dial_with_fallback)
+    monkeypatch.setattr(device_sync.net, "_request", fake_request)
+
+    known_tickets = {owner_pubkey: "owner-ticket", other_pubkey: "other-ticket"}
+    delivered = await push_staged_edits(devices_dir, state_path, generate_identity(), known_tickets)
+
+    assert delivered == 1
+    assert dialed_tickets == ["owner-ticket"]  # never dialed the other paired device
+    assert requests_sent[0]["op"] == "put_file"
+    assert requests_sent[0]["path"] == "roast.alog"  # the OWNER's own relpath, not the staging one
+    assert load_staged(state_path) == {}  # cleared after confirmed delivery
+    assert not (devices_dir / staging_relpath).exists()  # local staging copy removed
+
+
+async def test_push_staged_edits_leaves_an_unreachable_owners_edit_in_place(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.identity import generate_identity
+
+    owner_pubkey = "c" * 64
+    _trust(owner_pubkey, monkeypatch, tmp_path)
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+    staging_relpath = stage_file_for_owner(
+        devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath="roast.alog", content=b"edited bytes",
+    )
+
+    delivered = await push_staged_edits(devices_dir, state_path, generate_identity(), known_tickets={})
+
+    assert delivered == 0
+    assert (devices_dir / staging_relpath).exists()  # untouched, retried on a later call
+    assert staging_relpath in load_staged(state_path)

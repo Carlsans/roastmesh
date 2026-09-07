@@ -190,6 +190,41 @@ async def _resolve(bootstrap_nodes: list[Addr]) -> list[Addr]:
     return [addr for _host, addr in await _resolve_named(bootstrap_nodes) if addr is not None]
 
 
+def _looks_like_self_collision(source_ip: str, own_local_addrs: set[str], adopted_for_ip: str | None) -> bool:
+    """A hello claiming our own pubkey is only a real identity collision --
+    someone else running with our keys, most plausibly a cloned disk image
+    or copied config directory -- if it did NOT come from one of this
+    machine's own addresses. Same-host loopback (a broadcast/multicast echo,
+    or our own announce being looked up and helloed back to us from our own
+    external address) is routine and must not be reported as a collision.
+
+    A pure function so this decision is testable with plain strings,
+    without needing two real sockets on genuinely different hosts.
+    """
+    return source_ip not in own_local_addrs and source_ip != adopted_for_ip
+
+
+async def _resolve_rendezvous_hosts(hosts: list[tuple[str, str | None, int]]) -> list[Addr]:
+    """DNS-resolve each rendezvous host, falling back to its own literal IP
+    (if given) when resolution fails -- same idea as `_resolve`'s fallback
+    to DHT_BOOTSTRAP_FALLBACK_IPS, except each of these maintainer-run hosts
+    (bootstrap.RendezvousHost) carries its own fallback instead of sharing
+    one table, since they're independent single hosts, not routers of one
+    well-known swarm."""
+    loop = asyncio.get_running_loop()
+    out: list[Addr] = []
+    for host, fallback_ip, port in hosts:
+        try:
+            infos = await loop.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM)
+        except OSError:
+            infos = []
+        if infos:
+            out.append((infos[0][4][0], port))
+        elif fallback_ip:
+            out.append((fallback_ip, port))
+    return out
+
+
 async def _resolve_named(bootstrap_nodes: list[Addr]) -> list[tuple[str, Addr | None]]:
     """`_resolve`, but keeping each result beside the host it came from.
 
@@ -413,9 +448,11 @@ async def run_wan_discovery(
     hello_resync_s: float = HELLO_RESYNC_S,
     retry_interval_s: float = RETRY_INTERVAL_S,
     bootstrap_nodes: list[Addr] | None = None,
+    rendezvous_hosts: list[tuple[str, str | None, int]] | None = None,
     info_hash: bytes = SWARM_INFO_HASH,
     node_cache_path=None,
     on_round: Callable[[object], None] | None = None,
+    on_self_identity_collision: Callable[[str], None] | None = None,
     allow_loopback: bool = False,
     public_port: int | None = None,
     auto_port: bool = False,
@@ -447,6 +484,27 @@ async def run_wan_discovery(
 
     `on_round` receives each round's LookupStats (used by the logs and by
     `roastmesh net doctor`) -- without it a failing round is invisible.
+
+    `on_self_identity_collision(source_ip)`, if given, fires the first time
+    a hello claiming this device's OWN pubkey arrives from an address that
+    isn't this device's own (known-adopted) external IP -- i.e. NOT the
+    routine, harmless case of our own announce being looked up and helloed
+    back to us from our own address, but a genuinely different host
+    claiming our identity. The most plausible cause is a cloned disk image
+    or copied config directory carrying identity.json along with it, which
+    silently makes every one of that other machine's peers look like "us"
+    and get dropped (see the pubkey == own_pubkey_hex check just below
+    `_on_foreign`) -- indistinguishable, from the outside, from "discovery
+    is broken", until someone happens to delete the copied identity.json.
+
+    `rendezvous_hosts` (host, literal-ip-fallback-or-None, port) triples --
+    see bootstrap.RendezvousHost, the caller resolves that into this plain
+    shape so this module doesn't need to import bootstrap.py -- are
+    hello'd directly, immediately on startup and once per round after,
+    bypassing the DHT lookup entirely. A live maintainer-run rendezvous
+    host (moduloinfo.ca) answers in well under a second where a cold DHT
+    lookup can take minutes to converge, which is the actual fix for slow
+    first discovery.
     """
     if debug:
         print("wan: debug logging enabled -- wan-stats emitted every lookup round", flush=True)
@@ -460,6 +518,18 @@ async def run_wan_discovery(
     client = await DhtClient.bind(port=port, own_id=own_id, allow_loopback=allow_loopback)
     state = load_node_cache(state_path)
     failed_rounds = 0
+
+    # Computed once, not per-datagram: interfaces essentially never change
+    # mid-run, and this is what lets _looks_like_self_collision tell
+    # "ourselves, looped back" from "someone else with our identity" without
+    # depending on BEP 42/IP-vote convergence, which may never happen at all
+    # (a cold node, a symmetric NAT, an isolated test).
+    own_local_addrs: set[str] = {"127.0.0.1", "::1"}
+    try:
+        from roastmesh.interfaces import local_interfaces
+        own_local_addrs.update(iface.address for iface in local_interfaces())
+    except Exception:  # noqa: BLE001 -- best-effort; worst case is a missed warning, not a crash
+        pass
 
     last_helloed: dict[Addr, float] = {}
     last_seen_pubkey: dict[str, float] = {}
@@ -516,6 +586,7 @@ async def run_wan_discovery(
                 return
 
     _acked: set[Addr] = set()
+    _self_collision_reported: set[str] = set()
 
     def _on_foreign(data: bytes, addr) -> None:
         decoded = decode_hello(data)
@@ -526,6 +597,11 @@ async def run_wan_discovery(
         # and ignored here rather than in lan_discovery specifically.
         pubkey, ticket, _pairing, _code, _hostname = decoded
         if pubkey == own_pubkey_hex:
+            if (on_self_identity_collision is not None
+                    and addr[0] not in _self_collision_reported
+                    and _looks_like_self_collision(addr[0], own_local_addrs, adopted_for_ip)):
+                _self_collision_reported.add(addr[0])
+                on_self_identity_collision(addr[0])
             return
         _acked.add(addr)  # heard from them -- no need to keep retransmitting
         # Reciprocate immediately: whoever reached us first might not yet
@@ -620,6 +696,15 @@ async def run_wan_discovery(
         except Exception:  # noqa: BLE001 -- a failed probe is "unknown", not a crash
             return None
         return published in found
+
+    async def _hello_rendezvous_hosts() -> None:
+        for addr in await _resolve_rendezvous_hosts(rendezvous_hosts or []):
+            _maybe_hello(addr)
+
+    if rendezvous_hosts:
+        # Immediate, before the bootstrap/lookup machinery below even starts
+        # -- the whole point is not waiting on DHT convergence.
+        await _hello_rendezvous_hosts()
 
     bootstrap_task = asyncio.create_task(_bootstrap_loop())
     next_announce_at = 0.0
@@ -752,6 +837,12 @@ async def run_wan_discovery(
                 on_round(stats)
             for addr in addrs:
                 _maybe_hello(addr)
+            if rendezvous_hosts:
+                # Re-resolved and re-hello'd every round (throttled by
+                # _maybe_hello's own hello_resync_s dedup) so a rendezvous
+                # host that was briefly down, or whose IP moved, is retried
+                # instead of only ever being tried once at startup.
+                await _hello_rendezvous_hosts()
 
             # Retry sooner when a round achieved nothing, instead of sitting
             # out the full interval. Measured: a healthy first round makes a

@@ -1,0 +1,25 @@
+[Unit]
+Description=Check for and apply a roastmesh update, then restart the node (%i)
+Documentation=https://github.com/Carlsans/roastmesh
+
+[Service]
+Type=oneshot
+User=%i
+# NOT %h -- see roastmesh-node@.service's ExecStart comment: it resolves to
+# root's home on a system-scope unit, confirmed directly on real hardware.
+ExecStart=/home/%i/.local/bin/roastmesh update --yes
+# try-restart (not restart) only so this is a no-op when the node isn't
+# running at all -- NOT a guarantee against bouncing on a no-op update.
+# Confirmed directly: `roastmesh update --yes` re-downloads and reinstalls
+# every time this timer fires, even when already on the latest version
+# (unlike `roastmesh update --check`, which correctly says "up to date"),
+# so the node restarts daily regardless of whether anything really
+# changed. That's a gap in updater.py's --yes path, not something fixable
+# from this unit file -- see the deploy-playbook memory. A brief daily
+# restart of an always-on rendezvous host is a real but small cost; if it
+# ever needs to stop, it will need to happen in updater.py, not here.
+# The leading "+" runs just this line as root regardless of this unit's
+# own User=%i -- restarting a system-scope unit needs that, and the
+# update itself deliberately does not (it must write to %i's own
+# ~/.local/bin, not root's).
+ExecStartPost=+/bin/systemctl try-restart roastmesh-node@%i.service

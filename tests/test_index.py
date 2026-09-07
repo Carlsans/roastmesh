@@ -2,9 +2,11 @@ from pathlib import Path
 
 import pytest
 
+from roastmesh.feed import append_entry
+from roastmesh.identity import generate_identity
 from roastmesh.index import repository as repo
 from roastmesh.index.db import connect
-from roastmesh.index.ingest import ingest_file, ingest_path, refresh_known_sources
+from roastmesh.index.ingest import edit_unpublished_roast_notes, ingest_feed, ingest_file, ingest_path, refresh_known_sources
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -685,3 +687,65 @@ def test_concurrent_migrate_does_not_race_on_added_columns(tmp_path: Path) -> No
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sources)")}
     conn.close()
     assert "blob_local" in cols     # the migration still actually happened
+
+
+def _copy_fixture(tmp_path: Path, name: str = "kaleido_1.alog") -> Path:
+    # Tests that edit a roast's file must never write to the checked-in
+    # fixtures under tests/fixtures/ -- copy one into tmp_path first.
+    dest = tmp_path / name
+    dest.write_bytes((FIXTURES_DIR / name).read_bytes())
+    return dest
+
+
+def test_edit_unpublished_roast_notes_updates_the_same_row_in_place(conn, tmp_path: Path) -> None:
+    path = _copy_fixture(tmp_path)
+    first = ingest_file(conn, path, is_user_log=True)
+    roast_id = first.record.roast_id
+
+    result = edit_unpublished_roast_notes(conn, roast_id, roasting_notes="edited before ever publishing")
+    assert result.error is None
+    assert result.record.roast_id == roast_id  # same row, not a new one
+
+    row_count = conn.execute("SELECT COUNT(*) FROM roasts").fetchone()[0]
+    assert row_count == 1
+    stored = conn.execute("SELECT roasting_notes FROM roasts WHERE roast_id = ?", (roast_id,)).fetchone()
+    assert stored["roasting_notes"] == "edited before ever publishing"
+
+    # the file on disk was actually rewritten, not just the index row
+    from roastmesh.alog.edit import parse_for_edit
+    on_disk, _fmt = parse_for_edit(path.read_bytes())
+    assert on_disk["roastingnotes"] == "edited before ever publishing"
+
+
+def test_edit_unpublished_roast_notes_updates_fts(conn, tmp_path: Path) -> None:
+    path = _copy_fixture(tmp_path)
+    first = ingest_file(conn, path, is_user_log=True)
+    roast_id = first.record.roast_id
+
+    edit_unpublished_roast_notes(conn, roast_id, roasting_notes="a very distinctive searchable phrase")
+
+    rows = repo.search_roasts(conn, text="distinctive searchable phrase")
+    assert any(r.roast_id == roast_id for r in rows)
+
+
+def test_edit_unpublished_roast_notes_refuses_an_already_published_roast(conn, tmp_path: Path) -> None:
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    path = _copy_fixture(tmp_path)
+    append_entry(feed_dir, identity, path, timestamp="2026-01-01T00:00:00Z")
+    results = ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex)
+    roast_id = results[0].record.roast_id
+
+    result = edit_unpublished_roast_notes(conn, roast_id, roasting_notes="should be refused")
+    assert result.error is not None
+    assert "already published" in result.error
+
+    # nothing was actually changed
+    stored = conn.execute("SELECT roasting_notes FROM roasts WHERE roast_id = ?", (roast_id,)).fetchone()
+    assert stored["roasting_notes"] != "should be refused"
+
+
+def test_edit_unpublished_roast_notes_rejects_an_unknown_roast_id(conn) -> None:
+    result = edit_unpublished_roast_notes(conn, "not-a-real-roast-id", roasting_notes="x")
+    assert result.error is not None
+    assert "no such roast" in result.error

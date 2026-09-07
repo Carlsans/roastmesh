@@ -1,0 +1,17 @@
+# roastmesh rendezvous hosts -- always-on nodes for fast peer discovery.
+#
+# Fetched at startup (net.serve(), when --wan-discovery is on) from
+# https://raw.githubusercontent.com/Carlsans/roastmesh/master/BOOTSTRAP_NODES
+# and hello'd directly, bypassing the public BitTorrent DHT lookup entirely --
+# see src/roastmesh/bootstrap.py and ARCHITECTURE.md's "Peer discovery"
+# section for why. Editing this file changes what every roastmesh install
+# tries first, without anyone needing to update their binary.
+#
+# Format: one host per line, blank lines and "#" comments ignored.
+#   host
+#   host,literal-ip-fallback
+#   host,literal-ip-fallback,port
+# The literal IP is used only if DNS fails to resolve the host; port
+# defaults to WAN_PORT (41890) when omitted.
+
+moduloinfo.ca

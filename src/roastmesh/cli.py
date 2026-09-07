@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import tempfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,13 +16,13 @@ from roastmesh import devices as devices_mod
 from roastmesh import net
 from roastmesh import replication
 from roastmesh.bootstrap import BOOTSTRAP_TICKETS
-from roastmesh.feed import (append_entry, default_feed_dir, default_peer_feeds_root,
-                            held_feeds_digest, verify_feed)
+from roastmesh.feed import (append_entry, blob_path_for, default_feed_dir, default_peer_feeds_root,
+                            held_feeds_digest, read_entries, verify_feed)
 from roastmesh.gateway import make_server
 from roastmesh.identity import load_or_create_identity
 from roastmesh.index import repository as repo
 from roastmesh.index.db import connect, get_meta, set_meta
-from roastmesh.index.ingest import ingest_feed, ingest_file, ingest_path, refresh_known_sources
+from roastmesh.index.ingest import edit_unpublished_roast_notes, ingest_feed, ingest_file, ingest_path, refresh_known_sources
 from roastmesh.lan_discovery import probe_reachable_devices
 from roastmesh.machines import list_machines, slugify
 from roastmesh.paths import default_devices_dir, device_sync_state_path as default_device_sync_state_path
@@ -199,6 +200,9 @@ def _filter_lan_only(rows: list, peers_file: Path) -> list:
               help="Only show your own roasts -- hide everything synced from any peer.")
 @click.option("--show-hidden", is_flag=True,
               help="Also include roasts you've hidden (see `roastmesh hide`).")
+@click.option("--show-superseded", is_flag=True,
+              help="Also include roasts a later, superseding entry has replaced "
+                   "(see `roastmesh feed publish --supersedes`).")
 @click.option("--user", "user_id", default=None,
               help="Only show roasts from one user (pubkey prefix, resolved like a roast id -- "
                    "see `roastmesh user show`).")
@@ -219,6 +223,7 @@ def search(
     peers_file: Path | None,
     own_only: bool,
     show_hidden: bool,
+    show_superseded: bool,
     user_id: str | None,
     favorites_only: bool,
     as_json: bool,
@@ -230,7 +235,7 @@ def search(
         conn, text=text, machine_key=machine_key, roast_type=roast_type,
         dtr_min=dtr_min, dtr_max=dtr_max, drop_bt_min=drop_bt_min,
         after_second_crack=after_second_crack, own_only=own_only, include_hidden=show_hidden,
-        user_pubkey=user_pubkey, favorites_only=favorites_only,
+        user_pubkey=user_pubkey, favorites_only=favorites_only, include_superseded=show_superseded,
     )
     if own_only:
         lan_only = False  # own roasts are never peer-sourced -- nothing left for it to filter
@@ -252,8 +257,9 @@ def search(
         dtr = f"{row.dtr_pct:.1f}%" if row.dtr_pct is not None else "?"
         drop = f"{row.drop_bt_c:.0f}C" if row.drop_bt_c is not None else "?"
         hidden_note = " [hidden]" if row.hidden else ""
+        superseded_note = " [superseded]" if row.superseded else ""
         click.echo(f"{row.roast_id[:8]}  {row.machine_key:<16} {row.roast_type or '?':<12} "
-                   f"DTR={dtr:<7} DROP={drop:<6} {title}{hidden_note}")
+                   f"DTR={dtr:<7} DROP={drop:<6} {title}{hidden_note}{superseded_note}")
 
 
 def _resolve_roast_id(conn, roast_id_prefix: str) -> str:
@@ -295,6 +301,7 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
     hidden = repo.find_hidden(conn, full_id)
     blob_local = repo.is_blob_local(conn, full_id)
     feed_pubkey = repo.feed_pubkey_for_roast(conn, full_id)
+    source = repo.find_source_for_roast(conn, full_id)
     conn.close()
 
     # A stub -- the metadata is indexed but the .alog bytes were evicted to
@@ -306,8 +313,13 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
         blob_local = fetched or blob_local
 
     if as_json:
-        click.echo(json.dumps({"record": record, "raw_path": raw_path,
-                               "hidden": hidden, "blob_local": bool(blob_local)}))
+        author_pubkey = source["author_pubkey"] if source else None
+        click.echo(json.dumps({
+            "record": record, "raw_path": raw_path, "hidden": hidden, "blob_local": bool(blob_local),
+            "author_pubkey": author_pubkey,
+            "is_published": bool(source and source["author_seq"] is not None),
+            "is_from_paired_device": bool(author_pubkey and devices_mod.is_trusted(author_pubkey)),
+        }))
         return
 
     beans = record.get("beans_text") or "(no beans text)"
@@ -366,6 +378,84 @@ def unhide(ctx: click.Context, roast_id: str) -> None:
 
 
 @main.group()
+def notes() -> None:
+    """Edit a roast's tasting notes without opening Artisan."""
+
+
+@notes.command("edit")
+@click.argument("roast_id")
+@click.option("--roasting-notes", default=None, help="New roasting-notes text.")
+@click.option("--cupping-notes", default=None, help="New cupping-notes text.")
+@click.option("--feed-dir", "feed_dir", default=None, type=click.Path(path_type=Path),
+              help="Your feed directory -- only consulted if ROAST_ID turns out to already be "
+                   "published (default: same as `feed`'s own default).")
+@click.pass_context
+def notes_edit(
+    ctx: click.Context, roast_id: str, roasting_notes: str | None, cupping_notes: str | None,
+    feed_dir: Path | None,
+) -> None:
+    """Edit ROAST_ID's tasting notes in place, without opening Artisan.
+
+    A not-yet-published roast is rewritten on disk directly -- no new feed
+    entry. An already-published roast instead gets a new feed entry that
+    supersedes the original: the original stays in your feed forever,
+    byte-for-byte unchanged (append-only -- see ARCHITECTURE.md's Core
+    Model), everyone sees the edit as the current version by default, and
+    the original is still findable with `search --show-superseded`.
+    """
+    if roasting_notes is None and cupping_notes is None:
+        raise click.ClickException("nothing to edit -- pass --roasting-notes and/or --cupping-notes")
+
+    conn = connect(ctx.obj["db_path"])
+    full_id = _resolve_roast_id(conn, roast_id)
+    source = repo.find_source_for_roast(conn, full_id)
+    if source is None:
+        raise click.ClickException(f"no such roast: {roast_id}")
+
+    if source["author_seq"] is None:
+        result = edit_unpublished_roast_notes(
+            conn, full_id, roasting_notes=roasting_notes, cupping_notes=cupping_notes,
+        )
+        if result.error:
+            raise click.ClickException(result.error)
+        click.echo(f"edited {full_id[:8]}... in place (not yet published)")
+        return
+
+    # Already published: write the edit to a throwaway temp file and publish
+    # IT as a superseding entry -- append_entry copies the bytes into the
+    # feed's own content-addressed blob store, so the temp file is only ever
+    # needed transiently; the index row then points at the permanent blob
+    # (blob_path_for), never the temp path, so it doesn't go stale once
+    # this command exits and the temp file is removed.
+    ident, _created = load_or_create_identity()
+    if source["author_pubkey"] != ident.public_key_hex:
+        raise click.ClickException("this roast isn't yours to edit -- only its author can supersede it")
+
+    from roastmesh.alog.edit import set_notes
+
+    resolved_feed_dir = feed_dir or default_feed_dir()
+    old_bytes = Path(source["raw_path"]).read_bytes()
+    new_bytes = set_notes(old_bytes, roasting_notes=roasting_notes, cupping_notes=cupping_notes)
+    fd, tmp_name = tempfile.mkstemp(suffix=".alog")
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "wb") as tmp_file:
+            tmp_file.write(new_bytes)
+        entry = append_entry(
+            resolved_feed_dir, ident, tmp_path, timestamp=datetime.now(timezone.utc).isoformat(),
+            supersedes=source["author_seq"],
+        )
+        ingest_file(
+            conn, blob_path_for(resolved_feed_dir, entry), is_user_log=True,
+            author_seq=entry.seq, supersedes_seq=source["author_seq"],
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    click.echo(f"published entry {entry.seq}, superseding entry {source['author_seq']} "
+               f"-- the edit is now the current version of {full_id[:8]}...")
+
+
+@main.group()
 def identity() -> None:
     """Manage your Ed25519 feed identity (created silently on first publish)."""
 
@@ -401,17 +491,32 @@ def feed(ctx: click.Context, feed_dir: Path | None) -> None:
 
 @feed.command("publish")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--supersedes", "supersedes", type=int, default=None,
+              help="Seq of an earlier entry in YOUR OWN feed that this publish replaces -- "
+                   "e.g. after editing a roast's notes and wanting the edit to show as the "
+                   "current version everywhere, without touching the original entry (which "
+                   "stays in the feed forever -- append-only, see ARCHITECTURE.md). Must be "
+                   "an existing seq in this same feed.")
 @click.pass_context
-def feed_publish(ctx: click.Context, path: Path) -> None:
+def feed_publish(ctx: click.Context, path: Path, supersedes: int | None) -> None:
     """Append a .alog file to your feed, signed with your identity, and add
     it to your own local search index (as one of "your own roasts")."""
     ident, created = load_or_create_identity()
     _remind_backup_if_new(ident, created)
-    entry = append_entry(ctx.obj["feed_dir"], ident, path, timestamp=datetime.now(timezone.utc).isoformat())
+    if supersedes is not None:
+        own_entries = read_entries(ctx.obj["feed_dir"])
+        if not (0 <= supersedes < len(own_entries)):
+            raise click.ClickException(
+                f"--supersedes {supersedes} is not an existing entry in this feed "
+                f"(it has {len(own_entries)} entr{'y' if len(own_entries) == 1 else 'ies'})"
+            )
+    entry = append_entry(ctx.obj["feed_dir"], ident, path, timestamp=datetime.now(timezone.utc).isoformat(),
+                          supersedes=supersedes)
     click.echo(f"published entry {entry.seq} ({entry.content_sha256[:12]}...) "
-               f"to feed {ident.public_key_hex[:12]}...")
+               f"to feed {ident.public_key_hex[:12]}..."
+               + (f", superseding entry {supersedes}" if supersedes is not None else ""))
     conn = connect(ctx.obj["db_path"])
-    result = ingest_file(conn, path, is_user_log=True)
+    result = ingest_file(conn, path, is_user_log=True, author_seq=entry.seq, supersedes_seq=supersedes)
     if result.error:
         click.echo(f"warning: could not add it to your local search index: {result.error}", err=True)
 
@@ -690,6 +795,12 @@ def node_doctor(announce: bool, as_json: bool, public_port: int | None) -> None:
             report["bootstrap_unresolved"] = unresolved
             report["announced_this_run"] = announce_now
 
+            from roastmesh import bootstrap as bootstrap_mod
+            cached_rendezvous = bootstrap_mod.load_cached_rendezvous_hosts()
+            fetched_rendezvous = await bootstrap_mod.fetch_rendezvous_hosts()
+            rendezvous_hosts = bootstrap_mod.effective_rendezvous_hosts(cached_rendezvous, fetched_rendezvous)
+            report["rendezvous"] = await _probe_rendezvous_hosts(rendezvous_hosts)
+
             if as_json:
                 click.echo(json.dumps(report))
                 return
@@ -698,6 +809,56 @@ def node_doctor(announce: bool, as_json: bool, public_port: int | None) -> None:
             client.close()
 
     asyncio.run(run())
+
+
+async def _probe_rendezvous_hosts(hosts: list) -> list[dict]:
+    """Send a `hello` directly to each configured rendezvous host (bootstrap.py)
+    and see if it answers within a couple of seconds -- the standalone-diagnostic
+    equivalent of pinging the DHT bootstrap routers above, for the alternative
+    fast-discovery path net.serve() uses (wan_discovery.run_wan_discovery's
+    rendezvous_hosts). Any decodable hello reply counts, regardless of whose
+    pubkey it carries -- this is a liveness probe, not an identity check.
+    """
+    from roastmesh.hello import decode_hello, encode_hello
+    from roastmesh.wan_discovery import _resolve_rendezvous_hosts
+
+    if not hosts:
+        return []
+
+    loop = asyncio.get_event_loop()
+    replied: set[tuple[str, int]] = set()
+
+    class _Probe(asyncio.DatagramProtocol):
+        def datagram_received(self, data: bytes, addr) -> None:
+            if decode_hello(data) is not None:
+                replied.add(addr)
+
+    transport, _ = await loop.create_datagram_endpoint(_Probe, local_addr=("0.0.0.0", 0))
+    results: list[dict] = []
+    try:
+        payload = encode_hello("0" * 64, "doctor-probe")
+        resolved: dict[str, tuple[str, int] | None] = {}
+        for h in hosts:
+            addrs = await _resolve_rendezvous_hosts([(h.host, h.ip, h.port)])
+            addr = addrs[0] if addrs else None
+            resolved[h.host] = addr
+            if addr is not None:
+                try:
+                    transport.sendto(payload, addr)
+                except OSError:
+                    pass
+        if any(addr is not None for addr in resolved.values()):
+            await asyncio.sleep(2.0)
+        for h in hosts:
+            addr = resolved[h.host]
+            results.append({
+                "host": h.host,
+                "addr": f"{addr[0]}:{addr[1]}" if addr else None,
+                "ok": addr is not None and addr in replied,
+            })
+    finally:
+        transport.close()
+    return results
 
 
 async def _ask_router_for_external_ip() -> str | None:
@@ -745,6 +906,16 @@ def _print_doctor_report(r: dict) -> None:
                    "  that needs DNS will be broken too.")
     elif r["bootstrap_unresolved"]:
         click.echo(f"  ({r['bootstrap_unresolved']} did not resolve)")
+
+    if r.get("rendezvous"):
+        click.echo("\nrendezvous hosts (bootstrap.py, bypasses the DHT lookup entirely):")
+        for row in r["rendezvous"]:
+            if row["addr"] is None:
+                click.echo(f"  {row['host']:26} {'-':>15}  did not resolve")
+                continue
+            addr = row["addr"].rsplit(":", 1)[0]
+            click.echo(f"  {row['host']:26} {addr:>15}  {'replied' if row['ok'] else 'no reply'}")
+
     if not any(row["ok"] for row in r["bootstrap"]) and not r["state_nodes"]:
         click.echo("\nno bootstrap router answered and no known nodes -- "
                    "the DHT is unreachable from this network.")
@@ -1288,6 +1459,57 @@ def device_sync_cmd(once: bool) -> None:
             click.echo("no paired device was reachable")
 
     asyncio.run(_run())
+
+
+@device.command("stage-edit")
+@click.argument("roast_id")
+@click.option("--roasting-notes", default=None, help="New roasting-notes text.")
+@click.option("--cupping-notes", default=None, help="New cupping-notes text.")
+@click.pass_context
+def device_stage_edit(ctx: click.Context, roast_id: str, roasting_notes: str | None, cupping_notes: str | None) -> None:
+    """Edit a paired device's roast and stage the edit to sync back to it.
+
+    ROAST_ID must be a roast whose author_pubkey is one of your own paired
+    devices (found via search, same as anything else) -- this never touches
+    a stranger's or an unpaired peer's content. The edit is written into
+    your own private devices folder, addressed to that specific device
+    only (never mirrored to any other paired device -- see
+    device_sync.stage_file_for_owner), and delivered automatically the next
+    time that device is reachable (`device sync`, or the background watch
+    loop if a node is already running). Nothing here publishes anything --
+    it only gets the edited bytes to the machine that owns them; what that
+    device does with them next (e.g. `roastmesh notes edit --supersedes`
+    against its own feed) is up to whoever is at that device.
+    """
+    if roasting_notes is None and cupping_notes is None:
+        raise click.ClickException("nothing to edit -- pass --roasting-notes and/or --cupping-notes")
+
+    from roastmesh.alog.edit import set_notes
+    from roastmesh.gui import config as gui_config
+
+    conn = connect(ctx.obj["db_path"])
+    full_id = _resolve_roast_id(conn, roast_id)
+    source = repo.find_source_for_roast(conn, full_id)
+    if source is None:
+        raise click.ClickException(f"no such roast: {roast_id}")
+    owner_pubkey = source["author_pubkey"]
+    if not owner_pubkey or not devices_mod.is_trusted(owner_pubkey):
+        raise click.ClickException("this roast isn't from one of your paired devices")
+
+    old_bytes = Path(source["raw_path"]).read_bytes()
+    new_bytes = set_notes(old_bytes, roasting_notes=roasting_notes, cupping_notes=cupping_notes)
+
+    cfg = gui_config.load_config()
+    devices_dir = Path(cfg.devices_dir) if cfg.devices_dir else default_devices_dir()
+    state_path = default_device_sync_state_path()
+    return_relpath = f"edited/{full_id}.alog"
+    staging_relpath = device_sync.stage_file_for_owner(
+        devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath=return_relpath, content=new_bytes,
+    )
+    match = next((d for d in devices_mod.load_devices() if d.pubkey == owner_pubkey), None)
+    device_label = match.name if match else f"{owner_pubkey[:16]}..."
+    click.echo(f"staged edit for {device_label} at {staging_relpath} -- "
+               f"will sync to their RoastMeshDevices/{return_relpath} once reachable")
 
 
 @device.command("folder")

@@ -639,6 +639,8 @@ class SearchTab(Tab):
             self, self.app, roast_id, payload.get("record") or {}, payload.get("raw_path"),
             bool(payload.get("hidden")), on_change=self._on_run,
             blob_local=bool(payload.get("blob_local", True)),
+            is_published=bool(payload.get("is_published")),
+            is_from_paired_device=bool(payload.get("is_from_paired_device")),
         )
 
 
@@ -654,13 +656,15 @@ class RoastDetailWindow(tk.Toplevel):
     def __init__(
         self, parent: tk.Widget, app: "RoastmeshApp", roast_id: str, record: dict,
         raw_path: str | None, hidden: bool, *, on_change: Callable[[], None] | None = None,
-        blob_local: bool = True,
+        blob_local: bool = True, is_published: bool = False, is_from_paired_device: bool = False,
     ) -> None:
         super().__init__(parent)
         self.app = app
         self.roast_id = roast_id
         self.hidden = hidden
         self.on_change = on_change
+        self.is_published = is_published
+        self.is_from_paired_device = is_from_paired_device
         self.configure(bg=theme.BG)
         self.geometry(screen_geometry(self, 1040, 820))
         # Same on Windows: the chart is the point of this window, and it reads
@@ -716,11 +720,36 @@ class RoastDetailWindow(tk.Toplevel):
                 # (same reasoning as gui/chart.py's legend).
                 row(m.get("name") or t("?"), t("t={time}  BT={bt}  ET={et}", time=time_text, bt=bt_text, et=et_text))
 
-        notes = record.get("roasting_notes") or record.get("cupping_notes")
-        if notes:
-            tk.Label(self, text=t("Notes"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
-                fill="x", padx=14, pady=(10, 2))
-            explain(self, notes)
+        tk.Label(self, text=t("Notes"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
+            fill="x", padx=14, pady=(10, 2))
+        notes_frame = ttk.Frame(self)
+        notes_frame.pack(fill="x", padx=14)
+        tk.Label(notes_frame, text=t("Roasting notes:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
+                 anchor="w").pack(fill="x")
+        self.roasting_notes_text = tk.Text(notes_frame, height=3, wrap="word", font=("TkDefaultFont", 10))
+        self.roasting_notes_text.insert("1.0", record.get("roasting_notes") or "")
+        self.roasting_notes_text.pack(fill="x", pady=(0, 6))
+        tk.Label(notes_frame, text=t("Cupping notes:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
+                 anchor="w").pack(fill="x")
+        self.cupping_notes_text = tk.Text(notes_frame, height=3, wrap="word", font=("TkDefaultFont", 10))
+        self.cupping_notes_text.insert("1.0", record.get("cupping_notes") or "")
+        self.cupping_notes_text.pack(fill="x", pady=(0, 4))
+
+        notes_btn_row = ttk.Frame(self)
+        notes_btn_row.pack(fill="x", padx=14, pady=(0, 4))
+        if is_from_paired_device:
+            explain(self, t("This roast belongs to a paired device -- saving stages the edit to sync "
+                             "back to it, rather than changing anything here."))
+            ttk.Button(notes_btn_row, text=t("Send edit to device"),
+                       command=self._on_stage_edit).pack(side="left")
+        else:
+            if is_published:
+                explain(self, t("Already published -- saving publishes a new entry that supersedes "
+                                 "this one. The original stays in your feed, unchanged."))
+            ttk.Button(notes_btn_row, text=t("Save notes"), command=self._on_save_notes).pack(side="left")
+        self.notes_status_var = tk.StringVar(value="")
+        tk.Label(notes_btn_row, textvariable=self.notes_status_var, font=("TkDefaultFont", 9),
+                 fg=theme.MUTED, bg=theme.BG, anchor="w").pack(side="left", padx=(8, 0))
 
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=14, pady=(12, 2))
@@ -777,6 +806,44 @@ class RoastDetailWindow(tk.Toplevel):
         self.status_var.set(t("Hidden from your own search results.") if self.hidden else t("Unhidden."))
         if self.on_change:
             self.on_change()
+
+    def _on_save_notes(self) -> None:
+        roasting_notes = self.roasting_notes_text.get("1.0", "end-1c")
+        cupping_notes = self.cupping_notes_text.get("1.0", "end-1c")
+        argv = roastmesh_argv("--db", self.app.db_path.get(), "notes", "edit", self.roast_id,
+                               "--roasting-notes", roasting_notes, "--cupping-notes", cupping_notes)
+        self.notes_status_var.set(t("Saving..."))
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._on_notes_saved(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_notes_saved(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            self.notes_status_var.set(t("Couldn't save: {error}", error="".join(buf).strip()))
+            return
+        self.notes_status_var.set(t("Saved."))
+        if self.on_change:
+            self.on_change()
+
+    def _on_stage_edit(self) -> None:
+        roasting_notes = self.roasting_notes_text.get("1.0", "end-1c")
+        cupping_notes = self.cupping_notes_text.get("1.0", "end-1c")
+        argv = roastmesh_argv("--db", self.app.db_path.get(), "device", "stage-edit", self.roast_id,
+                               "--roasting-notes", roasting_notes, "--cupping-notes", cupping_notes)
+        self.notes_status_var.set(t("Staging..."))
+        buf: list[str] = []
+        task = Task(argv=argv)
+        task.start()
+        stream_into(task, buf.append, lambda code: self._on_edit_staged(code, buf),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _on_edit_staged(self, code: int, buf: list[str]) -> None:
+        if code != 0:
+            self.notes_status_var.set(t("Couldn't stage the edit: {error}", error="".join(buf).strip()))
+            return
+        self.notes_status_var.set(t("Staged -- will sync to that device once it's reachable."))
 
 
 class PublishTab(Tab):
@@ -1470,12 +1537,28 @@ class _PairingModal(tk.Toplevel):
         tk.Label(body, textvariable=self.status_var, font=FONT_BOLD, fg=theme.FG, bg=theme.BG,
                  anchor="w", wraplength=sp(480), justify="left").pack(fill="x", pady=(0, sp(8)))
 
+        # Tk's font fallback chain doesn't reliably include a color-emoji font
+        # at this size on every platform (confirmed missing on at least one
+        # Linux desktop) -- the glyphs then render as tofu/boxes even though
+        # pairing itself works fine. Try an explicit emoji font opportunistically
+        # (verified via actual() so a silent Tk substitution isn't mistaken for
+        # success), but treat the plain-text names below as the *real*
+        # comparison: they always render, regardless of font support.
+        emoji_font: tuple | tkfont.Font = ("TkDefaultFont", 28)
+        for family in ("Noto Color Emoji", "Noto Emoji", "Segoe UI Emoji", "Apple Color Emoji"):
+            try:
+                candidate = tkfont.Font(family=family, size=28)
+            except tk.TclError:
+                continue
+            if candidate.actual("family") == family:
+                emoji_font = candidate
+                break
         self.emoji_var = tk.StringVar(value="")
-        self.emoji_label = tk.Label(body, textvariable=self.emoji_var, font=("TkDefaultFont", 28),
+        self.emoji_label = tk.Label(body, textvariable=self.emoji_var, font=emoji_font,
                                     bg=theme.BG, fg=theme.FG, wraplength=sp(480), justify="center")
         self.names_var = tk.StringVar(value="")
-        self.names_label = tk.Label(body, textvariable=self.names_var, font=FONT_SMALL,
-                                    fg=theme.MUTED, bg=theme.BG, wraplength=sp(480), justify="center")
+        self.names_label = tk.Label(body, textvariable=self.names_var, font=("TkDefaultFont", 15, "bold"),
+                                    fg=theme.FG, bg=theme.BG, wraplength=sp(480), justify="center")
 
         buttons = ttk.Frame(body)
         buttons.pack(pady=(sp(2), 0))

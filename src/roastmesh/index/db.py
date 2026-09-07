@@ -49,6 +49,17 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     # so every already-ingested source is correctly "held" until eviction says
     # otherwise.
     ("sources", "blob_local", "INTEGER NOT NULL DEFAULT 1"),
+    # The feed.py seq this source's content was published as (same author's
+    # feed as author_pubkey), and -- when this entry supersedes an earlier
+    # one of the author's own entries -- that earlier entry's seq. Both NULL
+    # for a source with no known feed position (never published, or ingested
+    # before this column existed). Together these are the join key
+    # repository.search_roasts uses to resolve "is this roast superseded,
+    # and by what" via a correlated subquery at query time -- no stored
+    # roast-to-roast link, and no ordering requirement between when a
+    # superseding entry and the entry it supersedes each arrive.
+    ("sources", "author_seq", "INTEGER"),
+    ("sources", "supersedes_seq", "INTEGER"),
 ]
 
 
@@ -80,6 +91,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     # after that column is guaranteed to exist on both a fresh and an
     # upgraded database -- see schema.sql's comment by `sources`.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_author ON sources(author_pubkey)")
+    # Speeds up search_roasts' "NOT EXISTS (... supersedes_seq = ...)"
+    # correlated subquery -- same added-column reasoning as idx_sources_author
+    # just above (an index on a column _apply_added_columns just created
+    # can't live in schema.sql's own CREATE TABLE IF NOT EXISTS).
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_supersedes ON sources(author_pubkey, supersedes_seq)")
     _rebuild_fts_if_stale(conn)
     conn.commit()
 

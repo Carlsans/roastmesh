@@ -72,10 +72,33 @@ TOMBSTONE_MAX_AGE_DAYS = 90.0
 # client to learn to ignore a brand new top-level directory.
 _VERSIONS_DIR_NAME = ".roastmesh-versions"
 
+# A "cross-edit": a file staged here (stage_file_for_owner) is addressed to
+# one specific *other* paired device (its owner_pubkey/return_relpath, kept
+# in the "staged" section of the state file below) -- never broadcast-mirrored
+# to every paired device the way an ordinary file dropped in devices_dir is.
+# scan_folder ignores this directory entirely so a staged edit can never
+# leak into the normal full-mirror manifest.
+_STAGING_DIR_NAME = ".staging"
+
 
 # --------------------------------------------------------------------------
-# Sync state: relpath -> {sha256, size, mtime_ns, deleted, updated_at}
+# Sync state: {"records": relpath -> {sha256, size, mtime_ns, deleted,
+# updated_at}, "staged": staging_relpath -> {owner_pubkey, return_relpath,
+# sha256, updated_at}} -- one JSON file, two independent sections that must
+# each survive the other being saved (hence the read-modify-write in both
+# save_state and save_staged below, rather than either one overwriting the
+# whole file from just its own half).
 # --------------------------------------------------------------------------
+
+def _load_full_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
 
 def load_state(path: Path | None = None) -> dict:
     """The persisted local manifest: relpath -> record. Corrupt or missing
@@ -83,13 +106,7 @@ def load_state(path: Path | None = None) -> dict:
     takes toward its own file, since a mirror engine should degrade to "scan
     everything fresh" rather than refuse to run."""
     path = path or device_sync_state_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    records = data.get("records")
+    records = _load_full_state(path).get("records")
     return records if isinstance(records, dict) else {}
 
 
@@ -105,8 +122,31 @@ def _prune_old_tombstones(records: dict, *, now: float | None = None) -> dict:
 def save_state(records: dict, path: Path | None = None) -> None:
     path = path or device_sync_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_staged = _load_full_state(path).get("staged")
+    staged = existing_staged if isinstance(existing_staged, dict) else {}
     pruned = _prune_old_tombstones(records)
-    path.write_text(json.dumps({"v": STATE_VERSION, "records": pruned}, indent=2), encoding="utf-8")
+    path.write_text(json.dumps({"v": STATE_VERSION, "records": pruned, "staged": staged}, indent=2),
+                     encoding="utf-8")
+
+
+def load_staged(path: Path | None = None) -> dict:
+    """staging_relpath -> {owner_pubkey, return_relpath, sha256, updated_at}
+    -- every cross-edit currently waiting to be delivered to its owning
+    device. Same missing/corrupt-is-empty posture as load_state."""
+    path = path or device_sync_state_path()
+    staged = _load_full_state(path).get("staged")
+    return staged if isinstance(staged, dict) else {}
+
+
+def save_staged(staged: dict, path: Path | None = None) -> None:
+    path = path or device_sync_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_records = _load_full_state(path).get("records")
+    records = existing_records if isinstance(existing_records, dict) else {}
+    path.write_text(
+        json.dumps({"v": STATE_VERSION, "records": _prune_old_tombstones(records), "staged": staged}, indent=2),
+        encoding="utf-8",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -189,7 +229,7 @@ def scan_folder(devices_dir: Path, prev: dict) -> dict:
                 rel = path.relative_to(devices_dir).as_posix()
             except ValueError:
                 continue
-            if rel.split("/", 1)[0] == _VERSIONS_DIR_NAME:
+            if rel.split("/", 1)[0] in (_VERSIONS_DIR_NAME, _STAGING_DIR_NAME):
                 continue
             safe = _safe_relpath(rel)
             if safe is None:
@@ -512,6 +552,112 @@ async def reconcile_with_device(
         return SyncReport(peer_pubkey_hex=peer_pubkey_hex, pulled=pulled, pushed=pushed)
     finally:
         await ep.close()
+
+
+# --------------------------------------------------------------------------
+# Cross-edit staging: a file addressed to ONE specific other paired device,
+# never mirrored to anyone else -- "search finds a paired device's roast,
+# Edit stages a local copy, saving syncs it back to the owning device".
+# --------------------------------------------------------------------------
+
+def stage_file_for_owner(
+    devices_dir: Path, state_path: Path, *, owner_pubkey: str, return_relpath: str, content: bytes,
+) -> str:
+    """Copy `content` into devices_dir's staging area, tagged with which
+    device it belongs to and where it goes there. Returns the staging
+    relpath the file was actually written to (under _STAGING_DIR_NAME,
+    scan_folder never sees it -- it is not part of the ordinary full-mirror
+    manifest). push_staged_edits is what actually delivers it and clears
+    this entry once the owning device confirms receipt.
+    """
+    safe_return = _safe_relpath(return_relpath)
+    if safe_return is None:
+        raise ValueError(f"unsafe return_relpath: {return_relpath!r}")
+    if not devices.is_trusted(owner_pubkey):
+        raise ValueError(f"{owner_pubkey[:16]}... is not a paired device")
+
+    staging_relpath = f"{_STAGING_DIR_NAME}/{owner_pubkey}/{safe_return}"
+    target = Path(devices_dir) / staging_relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+
+    staged = load_staged(state_path)
+    staged[staging_relpath] = {
+        "owner_pubkey": owner_pubkey,
+        "return_relpath": safe_return,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "updated_at": time.time(),
+    }
+    save_staged(staged, state_path)
+    return staging_relpath
+
+
+async def push_staged_edits(
+    devices_dir: Path, state_path: Path, identity: Identity, known_tickets: dict[str, str], *,
+    relay: bool = True,
+) -> int:
+    """Deliver every currently-staged cross-edit whose owning device is
+    reachable right now (present in `known_tickets`, the same "who did we
+    last hear from" map _device_watch_loop/_auto_sync_discovered_peer
+    already maintain) directly to that device, at its own return_relpath --
+    NOT devices_dir's normal reconcile path, since a staged edit belongs to
+    exactly one device and must never be mirrored to any other paired
+    device. Clears the local staging copy once delivery is confirmed
+    (an "ok" response); an unreachable owner is retried on a later call
+    (the next tick, or the next time that device is discovered), same
+    resilience posture as the ordinary mirror push. Returns how many were
+    delivered this call.
+    """
+    staged = load_staged(state_path)
+    if not staged:
+        return 0
+
+    remaining = dict(staged)
+    delivered = 0
+    for staging_relpath, meta in staged.items():
+        if not isinstance(meta, dict):
+            remaining.pop(staging_relpath, None)
+            continue
+        owner_pubkey = meta.get("owner_pubkey")
+        return_relpath = meta.get("return_relpath")
+        if not owner_pubkey or not return_relpath:
+            remaining.pop(staging_relpath, None)  # malformed entry -- drop it, nothing to deliver
+            continue
+        ticket = known_tickets.get(owner_pubkey)
+        if ticket is None:
+            continue  # owner not currently reachable -- retried next time it's known-reachable
+
+        source = Path(devices_dir) / staging_relpath
+        try:
+            content = source.read_bytes()
+        except OSError:
+            remaining.pop(staging_relpath, None)  # gone locally (e.g. user deleted the staged copy)
+            continue
+
+        try:
+            ep = await net.bind_endpoint(identity, relay=relay)
+            try:
+                conn = await net.dial_with_fallback(ep, ticket, SYNC_ALPN)
+                response = await net._request(conn, {
+                    "op": "put_file", "path": return_relpath,
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                    "record": {"mtime_ns": 0, "updated_at": time.time()},
+                })
+            finally:
+                await ep.close()
+        except Exception:  # noqa: BLE001 -- unreachable/transport hiccup -- retry on a later pass
+            continue
+
+        if "error" in response:
+            continue
+
+        source.unlink(missing_ok=True)
+        remaining.pop(staging_relpath, None)
+        delivered += 1
+
+    if delivered:
+        save_staged(remaining, state_path)
+    return delivered
 
 
 # --------------------------------------------------------------------------

@@ -724,18 +724,65 @@ async def _watch_publish_loop(
 
 
 DEVICE_WATCH_INTERVAL_S = 5.0
+# Once a real filesystem watcher (watchdog) is running, polling only exists
+# as a safety net for an event a watcher can occasionally miss (a network
+# filesystem, or an editor's temp-file-then-rename dance) -- it can be far
+# slower than the "no watcher available" fallback above.
+DEVICE_WATCH_FALLBACK_POLL_S = 60.0
+# Coalesces a burst of raw filesystem events (a save that fires several
+# events -- delete+create, or multiple writes) into one reconcile pass
+# instead of several back-to-back ones.
+DEVICE_WATCH_DEBOUNCE_S = 0.2
+
+
+class _DeviceWatchHandler:
+    """watchdog's FileSystemEventHandler API is synchronous and runs on
+    watchdog's own thread -- this hands off to the asyncio loop via
+    call_soon_threadsafe (the only thread-safe way in) and debounces there,
+    not on the watcher thread, so the debounce timer is a plain asyncio
+    task the owning loop can see and cancel on shutdown.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, on_change) -> None:
+        self._loop = loop
+        self._on_change = on_change
+        self.pending_task: asyncio.Task | None = None
+
+    def _schedule(self) -> None:
+        if self.pending_task is not None and not self.pending_task.done():
+            self.pending_task.cancel()
+
+        async def _debounced() -> None:
+            await asyncio.sleep(DEVICE_WATCH_DEBOUNCE_S)
+            await self._on_change()
+
+        self.pending_task = asyncio.ensure_future(_debounced())
+
+    # watchdog calls this (any event: created/modified/deleted/moved) from
+    # its own thread -- must never touch asyncio state directly.
+    def dispatch(self, event) -> None:  # noqa: ANN001 -- watchdog's own event type
+        self._loop.call_soon_threadsafe(self._schedule)
 
 
 async def _device_watch_loop(
     devices_dir: Path, state_path: Path, identity: Identity, relay: bool,
     known_tickets: dict[str, str], interval_s: float = DEVICE_WATCH_INTERVAL_S,
 ) -> None:
-    """Poll the private device-sync folder on a timer (device_sync.scan_folder's
-    cheap mtime/size fingerprint pass -- see its own docstring) and, the
-    moment a change is noticed, push it out right away to every paired
-    device this node currently knows how to reach -- this is what makes
-    "drop a file on one device" show up on the other "within seconds"
-    rather than waiting for the next scheduled discovery round.
+    """React to changes in the private device-sync folder and push them out
+    right away to every paired device this node currently knows how to
+    reach -- this is what makes "drop a file on one device" show up on the
+    other "within seconds" rather than waiting for the next scheduled
+    discovery round.
+
+    Primarily driven by a real OS-level filesystem watcher (`watchdog`),
+    debounced (_DeviceWatchHandler) so one save doesn't trigger several
+    reconcile passes back to back. A plain timer poll always still runs
+    too, at `interval_s` if the watcher failed to start at all (e.g. an
+    unsupported filesystem), or `DEVICE_WATCH_FALLBACK_POLL_S` (much
+    slower) as a safety net once the watcher IS running -- a watcher can
+    occasionally miss an event (a network filesystem, or an editor's
+    temp-file-then-rename dance), and this is what catches that instead of
+    a change silently never propagating.
 
     The sync db is saved on every pass regardless of whether anything
     changed, so a SYNC_ALPN request served concurrently (net._handle_connection)
@@ -751,7 +798,9 @@ async def _device_watch_loop(
     from roastmesh import device_sync
     from roastmesh import devices as devices_mod
 
-    while True:
+    devices_dir = Path(devices_dir)
+
+    async def _pass() -> None:
         try:
             prev = device_sync.load_state(state_path)
             manifest = device_sync.scan_folder(devices_dir, prev)
@@ -768,9 +817,51 @@ async def _device_watch_loop(
                         )
                     except Exception as exc:  # noqa: BLE001 -- one unreachable device must not kill the loop
                         print(f"device-sync: push to {device.name!r} failed: {exc!r}", flush=True)
+            # Independent of `changed` above: a staged cross-edit's own
+            # delivery depends on ITS owning device becoming reachable, not
+            # on devices_dir changing again -- scan_folder doesn't even see
+            # .staging/ files, so `changed` would never reflect one anyway.
+            try:
+                await device_sync.push_staged_edits(devices_dir, state_path, identity, known_tickets, relay=relay)
+            except Exception as exc:  # noqa: BLE001 -- one failed delivery must not kill the loop
+                print(f"device-sync: staged-edit delivery failed: {exc!r}", flush=True)
         except Exception as exc:  # noqa: BLE001 -- housekeeping must not kill serve()
             print(f"device-sync: watch loop error: {exc!r}", flush=True)
-        await asyncio.sleep(interval_s)
+
+    observer = None
+    handler: _DeviceWatchHandler | None = None
+    try:
+        from watchdog.observers import Observer
+
+        # The folder is deliberately created here if missing, not left for
+        # the first pairing to create: a watcher needs a real path to watch
+        # from the moment this loop starts (enable_device_sync defaults on,
+        # per Part A's restart-gating fix, well before any device is
+        # necessarily paired yet).
+        devices_dir.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_running_loop()
+        handler = _DeviceWatchHandler(loop, _pass)
+        observer = Observer()
+        observer.schedule(handler, str(devices_dir), recursive=True)
+        observer.start()
+    except Exception as exc:  # noqa: BLE001 -- the poll below still works without a watcher
+        print(f"device-sync: filesystem watch unavailable, falling back to polling only: {exc!r}",
+              flush=True)
+        observer = None
+
+    poll_interval = interval_s if observer is None else DEVICE_WATCH_FALLBACK_POLL_S
+    try:
+        while True:
+            await _pass()
+            await asyncio.sleep(poll_interval)
+    finally:
+        if handler is not None and handler.pending_task is not None:
+            handler.pending_task.cancel()
+        if observer is not None:
+            observer.stop()
+            # join() blocks waiting for the watcher thread to exit -- off
+            # the event loop, so shutdown never stalls on it.
+            await asyncio.get_running_loop().run_in_executor(None, observer.join, 2)
 
 
 def _discovery_is_offline() -> bool:
@@ -824,6 +915,7 @@ async def serve(
     enable_device_sync: bool = True,
     devices_dir: Path | None = None,
     device_sync_state_path: Path | None = None,
+    device_sync_interval_s: float = DEVICE_WATCH_INTERVAL_S,
 ) -> None:
     """Bind a node and serve get_peers/get_feed requests forever.
 
@@ -877,12 +969,19 @@ async def serve(
     `devices_dir`/`device_sync_state_path` default to
     paths.default_devices_dir()/paths.device_sync_state_path() when not
     given. The background watch loop that pushes a local change out
-    immediately, and the reconcile-on-discovery catch-up, both additionally
-    only start when `roastmesh.devices.load_devices()` is non-empty
-    (nothing paired yet -- no reason to poll a folder or dial anyone) and
-    when discovery isn't forced offline (ROASTMESH_DISCOVERY_OFFLINE -- see
-    _discovery_is_offline; with discovery off there is no peer to reach
-    anyway).
+    immediately, and the reconcile-on-discovery catch-up, both run whenever
+    `enable_device_sync` is true and discovery isn't forced offline
+    (ROASTMESH_DISCOVERY_OFFLINE -- see _discovery_is_offline; with discovery
+    off there is no peer to reach anyway) -- deliberately NOT gated on
+    `roastmesh.devices.load_devices()` being non-empty at this moment: an
+    earlier version only started the watch loop when a device was already
+    paired *at serve() startup*, so pairing a new device while a node/GUI
+    was already running silently never activated live sync until the next
+    restart. Polling an empty/nonexistent devices folder is cheap
+    (device_sync.scan_folder no-ops when the directory doesn't exist), so
+    there is no real cost to always running it. `device_sync_interval_s`
+    controls that poll's cadence (default DEVICE_WATCH_INTERVAL_S); tests
+    shrink it so a mid-test pairing is picked up without a multi-second wait.
     """
     if _discovery_is_offline():
         # Only the *shared* channels are closed: the production LAN beacon
@@ -968,13 +1067,40 @@ async def serve(
     # away instead of waiting for that device to be rediscovered.
     known_device_tickets: dict[str, str] = {}
 
-    # Device sync only ever runs when there is at least one paired device to
-    # run it for, and only while this node is actually reaching the network
-    # at all -- with discovery forced offline there is nobody it could reach
-    # anyway (see this function's own docstring).
-    device_sync_active = (
-        enable_device_sync and not _discovery_is_offline() and bool(devices_mod.load_devices())
-    )
+    # Deliberately NOT conditioned on devices_mod.load_devices() being
+    # non-empty right now: that used to gate this, which meant pairing a
+    # device while serve() was already running never activated live sync
+    # until a restart (_device_watch_loop re-reads load_devices() itself on
+    # every pass, so it picks up a device paired mid-session on its very
+    # next tick -- but only if it's already running to have a "next tick").
+    # With discovery forced offline there is nobody to reach anyway (see
+    # this function's own docstring).
+    device_sync_active = enable_device_sync and not _discovery_is_offline()
+
+    # Shared by both discovery mechanisms: a hello/beacon claiming this
+    # device's own identity from an address that isn't one of this
+    # machine's own (routine same-host loopback aside) most plausibly means
+    # a cloned disk image or copied config directory carried identity.json
+    # along with it -- which silently makes every one of that other
+    # machine's peers look like "us" and get dropped, indistinguishable
+    # from "discovery is broken" until someone happens to delete the copied
+    # identity.json. Printed once per process, not per-occurrence: this is
+    # a one-time "something is misconfigured" notice for whoever is
+    # watching this node's log, not a recurring metric.
+    _warned_self_collision = False
+
+    def _on_self_identity_collision(source: str, source_ip: str) -> None:
+        nonlocal _warned_self_collision
+        if _warned_self_collision:
+            return
+        _warned_self_collision = True
+        from roastmesh.identity import default_identity_path
+        print(
+            f"{source}: received a hello claiming this device's own identity from {source_ip!r} -- "
+            "if this machine's config was copied or cloned from another roastmesh install, "
+            f"delete {default_identity_path()} and restart to generate a fresh identity.",
+            flush=True,
+        )
 
     background_tasks: list[asyncio.Task] = []
     if db_path is not None:
@@ -995,9 +1121,28 @@ async def serve(
         background_tasks.append(asyncio.create_task(run_beacon(
             identity.public_key_hex, ticket, _on_lan_discovered,
             port=lan_discovery_port, interval_s=lan_discovery_interval_s,
+            on_self_identity_collision=lambda ip: _on_self_identity_collision("lan", ip),
         )))
 
     if enable_wan_discovery:
+        # Fetched/cached rendezvous hosts (bootstrap.py) let run_wan_discovery
+        # hello a maintainer-run always-on node (moduloinfo.ca) directly on
+        # startup instead of waiting for the public DHT to converge -- a
+        # broken fetch/cache read must never block serve() from coming up.
+        rendezvous_addrs: list[tuple[str, str | None, int]] = []
+        try:
+            from roastmesh import bootstrap as bootstrap_mod
+            cached = bootstrap_mod.load_cached_rendezvous_hosts()
+            fetched = await bootstrap_mod.fetch_rendezvous_hosts()
+            if fetched:
+                bootstrap_mod.save_cached_rendezvous_hosts(fetched)
+            rendezvous_addrs = [
+                (h.host, h.ip, h.port)
+                for h in bootstrap_mod.effective_rendezvous_hosts(cached, fetched)
+            ]
+        except Exception as exc:  # noqa: BLE001 -- a broken bootstrap lookup must not block serve()
+            print(f"wan: rendezvous-host lookup failed: {exc!r}", flush=True)
+
         async def _on_wan_discovered(peer_pubkey_hex: str, peer_ticket: str) -> None:
             await _auto_sync_discovered_peer(
                 peer_pubkey_hex, peer_ticket, identity=identity,
@@ -1013,6 +1158,8 @@ async def serve(
             identity.public_key_hex, ticket, _on_wan_discovered,
             port=wan_discovery_port, lookup_interval_s=wan_discovery_interval_s,
             public_port=wan_public_port, auto_port=wan_auto_port, debug=debug,
+            rendezvous_hosts=rendezvous_addrs,
+            on_self_identity_collision=lambda ip: _on_self_identity_collision("wan", ip),
         )))
 
     if publish_watch_dir is not None:
@@ -1031,6 +1178,7 @@ async def serve(
     if device_sync_active:
         background_tasks.append(asyncio.create_task(_device_watch_loop(
             resolved_devices_dir, resolved_device_sync_state_path, identity, relay, known_device_tickets,
+            interval_s=device_sync_interval_s,
         )))
 
     try:

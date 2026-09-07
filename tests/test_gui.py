@@ -1282,3 +1282,53 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "IS_TOPLEVEL True" in r.stdout, r.stdout
     assert "TASK_IS_NONE True" in r.stdout, r.stdout
+
+
+def test_roast_detail_window_shows_editable_notes_for_your_own_roast(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp, RoastDetailWindow
+app = RoastmeshApp()
+app.update()
+record = {{"roasting_notes": "existing roasting note", "cupping_notes": "existing cupping note",
+          "beans_text": "", "milestones": []}}
+win = RoastDetailWindow(app, app, "abc123", record, "/tmp/fake.alog", False,
+                        is_published=False, is_from_paired_device=False)
+app.update()
+print("ROASTING_TEXT", repr(win.roasting_notes_text.get("1.0", "end-1c")))
+print("CUPPING_TEXT", repr(win.cupping_notes_text.get("1.0", "end-1c")))
+print("HAS_SAVE_METHOD", hasattr(win, "_on_save_notes"))
+win.destroy()
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "ROASTING_TEXT 'existing roasting note'" in r.stdout, r.stdout
+    assert "CUPPING_TEXT 'existing cupping note'" in r.stdout, r.stdout
+
+
+def test_roast_detail_window_offers_send_to_device_for_a_paired_devices_roast(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp, RoastDetailWindow
+app = RoastmeshApp()
+app.update()
+record = {{"roasting_notes": "", "cupping_notes": "", "beans_text": "", "milestones": []}}
+win = RoastDetailWindow(app, app, "abc123", record, "/tmp/fake.alog", False,
+                        is_published=True, is_from_paired_device=True)
+app.update()
+print("IS_FROM_PAIRED_DEVICE", win.is_from_paired_device)
+print("HAS_STAGE_EDIT_METHOD", hasattr(win, "_on_stage_edit"))
+win.destroy()
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "IS_FROM_PAIRED_DEVICE True" in r.stdout, r.stdout
+    assert "HAS_STAGE_EDIT_METHOD True" in r.stdout, r.stdout

@@ -107,6 +107,187 @@ def test_feed_publish_twice_appends_two_entries(tmp_path: Path, monkeypatch) -> 
     assert "entry 1" in second.output
 
 
+def test_feed_publish_supersedes_an_earlier_entry(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    feed_dir = tmp_path / "feed"
+    db_path = tmp_path / "cli.sqlite3"
+
+    runner.invoke(
+        main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish", str(FIXTURES_DIR / "kaleido_1.alog")]
+    )
+    result = runner.invoke(
+        main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish",
+               "--supersedes", "0", str(FIXTURES_DIR / "hottop_1.alog")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "entry 1" in result.output
+    assert "superseding entry 0" in result.output
+
+    default_search = runner.invoke(main, ["--db", str(db_path), "search", "--own-only"])
+    assert "[superseded]" not in default_search.output  # excluded entirely by default
+    assert len(default_search.output.strip().splitlines()) == 1  # only the superseding entry shows
+
+    all_search = runner.invoke(main, ["--db", str(db_path), "search", "--own-only", "--show-superseded"])
+    assert "[superseded]" in all_search.output
+    assert len(all_search.output.strip().splitlines()) == 2
+
+
+def test_feed_publish_rejects_a_supersedes_value_that_does_not_exist(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    feed_dir = tmp_path / "feed"
+    db_path = tmp_path / "cli.sqlite3"
+
+    runner.invoke(
+        main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish", str(FIXTURES_DIR / "kaleido_1.alog")]
+    )
+    result = runner.invoke(
+        main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish",
+               "--supersedes", "5", str(FIXTURES_DIR / "hottop_1.alog")]
+    )
+    assert result.exit_code != 0
+    assert "not an existing entry" in result.output
+
+
+def test_notes_edit_unpublished_roast_rewrites_in_place(tmp_path: Path, monkeypatch) -> None:
+    # edit_unpublished_roast_notes rewrites the file at its indexed raw_path
+    # in place -- ingest a COPY, never the checked-in fixture itself.
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    db_path = tmp_path / "cli.sqlite3"
+    roast_path = tmp_path / "kaleido_1.alog"
+    roast_path.write_bytes((FIXTURES_DIR / "kaleido_1.alog").read_bytes())
+
+    ingest_result = runner.invoke(main, ["--db", str(db_path), "ingest", str(roast_path)])
+    assert ingest_result.exit_code == 0, ingest_result.output
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    result = runner.invoke(
+        main, ["--db", str(db_path), "notes", "edit", roast_id, "--roasting-notes", "edited via CLI"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "in place" in result.output
+
+    reread_search = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    assert len(json.loads(reread_search.output)) == 1  # no new row was created
+    show_result = runner.invoke(main, ["--db", str(db_path), "show", roast_id, "--json"])
+    assert json.loads(show_result.output)["record"]["roasting_notes"] == "edited via CLI"
+
+
+def test_notes_edit_published_roast_publishes_a_superseding_entry(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    feed_dir = tmp_path / "feed"
+    db_path = tmp_path / "cli.sqlite3"
+
+    publish_result = runner.invoke(
+        main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish", str(FIXTURES_DIR / "kaleido_1.alog")]
+    )
+    assert publish_result.exit_code == 0, publish_result.output
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    result = runner.invoke(
+        main, ["--db", str(db_path), "notes", "edit", roast_id,
+               "--feed-dir", str(feed_dir), "--roasting-notes", "edited after publishing"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "superseding entry 0" in result.output
+
+    default_search = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    default_rows = json.loads(default_search.output)
+    assert len(default_rows) == 1
+    new_roast_id = default_rows[0]["roast_id"]
+    show_result = runner.invoke(main, ["--db", str(db_path), "show", new_roast_id, "--json"])
+    assert json.loads(show_result.output)["record"]["roasting_notes"] == "edited after publishing"
+
+    all_search = runner.invoke(main, ["--db", str(db_path), "search", "--show-superseded", "--json"])
+    assert len(json.loads(all_search.output)) == 2
+
+    # the ORIGINAL published entry/blob is untouched
+    verify_result = runner.invoke(main, ["feed", "--feed-dir", str(feed_dir), "verify"])
+    assert verify_result.exit_code == 0, verify_result.output
+    assert "OK" in verify_result.output
+
+
+def test_notes_edit_requires_at_least_one_field(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    db_path = tmp_path / "cli.sqlite3"
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    result = runner.invoke(main, ["--db", str(db_path), "notes", "edit", roast_id])
+    assert result.exit_code != 0
+    assert "nothing to edit" in result.output
+
+
+def test_device_stage_edit_stages_a_paired_devices_roast(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.devices import Device, add_device
+    from roastmesh.device_sync import load_staged
+    from roastmesh.paths import default_devices_dir
+
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    db_path = tmp_path / "cli.sqlite3"
+
+    owner_pubkey = "c" * 64
+    add_device(Device(pubkey=owner_pubkey, name="their-laptop", platform="linux",
+                       paired_at="2026-01-01T00:00:00+00:00"))
+
+    # Simulate a roast replicated from that paired device via the public
+    # feed -- author_pubkey is what makes it "theirs" for stage-edit's purposes.
+    ingest_result = runner.invoke(
+        main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")]
+    )
+    assert ingest_result.exit_code == 0, ingest_result.output
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE sources SET author_pubkey = ?", (owner_pubkey,))
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(
+        main, ["--db", str(db_path), "device", "stage-edit", roast_id, "--roasting-notes", "edited for them"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "their-laptop" in result.output
+
+    staged = load_staged()
+    assert len(staged) == 1
+    meta = next(iter(staged.values()))
+    assert meta["owner_pubkey"] == owner_pubkey
+    assert meta["return_relpath"] == f"edited/{roast_id}.alog"
+
+    staging_relpath = next(iter(staged))
+    staged_bytes = (default_devices_dir() / staging_relpath).read_bytes()
+    from roastmesh.alog.edit import parse_for_edit
+    data, _fmt = parse_for_edit(staged_bytes)
+    assert data["roastingnotes"] == "edited for them"
+
+
+def test_device_stage_edit_refuses_a_roast_not_from_a_paired_device(tmp_path: Path, monkeypatch) -> None:
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    db_path = tmp_path / "cli.sqlite3"
+
+    runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    result = runner.invoke(
+        main, ["--db", str(db_path), "device", "stage-edit", roast_id, "--roasting-notes", "x"],
+    )
+    assert result.exit_code != 0
+    assert "paired" in result.output
+
+
 def test_feed_verify_passes_on_own_feed(tmp_path: Path, monkeypatch) -> None:
     _isolate_home(monkeypatch, tmp_path)
     runner = CliRunner()

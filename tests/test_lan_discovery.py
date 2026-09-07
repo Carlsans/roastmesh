@@ -87,6 +87,71 @@ async def test_own_beacon_is_never_reported_as_discovered() -> None:
             pass
 
 
+async def test_self_broadcast_loopback_never_reports_a_collision() -> None:
+    """A solo beacon's own broadcast/multicast loops back to itself on
+    every single interval (see run_beacon/_BeaconProtocol's own docstrings)
+    -- on_self_identity_collision must never fire for that routine case,
+    only for a hello claiming our pubkey from an address that genuinely
+    isn't one of this machine's own."""
+    collisions: list[str] = []
+
+    task = asyncio.create_task(run_beacon(
+        "cc" + "0" * 62, "solo-ticket", lambda p, t: None, port=TEST_PORT + 3, interval_s=0.15,
+        on_self_identity_collision=collisions.append,
+    ))
+    try:
+        await asyncio.sleep(1.0)
+        assert collisions == []
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def test_beacon_protocol_ignores_a_self_pubkey_hello_from_a_known_local_address() -> None:
+    from roastmesh.hello import encode_hello
+    from roastmesh.lan_discovery import _BeaconProtocol
+
+    collisions: list[str] = []
+    proto = _BeaconProtocol(
+        "aa" * 32, lambda p, t: None,
+        own_local_addrs={"192.168.1.50", "127.0.0.1"},
+        on_self_identity_collision=collisions.append,
+    )
+    proto.datagram_received(encode_hello("aa" * 32, "ticket"), ("192.168.1.50", 12345))
+    assert collisions == []
+
+
+def test_beacon_protocol_flags_a_self_pubkey_hello_from_a_different_address() -> None:
+    from roastmesh.hello import encode_hello
+    from roastmesh.lan_discovery import _BeaconProtocol
+
+    collisions: list[str] = []
+    proto = _BeaconProtocol(
+        "aa" * 32, lambda p, t: None,
+        own_local_addrs={"192.168.1.50", "127.0.0.1"},
+        on_self_identity_collision=collisions.append,
+    )
+    proto.datagram_received(encode_hello("aa" * 32, "ticket"), ("10.0.0.99", 12345))
+    assert collisions == ["10.0.0.99"]
+
+
+def test_beacon_protocol_reports_a_colliding_address_only_once() -> None:
+    from roastmesh.hello import encode_hello
+    from roastmesh.lan_discovery import _BeaconProtocol
+
+    collisions: list[str] = []
+    proto = _BeaconProtocol(
+        "aa" * 32, lambda p, t: None, own_local_addrs=set(), on_self_identity_collision=collisions.append,
+    )
+    payload = encode_hello("aa" * 32, "ticket")
+    proto.datagram_received(payload, ("10.0.0.99", 12345))
+    proto.datagram_received(payload, ("10.0.0.99", 12345))
+    assert collisions == ["10.0.0.99"]
+
+
 async def test_repeated_beacons_are_debounced_within_resync_window() -> None:
     discovered: list[tuple[str, str]] = []
 

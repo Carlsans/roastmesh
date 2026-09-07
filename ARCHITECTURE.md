@@ -90,9 +90,33 @@ defense**; add per-peer trust weighting only if it becomes a real problem.
 - Peer exchange: on connect, peers swap known-peer lists.
 - Liveness pruning: drop peers unreachable for N days, but keep their replicated
   data.
+- **Rendezvous hosts** (`src/roastmesh/bootstrap.py`): the public BitTorrent
+  Mainline DHT lookup (`wan_discovery.py`) that finds other roastmesh nodes over
+  the internet is real infrastructure, and real DHT lookups can take minutes to
+  converge on a cold start. A rendezvous host is an always-on roastmesh node
+  (`moduloinfo.ca`, baked into the binary) that gets a `hello` datagram sent to
+  it directly on startup, bypassing the DHT lookup entirely -- a live one
+  answers in well under a second. The list is also fetched from
+  `BOOTSTRAP_NODES` at the repo root
+  (`https://raw.githubusercontent.com/Carlsans/roastmesh/master/BOOTSTRAP_NODES`),
+  so a maintainer can add or rotate rendezvous hosts without a new release;
+  `moduloinfo.ca` itself stays reachable even with GitHub unavailable, because
+  it's the hardcoded default the fetch/cache both fall back to.
 
 An always-on node (VPS, Pi) run by the maintainers removes availability concerns
 entirely, without becoming an authority.
+
+**Pitfall: cloned identities look like broken discovery.** Every discovery path
+(LAN beacon, WAN hello) drops a peer whose pubkey equals this node's own --
+necessary so a node's own broadcast/announce never gets treated as "a peer
+found." If a machine's config directory (or a whole disk image) is copied or
+cloned from another roastmesh install, `identity.json` comes along with it, so
+both machines share one Ed25519 keypair -- each one's "peer" then looks
+exactly like "myself" and is silently dropped, forever, with no error. This is
+indistinguishable from "discovery is broken" until someone happens to delete
+the copied `identity.json` and restart. Give each install its own identity;
+`node serve`'s log prints a one-time warning if a hello claiming this node's
+own identity ever arrives from an address that isn't this machine's own.
 
 ## Device pairing & private sync
 

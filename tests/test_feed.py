@@ -121,6 +121,117 @@ def test_verify_catches_corrupted_blob_bytes(tmp_path: Path, identity) -> None:
     assert "entry 0" in result.error
 
 
+def test_supersedes_round_trips_and_verifies(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+    append_entry(feed_dir, identity, FIXTURES[1], timestamp="2026-01-02T00:00:00Z", supersedes=0)
+
+    entries = read_entries(feed_dir)
+    assert entries[0].supersedes is None
+    assert entries[1].supersedes == 0
+    assert verify_feed(feed_dir).ok
+
+
+def test_supersedes_is_signed_not_decorative(tmp_path: Path, identity) -> None:
+    # Entry 1, identical in content whether or not it claims to supersede
+    # entry 0, must sign differently -- otherwise a relay could forge or
+    # strip the supersede marker without invalidating the signature. (Using
+    # entry index 1, not 0: index 0 has nothing valid to supersede, so
+    # forging "supersedes" onto it would trip the structural bounds check
+    # instead of isolating the signature check this test is about.)
+    feed_dir_a = tmp_path / "feed_a"
+    feed_dir_b = tmp_path / "feed_b"
+    for feed_dir in (feed_dir_a, feed_dir_b):
+        append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+        append_entry(feed_dir, identity, FIXTURES[1], timestamp="2026-01-02T00:00:00Z")
+
+    entry_a = read_entries(feed_dir_a)[1]
+    entry_path_b = feed_dir_b / "entries" / "00000001.json"
+    data_b = json.loads(entry_path_b.read_text())
+    data_b["supersedes"] = 0  # forge it post-hoc, as a relay would have to
+    entry_path_b.write_text(json.dumps(data_b))
+    entry_b = read_entries(feed_dir_b)[1]
+
+    assert entry_a.signature == entry_b.signature  # same bytes were actually signed
+    result = verify_feed(feed_dir_b)
+    assert not result.ok  # forged supersedes changed the signed payload -> signature no longer matches
+    assert "invalid signature" in result.error
+
+
+def test_verify_rejects_supersedes_pointing_at_or_past_itself(tmp_path: Path, identity) -> None:
+    feed_dir = tmp_path / "feed"
+    append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+    append_entry(feed_dir, identity, FIXTURES[1], timestamp="2026-01-02T00:00:00Z", supersedes=1)  # itself
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    assert result.valid_count == 1
+    assert "invalid seq" in result.error
+
+
+def test_verify_rejects_negative_supersedes(tmp_path: Path, identity) -> None:
+    # A tampered-then-not-resigned supersedes would just trip the signature
+    # check first (it's part of the signed payload) -- to isolate the
+    # structural bounds check itself, construct an entry legitimately signed
+    # with a nonsensical supersedes, the way a buggy client might.
+    from roastmesh.feed import FeedEntry
+
+    feed_dir = tmp_path / "feed"
+    append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+    entry0 = read_entries(feed_dir)[0]
+    prev_hash = hashlib.sha256(entry0.canonical_stored_bytes()).hexdigest()
+
+    raw_bytes = FIXTURES[1].read_bytes()
+    content_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    (feed_dir / "blobs" / f"{content_sha256}.alog").write_bytes(raw_bytes)
+
+    unsigned = FeedEntry(seq=1, content_sha256=content_sha256, timestamp="2026-01-02T00:00:00Z",
+                          prev_hash=prev_hash, size_bytes=len(raw_bytes), signature="", supersedes=-1)
+    signature = identity.sign(unsigned.canonical_signed_bytes()).hex()
+    entry = FeedEntry(seq=1, content_sha256=content_sha256, timestamp="2026-01-02T00:00:00Z",
+                       prev_hash=prev_hash, size_bytes=len(raw_bytes), signature=signature, supersedes=-1)
+    (feed_dir / "entries" / "00000001.json").write_text(json.dumps(entry.__dict__, sort_keys=True))
+
+    result = verify_feed(feed_dir)
+    assert not result.ok
+    assert result.valid_count == 1
+    assert "invalid seq" in result.error
+
+
+def test_read_entries_tolerates_an_unrecognized_future_field(tmp_path: Path, identity) -> None:
+    # The other direction of backward compat: THIS code encountering a field
+    # even newer than `supersedes` that it doesn't know about yet must not
+    # crash the way a bare FeedEntry(**data) would.
+    feed_dir = tmp_path / "feed"
+    append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+
+    entry_path = feed_dir / "entries" / "00000000.json"
+    data = json.loads(entry_path.read_text())
+    data["some_field_from_the_future"] = "unknown to this code"
+    entry_path.write_text(json.dumps(data))
+
+    entries = read_entries(feed_dir)  # must not raise
+    assert entries[0].seq == 0
+
+
+def test_old_style_entry_with_no_supersedes_key_still_parses(tmp_path: Path, identity) -> None:
+    # The "old data, new code" direction: an entry stored before this field
+    # existed has no "supersedes" key in its JSON at all -- simulate that by
+    # stripping the key a freshly-written entry does carry (as None, via
+    # entry.__dict__) and confirming it still loads and verifies.
+    feed_dir = tmp_path / "feed"
+    append_entry(feed_dir, identity, FIXTURES[0], timestamp="2026-01-01T00:00:00Z")
+
+    entry_path = feed_dir / "entries" / "00000000.json"
+    data = json.loads(entry_path.read_text())
+    data.pop("supersedes", None)
+    entry_path.write_text(json.dumps(data))
+
+    entries = read_entries(feed_dir)
+    assert entries[0].supersedes is None
+    assert verify_feed(feed_dir).ok
+
+
 def test_verify_catches_deleted_middle_entry(tmp_path: Path, identity) -> None:
     feed_dir = tmp_path / "feed"
     _publish_all(feed_dir, identity)

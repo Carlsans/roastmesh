@@ -1087,3 +1087,287 @@ async def test_serve_with_enable_device_sync_false_behaves_exactly_as_before(tmp
         assert report.verify.ok
     finally:
         await _stop_server(task)
+
+
+async def test_serve_starts_device_watch_loop_even_with_no_paired_devices_yet(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression test: the device-sync watch loop used to only be scheduled
+    if devices.load_devices() was already non-empty *at serve() startup* --
+    so a freshly-set-up node (nothing paired yet) never even created the
+    sync state file, and pairing a device afterwards silently never
+    activated live sync until a restart. The loop must now run
+    unconditionally (cheaply, since scan_folder no-ops on an empty/missing
+    devices_dir) so the sync state file appears regardless."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # device_sync_active also requires discovery not be forced offline (see
+    # net.serve's docstring) -- conftest sets this "1" for the whole suite so
+    # the other network-touching discovery mechanisms never hit the real LAN
+    # or DHT; override it here since this test's device_sync_interval_s/
+    # devices_dir/state_path are already fully isolated to tmp_path.
+    monkeypatch.setenv("ROASTMESH_DISCOVERY_OFFLINE", "0")
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+
+    ready: asyncio.Future = asyncio.get_event_loop().create_future()
+    task = asyncio.create_task(net.serve(
+        identity, tmp_path / "feed", tmp_path / "peers.json", relay=False,
+        ready_callback=ready.set_result, enable_lan_discovery=False,
+        enable_device_sync=True, devices_dir=devices_dir, device_sync_state_path=state_path,
+        device_sync_interval_s=0.05,
+    ))
+    await asyncio.wait_for(ready, timeout=10)
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if state_path.exists():
+                break
+        assert state_path.exists(), "watch loop never ran -- an empty devices.json at startup must not skip it"
+    finally:
+        await _stop_server(task)
+
+
+async def test_device_watch_loop_reconciles_a_device_paired_after_it_started(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The loop re-reads devices.load_devices() every pass -- this is what
+    lets a device paired *while serve() is already running* start getting
+    pushed to on the very next tick, instead of requiring a restart (the bug
+    Step 2 of the v0.6.21 follow-up plan fixes)."""
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    devices_dir.mkdir()
+    state_path = tmp_path / "state.json"
+
+    calls: list[str] = []
+
+    async def fake_reconcile(ticket_str, ident, ddir, spath, *, relay=True):
+        calls.append(ticket_str)
+
+    monkeypatch.setattr(device_sync, "reconcile_with_device", fake_reconcile)
+
+    known_tickets: dict[str, str] = {}
+    task = asyncio.create_task(net._device_watch_loop(
+        devices_dir, state_path, identity, True, known_tickets, interval_s=0.05,
+    ))
+    try:
+        # Nothing paired yet -- a few ticks must not error or call reconcile.
+        await asyncio.sleep(0.15)
+        assert calls == []
+
+        # Pair a device *after* the loop is already running (this used to
+        # require a restart of the whole node) and make it "reachable" the
+        # same way discovery would (net._auto_sync_discovered_peer populates
+        # known_tickets unconditionally on every discovery).
+        pubkey = "e" * 64
+        add_device(Device(pubkey=pubkey, name="new", platform="linux",
+                           paired_at="2026-01-01T00:00:00+00:00"))
+        known_tickets[pubkey] = "fake-ticket"
+        (devices_dir / "roast.alog").write_bytes(b"hello")
+
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if calls:
+                break
+        assert calls == ["fake-ticket"]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_device_watch_loop_reacts_to_a_real_filesystem_event_fast(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A real watchdog.observers.Observer against a real temp dir -- proves
+    the thread-safe hand-off (call_soon_threadsafe) actually works, not
+    just the reconcile logic in isolation. interval_s is set absurdly long
+    (far longer than this test's own timeout) so a pass succeeding at all
+    can only be attributable to the filesystem watcher, not the poll."""
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+
+    calls: list[str] = []
+
+    async def fake_reconcile(ticket_str, ident, ddir, spath, *, relay=True):
+        calls.append(ticket_str)
+
+    monkeypatch.setattr(device_sync, "reconcile_with_device", fake_reconcile)
+
+    pubkey = "f" * 64
+    add_device(Device(pubkey=pubkey, name="watched", platform="linux",
+                       paired_at="2026-01-01T00:00:00+00:00"))
+    known_tickets = {pubkey: "fake-ticket"}
+
+    task = asyncio.create_task(net._device_watch_loop(
+        devices_dir, state_path, identity, True, known_tickets, interval_s=999.0,
+    ))
+    try:
+        await asyncio.sleep(0.2)  # let the observer actually start watching
+        (devices_dir / "roast.alog").write_bytes(b"hello")
+
+        for _ in range(50):  # 5s budget, comfortably under interval_s=999
+            await asyncio.sleep(0.1)
+            if calls:
+                break
+        assert calls == ["fake-ticket"]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_device_watch_loop_coalesces_a_burst_of_writes(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+
+    call_count = 0
+
+    async def fake_reconcile(ticket_str, ident, ddir, spath, *, relay=True):
+        nonlocal call_count
+        call_count += 1
+
+    monkeypatch.setattr(device_sync, "reconcile_with_device", fake_reconcile)
+
+    pubkey = "a1" * 32
+    add_device(Device(pubkey=pubkey, name="watched", platform="linux",
+                       paired_at="2026-01-01T00:00:00+00:00"))
+    known_tickets = {pubkey: "fake-ticket"}
+
+    task = asyncio.create_task(net._device_watch_loop(
+        devices_dir, state_path, identity, True, known_tickets, interval_s=999.0,
+    ))
+    try:
+        await asyncio.sleep(0.2)
+        for i in range(10):  # a burst of writes well within the debounce window
+            (devices_dir / f"roast{i}.alog").write_bytes(f"hello {i}".encode())
+
+        await asyncio.sleep(2.0)  # comfortably past DEVICE_WATCH_DEBOUNCE_S settling
+        assert call_count == 1, f"expected one coalesced reconcile pass, got {call_count}"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_device_watch_loop_falls_back_to_polling_when_watchdog_unavailable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """If starting the real filesystem watcher fails for any reason (an
+    unsupported filesystem, a missing OS facility), the loop must still
+    work -- via interval_s, not silently stop reacting to changes at all."""
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+    import watchdog.observers
+
+    def _broken_observer(*a, **k):
+        raise OSError("simulated: no filesystem watch facility available")
+
+    monkeypatch.setattr(watchdog.observers, "Observer", _broken_observer)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    devices_dir.mkdir()
+    state_path = tmp_path / "state.json"
+
+    calls: list[str] = []
+
+    async def fake_reconcile(ticket_str, ident, ddir, spath, *, relay=True):
+        calls.append(ticket_str)
+
+    monkeypatch.setattr(device_sync, "reconcile_with_device", fake_reconcile)
+
+    pubkey = "b2" * 32
+    add_device(Device(pubkey=pubkey, name="polled", platform="linux",
+                       paired_at="2026-01-01T00:00:00+00:00"))
+    known_tickets = {pubkey: "fake-ticket"}
+
+    task = asyncio.create_task(net._device_watch_loop(
+        devices_dir, state_path, identity, True, known_tickets, interval_s=0.05,
+    ))
+    try:
+        (devices_dir / "roast.alog").write_bytes(b"hello")
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if calls:
+                break
+        assert calls == ["fake-ticket"]  # picked up by the interval_s poll, no watcher running
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_device_watch_loop_delivers_a_staged_cross_edit(tmp_path: Path, monkeypatch) -> None:
+    """_device_watch_loop must drive device_sync.push_staged_edits too, not
+    only the ordinary mirror-to-everyone reconcile -- a staged cross-edit
+    sitting in .staging/ never shows up as a `changed` manifest entry
+    (scan_folder ignores that directory entirely), so its delivery cannot
+    be left implicitly gated on that flag."""
+    from roastmesh import device_sync
+    from roastmesh.devices import Device, add_device
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+
+    owner_pubkey = "c3" * 32
+    add_device(Device(pubkey=owner_pubkey, name="owner", platform="linux",
+                       paired_at="2026-01-01T00:00:00+00:00"))
+    staging_relpath = device_sync.stage_file_for_owner(
+        devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath="roast.alog",
+        content=b"edited bytes",
+    )
+
+    delivered_paths: list[str] = []
+
+    async def fake_push_staged_edits(ddir, spath, ident, known_tickets, *, relay=True):
+        if owner_pubkey in known_tickets:
+            delivered_paths.append(staging_relpath)
+            return 1
+        return 0
+
+    monkeypatch.setattr(device_sync, "push_staged_edits", fake_push_staged_edits)
+
+    known_tickets = {owner_pubkey: "owner-ticket"}
+    task = asyncio.create_task(net._device_watch_loop(
+        devices_dir, state_path, identity, True, known_tickets, interval_s=0.05,
+    ))
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if delivered_paths:
+                break
+        assert delivered_paths == [staging_relpath]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

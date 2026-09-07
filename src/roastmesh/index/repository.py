@@ -25,6 +25,29 @@ def find_roast_id_by_source(conn: sqlite3.Connection, source_id: str) -> str | N
     return row["roast_id"] if row else None
 
 
+def find_source_for_roast(conn: sqlite3.Connection, roast_id: str) -> sqlite3.Row | None:
+    """The sources row backing one roast -- source_id, raw_path, source_type,
+    author_pubkey, author_seq/supersedes_seq -- everything an in-place notes
+    edit or a supersede-publish decision needs to know about where a roast
+    actually came from."""
+    return conn.execute(
+        "SELECT s.* FROM sources s JOIN roasts r ON r.source_id = s.source_id WHERE r.roast_id = ?",
+        (roast_id,),
+    ).fetchone()
+
+
+def update_source_content(conn: sqlite3.Connection, source_id: str, *, content_sha256: str, raw_path: str) -> None:
+    """Point an existing source row at rewritten bytes on disk -- used only
+    for a NOT-yet-published roast's in-place notes edit (ingest.
+    edit_unpublished_roast_notes), never for anything with a feed position:
+    a published entry's bytes are exactly what was signed and must never be
+    silently repointed."""
+    conn.execute(
+        "UPDATE sources SET content_sha256 = ?, raw_path = ? WHERE source_id = ?",
+        (content_sha256, raw_path, source_id),
+    )
+
+
 def find_all_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Every currently-known source (raw_path, source_type, source_ref)
     plus its roast's is_user_log -- everything ingest.refresh_known_sources
@@ -68,13 +91,17 @@ def insert_source(
     raw_path: str,
     content_sha256: str,
     author_pubkey: str | None = None,
+    author_seq: int | None = None,
+    supersedes_seq: int | None = None,
 ) -> None:
     conn.execute(
         """INSERT INTO sources (source_id, source_type, source_ref, source_url,
-                                 fetched_at, raw_path, content_sha256, author_pubkey)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                 fetched_at, raw_path, content_sha256, author_pubkey,
+                                 author_seq, supersedes_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (source_id, source_type, source_ref, source_url,
-         datetime.now(timezone.utc).isoformat(), raw_path, content_sha256, author_pubkey),
+         datetime.now(timezone.utc).isoformat(), raw_path, content_sha256, author_pubkey,
+         author_seq, supersedes_seq),
     )
 
 
@@ -85,6 +112,19 @@ def set_source_author_pubkey(conn: sqlite3.Connection, source_id: str, author_pu
     content happens to be (re-)ingested -- the same self-healing pattern
     already used for `roasts`' derived fields (see insert_roast)."""
     conn.execute("UPDATE sources SET author_pubkey = ? WHERE source_id = ?", (author_pubkey, source_id))
+
+
+def set_source_seq_info(
+    conn: sqlite3.Connection, source_id: str, author_seq: int | None, supersedes_seq: int | None,
+) -> None:
+    """Same self-healing pattern as set_source_author_pubkey, for the two
+    feed-position columns -- lets a re-ingest of already-known content (e.g.
+    refresh_known_sources, or content re-synced after this column existed)
+    backfill them without a separate migration pass."""
+    conn.execute(
+        "UPDATE sources SET author_seq = ?, supersedes_seq = ? WHERE source_id = ?",
+        (author_seq, supersedes_seq, source_id),
+    )
 
 
 def claim_orphan_local_sources(conn: sqlite3.Connection, author_pubkey: str) -> int:
@@ -202,6 +242,12 @@ class RoastSearchRow:
     # False for a roast whose blob was evicted to a search-only stub
     # (replication.py): still findable, bytes fetched on demand when opened.
     blob_local: bool = True
+    # True when some other source (same author_pubkey) has supersedes_seq
+    # pointing at this row's author_seq -- an edit of this roast was
+    # published later. Excluded from search_roasts by default
+    # (include_superseded=False); the roast itself and its feed entry are
+    # never touched (ARCHITECTURE.md's Core Model -- append-only).
+    superseded: bool = False
 
 
 def _fts_query(text: str) -> str:
@@ -226,12 +272,17 @@ def search_roasts(
     include_hidden: bool = False,
     user_pubkey: str | None = None,
     favorites_only: bool = False,
+    include_superseded: bool = False,
 ) -> list[RoastSearchRow]:
     sql = """
         SELECT r.roast_id, r.machine_key, r.mechanism_family, r.roast_type,
                r.batch_weight_in_g, r.density_g_per_l, r.title, r.beans_text, r.roast_date,
                r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, s.author_pubkey,
                s.blob_local,
+               EXISTS(
+                   SELECT 1 FROM sources s2
+                   WHERE s2.author_pubkey = s.author_pubkey AND s2.supersedes_seq = s.author_seq
+               ) AS is_superseded,
                p.dtr_pct, p.total_time_s,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'DROP') AS drop_bt_c,
                (SELECT bt_c FROM milestones m WHERE m.roast_id = r.roast_id AND m.name = 'SC_START') AS sc_start_bt_c
@@ -287,6 +338,11 @@ def search_roasts(
         conditions.append("r.is_user_log = 1")
     if not include_hidden:
         conditions.append("r.hidden = 0")
+    if not include_superseded:
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM sources s2 WHERE s2.author_pubkey = s.author_pubkey "
+            "AND s2.supersedes_seq = s.author_seq)"
+        )
 
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
@@ -313,6 +369,7 @@ def search_roasts(
             hidden=bool(row["hidden"]),
             author_pubkey=row["author_pubkey"],
             blob_local=bool(row["blob_local"]),
+            superseded=bool(row["is_superseded"]),
         )
         for row in cur.fetchall()
         # after_second_crack can't be expressed as a plain SQL predicate

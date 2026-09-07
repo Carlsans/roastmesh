@@ -70,6 +70,8 @@ def ingest_file(
     machine_key: str | None = None,
     mechanism_family: str | None = None,
     local_pubkey_hex: str | None = _UNSET,  # type: ignore[assignment]
+    author_seq: int | None = None,
+    supersedes_seq: int | None = None,
 ) -> IngestResult:
     path = Path(path)
     source_ref = source_ref or str(path)
@@ -125,6 +127,12 @@ def ingest_file(
         # refresh_known_sources's re-ingest of every already-known source
         # actually populate it, without a separate migration-time pass.
         repo.set_source_author_pubkey(conn, existing["source_id"], author_pubkey)
+        # Only when the caller actually knows something: refresh_known_sources'
+        # re-ingest has no feed to consult and passes neither, and must not
+        # wipe an already-correct author_seq/supersedes_seq back to NULL just
+        # because this particular call site can't re-derive them.
+        if author_seq is not None or supersedes_seq is not None:
+            repo.set_source_seq_info(conn, existing["source_id"], author_seq, supersedes_seq)
         conn.commit()
         return IngestResult(record, True, None)
 
@@ -138,8 +146,59 @@ def ingest_file(
         raw_path=str(path),
         content_sha256=content_sha256,
         author_pubkey=author_pubkey,
+        author_seq=author_seq,
+        supersedes_seq=supersedes_seq,
     )
     repo.insert_roast(conn, record, source_id)
+    conn.commit()
+    return IngestResult(record, False, None)
+
+
+def edit_unpublished_roast_notes(
+    conn: sqlite3.Connection, roast_id: str, *,
+    roasting_notes: str | None = None, cupping_notes: str | None = None,
+) -> IngestResult:
+    """Edit an as-yet-unpublished roast's notes in place: rewrite its .alog
+    file (alog.edit.set_notes_in_file) and update that SAME roast_id/
+    source_id row from the re-parsed content -- no new row, no feed
+    involvement, since there is no hash-chain constraint on a file that was
+    never published.
+
+    Refuses a roast that IS published (sources.author_seq is not None) --
+    that must go through a superseding publish instead (cli.py's `feed
+    publish --supersedes`, or the equivalent GUI flow), never an in-place
+    rewrite: a published entry's bytes are exactly what its signature
+    covers and must never be silently repointed.
+    """
+    from roastmesh.alog.edit import AlogEditError, set_notes_in_file
+
+    source = repo.find_source_for_roast(conn, roast_id)
+    if source is None:
+        return IngestResult(None, False, f"no such roast: {roast_id}")
+    if source["author_seq"] is not None:
+        return IngestResult(None, False,
+                             "this roast is already published -- edit it with a superseding "
+                             "publish instead of an in-place rewrite")
+
+    path = Path(source["raw_path"])
+    try:
+        set_notes_in_file(path, roasting_notes=roasting_notes, cupping_notes=cupping_notes)
+    except (OSError, AlogEditError) as exc:
+        return IngestResult(None, False, f"could not rewrite {path}: {exc}")
+
+    raw_bytes = path.read_bytes()
+    content_sha256 = repo.sha256_bytes(raw_bytes)
+    try:
+        raw, _fmt = formats.detect_and_parse(raw_bytes)
+    except formats.RoastParseError as exc:
+        return IngestResult(None, False, f"{path}: {exc}")
+
+    source_meta = SourceMeta(source_type=source["source_type"], source_ref=source["source_ref"])
+    record = to_roast_record(raw, source_meta, is_user_log=True)
+    record.roast_id = roast_id
+
+    repo.update_source_content(conn, source["source_id"], content_sha256=content_sha256, raw_path=str(path))
+    repo.insert_roast(conn, record, source["source_id"])
     conn.commit()
     return IngestResult(record, False, None)
 
@@ -219,6 +278,8 @@ def ingest_feed(
             source_type=source_type,
             source_ref=f"{pubkey_hex}:{entry.seq:08d}",
             is_user_log=is_user_log,
+            author_seq=entry.seq,
+            supersedes_seq=entry.supersedes,
         )
         for entry in entries
     ]

@@ -1,0 +1,37 @@
+[Unit]
+Description=roastmesh node (%i)
+Documentation=https://github.com/Carlsans/roastmesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+# NOT %h: confirmed on a real system unit that %h resolves against the
+# service MANAGER's own context (root, for the system instance) at
+# specifier-expansion time, not against User=%i above despite systemd.unit(5)
+# reading as though it should -- observed directly (ExecStart failed with
+# "Unable to locate executable '/root/.local/bin/roastmesh'"). /home/%i is
+# where install.sh actually puts the binary (~/.local/bin, no sudo) on every
+# real target (Pi, VPS, desktop); if some host's users don't live under
+# /home, override this ExecStart= line for that host specifically. Add
+# --wan-port/--public-port here (or via a drop-in:
+# `systemctl edit roastmesh-node@%i`) if this host has a specific port
+# forwarded on its router.
+#
+# --db is required here: the CLI's own default ("roastmesh.sqlite3") is
+# cwd-relative, meant for a terminal user running from a project directory
+# (see cli.py's DEFAULT_DB) -- a systemd unit's cwd defaults to / , which
+# %i can't write to, so without this the replication pass fails every
+# round ("unable to open database file") even though serving itself still
+# works. index/db.py's default_db_path() (data_dir()/index.sqlite3) is the
+# same path the GUI and every real deployment already use -- confirmed
+# directly on the Pi.
+ExecStart=/home/%i/.local/bin/roastmesh --db /home/%i/.local/share/roastmesh/index.sqlite3 node serve --wan-discovery --public-port auto
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

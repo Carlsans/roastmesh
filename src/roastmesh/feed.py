@@ -20,6 +20,7 @@ replication protocol.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -67,17 +68,46 @@ class FeedEntry:
     prev_hash: str
     size_bytes: int
     signature: str  # hex
+    # The seq (in this SAME feed) this entry supersedes, or None. A feed is
+    # single-owner, so this can only ever reference the author's own earlier
+    # work -- never a forged claim about someone else's entry. Defaults to
+    # None so every entry ever written before this field existed still
+    # constructs fine. See read_entries' unknown-key filter for the other
+    # half of the backward-compat story (an old reader encountering THIS
+    # field, not this reader encountering an older or newer one).
+    supersedes: int | None = None
 
     def signed_fields(self) -> dict:
-        return {"seq": self.seq, "content_sha256": self.content_sha256,
-                "timestamp": self.timestamp, "prev_hash": self.prev_hash,
-                "size_bytes": self.size_bytes}
+        # `supersedes` is omitted entirely (not just set to None) when unset,
+        # not included unconditionally -- every entry ever signed before this
+        # field existed was signed over exactly {seq, content_sha256,
+        # timestamp, prev_hash, size_bytes}. Including "supersedes": None
+        # unconditionally here would change canonical_signed_bytes() for
+        # EVERY existing entry, silently invalidating every signature ever
+        # produced and every hash-chain link derived from
+        # canonical_stored_bytes(). Only an entry that actually sets
+        # `supersedes` opts into the new, larger signed payload.
+        fields = {"seq": self.seq, "content_sha256": self.content_sha256,
+                  "timestamp": self.timestamp, "prev_hash": self.prev_hash,
+                  "size_bytes": self.size_bytes}
+        if self.supersedes is not None:
+            fields["supersedes"] = self.supersedes
+        return fields
 
     def canonical_signed_bytes(self) -> bytes:
         return _canonical_json(self.signed_fields())
 
     def canonical_stored_bytes(self) -> bytes:
         return _canonical_json({**self.signed_fields(), "signature": self.signature})
+
+
+# Every field FeedEntry knows about -- read_entries filters incoming stored
+# JSON down to this set before constructing one, so a field a FUTURE version
+# of this code adds (the way `supersedes` was added to a strict 6-field
+# dataclass) never crashes an older reader that doesn't recognize it yet,
+# instead of the unfiltered `FeedEntry(**data)` TypeError that would
+# otherwise reject an entire peer's feed over one unrecognized key.
+_FEEDENTRY_FIELDS = {f.name for f in dataclasses.fields(FeedEntry)}
 
 
 @dataclass
@@ -152,11 +182,23 @@ def read_entries(feed_dir: Path) -> list[FeedEntry]:
     entries = []
     for path in sorted(entries_dir.glob("*.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
-        entries.append(FeedEntry(**data))
+        known = {k: v for k, v in data.items() if k in _FEEDENTRY_FIELDS}
+        entries.append(FeedEntry(**known))
     return entries
 
 
-def append_entry(feed_dir: Path, identity: Identity, alog_path: Path, *, timestamp: str) -> FeedEntry:
+def append_entry(feed_dir: Path, identity: Identity, alog_path: Path, *, timestamp: str,
+                  supersedes: int | None = None) -> FeedEntry:
+    """`supersedes`, if given, must be the seq of an earlier entry in THIS
+    same feed (enforced by callers -- e.g. cli.py's publish command checks it
+    against this identity's own read_entries() before calling this) that this
+    new entry replaces. The old entry is never touched: it stays in the
+    hash chain exactly as it was signed (ARCHITECTURE.md's Core Model --
+    append-only, no entry is ever removed or rewritten); `supersedes` is only
+    ever a forward-pointing marker future readers can use to prefer the new
+    entry over the old one. See FeedEntry.signed_fields for why this is only
+    included in what's signed when actually set.
+    """
     feed_dir = Path(feed_dir)
     _init_feed_dir(feed_dir, identity.public_key_hex)
 
@@ -173,10 +215,12 @@ def append_entry(feed_dir: Path, identity: Identity, alog_path: Path, *, timesta
     size_bytes = len(raw_bytes)
 
     unsigned = FeedEntry(seq=seq, content_sha256=content_sha256, timestamp=timestamp,
-                          prev_hash=prev_hash, size_bytes=size_bytes, signature="")
+                          prev_hash=prev_hash, size_bytes=size_bytes, signature="",
+                          supersedes=supersedes)
     signature = identity.sign(unsigned.canonical_signed_bytes()).hex()
     entry = FeedEntry(seq=seq, content_sha256=content_sha256, timestamp=timestamp,
-                       prev_hash=prev_hash, size_bytes=size_bytes, signature=signature)
+                       prev_hash=prev_hash, size_bytes=size_bytes, signature=signature,
+                       supersedes=supersedes)
 
     entry_path = _entries_dir(feed_dir) / f"{seq:08d}.json"
     entry_path.write_text(json.dumps(entry.__dict__, sort_keys=True), encoding="utf-8")
@@ -198,6 +242,14 @@ def verify_feed(feed_dir: Path, expected_pubkey_hex: str | None = None) -> FeedV
             return FeedVerifyResult(valid_count, len(entries), f"entry {entry.seq}: out-of-order sequence number")
         if entry.prev_hash != expected_prev:
             return FeedVerifyResult(valid_count, len(entries), f"entry {entry.seq}: broken hash chain")
+        if entry.supersedes is not None and not (0 <= entry.supersedes < entry.seq):
+            # A supersede can only point backward at an already-verified
+            # position in this SAME chain -- entries are processed in order
+            # here, so "< entry.seq" alone guarantees the target already
+            # passed every check above (no separate seen-seqs bookkeeping
+            # needed, since verify_feed already rejects any gap/reorder).
+            return FeedVerifyResult(valid_count, len(entries),
+                                     f"entry {entry.seq}: supersedes an invalid seq {entry.supersedes}")
         try:
             signature = bytes.fromhex(entry.signature)
         except ValueError:
