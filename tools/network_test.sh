@@ -58,6 +58,13 @@ PI_HOST="raspberrypi"
 PI_REAL_SERVICE="roastmesh-node@carl.service"
 PI_REAL_TIMER="roastmesh-update@carl.timer"
 DESKTOP_GUI_BIN="/home/carl/.local/bin/roastmesh-gui"
+# Since 2026-09-08: a persistent public rendezvous host (moduloinfo.ca) runs
+# on THIS desktop under its own identity, using the exact same binary path
+# phase1_sync_and_build overwrites with a fresh dev build every run. Must be
+# stopped/restarted around a test run exactly like the Pi's real service --
+# otherwise a mid-test crash/restart would bring it back up running
+# untested/experimental code instead of whatever was last known-good.
+DESKTOP_RENDEZVOUS_SERVICE="roastmesh-rendezvous@carl.service"
 
 # Fixed, clearly-non-default test port -- defense in depth even though
 # phase 0 already asserts nothing real is running that could collide with it.
@@ -150,6 +157,21 @@ phase0_stop() {
     ssh_retry "$PI_HOST" "sudo systemctl stop $PI_REAL_SERVICE $PI_REAL_TIMER"
     sleep 1
 
+    # Best-effort only -- this desktop has no passwordless sudo (confirmed
+    # 2026-09-08), so `sudo -n` (never prompts, fails fast instead of
+    # hanging) will fail here today. If it does, the rendezvous service
+    # keeps running the pre-test binary in memory throughout phase1's swap,
+    # which is safe UNLESS that process happens to restart mid-test (a
+    # crash, or RestartSec=5 firing) -- in which case it would come back up
+    # running whatever experimental build phase1 just wrote. Low-probability,
+    # not eliminated: if you want zero risk, stop it yourself first with
+    # `sudo systemctl stop roastmesh-rendezvous@carl.service`.
+    if sudo -n systemctl stop "$DESKTOP_RENDEZVOUS_SERVICE" 2>/dev/null; then
+        log "stopped the desktop's real rendezvous service ($DESKTOP_RENDEZVOUS_SERVICE)"
+    else
+        log "WARNING: could not stop $DESKTOP_RENDEZVOUS_SERVICE (no passwordless sudo) -- it will keep running the PRE-test binary in memory during phase1's swap; run 'sudo systemctl stop $DESKTOP_RENDEZVOUS_SERVICE' yourself first for zero risk"
+    fi
+
     # Both exclusions must strip lines matching "pgrep" itself, not just the
     # scanning script's name: confirmed live over Tailscale SSH (2026-09-07)
     # that the remote command wrapper (`tailscaled be-child ssh ...
@@ -157,9 +179,11 @@ phase0_stop() {
     # roastmesh` both embed the literal text "pgrep -af roastmesh" in their
     # OWN argv while the check is running -- so an unfiltered `pgrep -af
     # roastmesh` on the Pi side always finds itself and would die here on a
-    # genuinely clean Pi, every single run.
+    # genuinely clean Pi, every single run. `.roastmesh-rendezvous` (the
+    # rendezvous service's own dedicated HOME) is excluded too -- expected
+    # to still be running whenever the sudo stop above couldn't happen.
     local desktop_left pi_left
-    desktop_left="$(pgrep -af roastmesh 2>/dev/null | grep -v 'pgrep\|network_test.sh' || true)"
+    desktop_left="$(pgrep -af roastmesh 2>/dev/null | grep -v 'pgrep\|network_test.sh\|\.roastmesh-rendezvous' || true)"
     pi_left="$(ssh "$PI_HOST" 'pgrep -af roastmesh || true' | grep -v pgrep || true)"
 
     [ -z "$desktop_left" ] || die "unexpected roastmesh process(es) still running on the desktop:
@@ -184,8 +208,13 @@ phase1_sync_and_build() {
     log "testing commit $commit$dirty"
 
     ssh "$PI_HOST" "rm -rf '$PI_SRC' && mkdir -p '$PI_SRC'"
+    # --exclude=build: PyInstaller's intermediate build/ dir (distinct from
+    # its dist/ output, already excluded) -- live-confirmed 2026-09-08 that
+    # missing this turned a normal ~10s rsync into over an HOUR after a
+    # manual `pyinstaller` run left a 127MB build/ directory in the repo
+    # root; the sync wasn't hung, just transferring far more than intended.
     rsync -a --delete \
-        --exclude=.git --exclude=dist --exclude=dist-aarch64 --exclude=.venv \
+        --exclude=.git --exclude=dist --exclude=dist-aarch64 --exclude=build --exclude=.venv \
         --exclude='__pycache__' --exclude='*.sqlite3' \
         ./ "$PI_HOST:$PI_SRC/"
 
@@ -957,6 +986,15 @@ EOF
     disown
     sleep 2
     pgrep -f "$DESKTOP_GUI_BIN" >/dev/null || die "the desktop's real GUI did not come back up after teardown"
+
+    # Best-effort, same caveat as phase0_stop -- if phase0 couldn't stop it
+    # either (no passwordless sudo), it was never actually down, and this is
+    # a no-op restart attempt on an already-running service.
+    if sudo -n systemctl start "$DESKTOP_RENDEZVOUS_SERVICE" 2>/dev/null; then
+        log "restarted the desktop's real rendezvous service ($DESKTOP_RENDEZVOUS_SERVICE)"
+    else
+        log "NOTE: could not restart $DESKTOP_RENDEZVOUS_SERVICE via sudo -n -- harmless if phase0 also couldn't stop it (it never went down); otherwise run 'sudo systemctl start $DESKTOP_RENDEZVOUS_SERVICE' yourself"
+    fi
 
     # Match on the TEST ROOT specifically, not on "roastmesh" generally --
     # live-confirmed 2026-09-07 that a broad "roastmesh" match produces a
