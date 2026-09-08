@@ -1332,3 +1332,52 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "IS_FROM_PAIRED_DEVICE True" in r.stdout, r.stdout
     assert "HAS_STAGE_EDIT_METHOD True" in r.stdout, r.stdout
+
+
+def test_roast_detail_window_scrolls_when_content_overflows(tmp_path: Path) -> None:
+    """A roast with enough milestones packs taller than even a maximized
+    1920x1080 window -- without a scrollable body, the bottom controls
+    (notably "Save notes") would be permanently unreachable. Regression
+    test for that: assert the scroll machinery is actually present AND
+    actually needed (the packed content is taller than the viewport), not
+    just decoratively there."""
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp, RoastDetailWindow
+app = RoastmeshApp()
+app.update()
+milestones = [{{"name": f"M{{i}}", "time_s": i * 10, "bt_c": 150 + i, "et_c": 160 + i}} for i in range(60)]
+record = {{"roasting_notes": "", "cupping_notes": "", "beans_text": "", "milestones": milestones}}
+win = RoastDetailWindow(app, app, "abc123", record, "/tmp/fake.alog", False,
+                        is_published=False, is_from_paired_device=False)
+app.update()
+
+canvases = [w for w in win.winfo_children() if w.winfo_class() == "Canvas"]
+bars = [w for w in win.winfo_children() if w.winfo_class() == "TScrollbar"]
+print("HAS_CANVAS", len(canvases) == 1)
+print("HAS_SCROLLBAR", len(bars) == 1)
+canvas = canvases[0]
+inner = [w for w in canvas.winfo_children() if w.winfo_class() == "TFrame"][0]
+print("CONTENT_TALLER_THAN_VIEWPORT", inner.winfo_reqheight() > canvas.winfo_height())
+
+win.destroy()
+app.update()
+# The old implementation bound its wheel handler with bind_all and never
+# unbound it on destroy -- a dead closure over this now-destroyed canvas
+# would raise TclError on any future wheel event anywhere in the app.
+app.event_generate("<MouseWheel>", delta=-120)
+app.update()
+print("NO_ERROR_AFTER_CLOSE_AND_SCROLL")
+
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "HAS_CANVAS True" in r.stdout, r.stdout
+    assert "HAS_SCROLLBAR True" in r.stdout, r.stdout
+    assert "CONTENT_TALLER_THAN_VIEWPORT True" in r.stdout, r.stdout
+    assert "NO_ERROR_AFTER_CLOSE_AND_SCROLL" in r.stdout, r.stdout
+    assert "TclError" not in r.stderr, r.stderr

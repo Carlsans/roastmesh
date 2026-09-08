@@ -80,6 +80,22 @@ def publish_new_files(
         if content_sha256 in existing_hashes:
             if skip_cache is not None:
                 skip_cache[path] = fingerprint
+            # Already in the feed doesn't mean already in the local search
+            # index: skip_cache is in-memory and resets on every restart, but
+            # the feed's own on-disk hash chain remembers forever -- without
+            # this, a file published in an earlier session (or already
+            # present before the index was last rebuilt) would silently and
+            # permanently never get a sources/roasts row, since this branch
+            # used to `continue` unconditionally and only the "newly
+            # published" branch below ever called ingest_file. Runs at most
+            # once per file per process lifetime: skip_cache short-circuits
+            # every following tick before this line is even reached.
+            if db_path is not None:
+                conn = connect(db_path)
+                try:
+                    ingest_file(conn, path, is_user_log=True)
+                finally:
+                    conn.close()
             continue
         entry = append_entry(feed_dir, identity, path, timestamp=datetime.now(timezone.utc).isoformat())
         existing_hashes.add(content_sha256)

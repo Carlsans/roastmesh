@@ -203,6 +203,12 @@ def _filter_lan_only(rows: list, peers_file: Path) -> list:
 @click.option("--show-superseded", is_flag=True,
               help="Also include roasts a later, superseding entry has replaced "
                    "(see `roastmesh feed publish --supersedes`).")
+@click.option("--show-near-duplicates", is_flag=True,
+              help="Also include every entry in a same-author/same-title/same-day cluster whose "
+                   "roast_epoch values are close together, instead of just the most recent one. "
+                   "This is about a peer re-exporting/re-publishing one physical roast several "
+                   "times without using --supersedes -- unlike --show-superseded, there's no "
+                   "signed link between these entries, just a heuristic on title/date/time.")
 @click.option("--user", "user_id", default=None,
               help="Only show roasts from one user (pubkey prefix, resolved like a roast id -- "
                    "see `roastmesh user show`).")
@@ -224,6 +230,7 @@ def search(
     own_only: bool,
     show_hidden: bool,
     show_superseded: bool,
+    show_near_duplicates: bool,
     user_id: str | None,
     favorites_only: bool,
     as_json: bool,
@@ -236,6 +243,7 @@ def search(
         dtr_min=dtr_min, dtr_max=dtr_max, drop_bt_min=drop_bt_min,
         after_second_crack=after_second_crack, own_only=own_only, include_hidden=show_hidden,
         user_pubkey=user_pubkey, favorites_only=favorites_only, include_superseded=show_superseded,
+        include_near_duplicates=show_near_duplicates,
     )
     if own_only:
         lan_only = False  # own roasts are never peer-sourced -- nothing left for it to filter

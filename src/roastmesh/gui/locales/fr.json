@@ -173,6 +173,7 @@
   "Share and discover Artisan roast profiles, peer-to-peer.": "Partagez et découvrez des profils de torréfaction Artisan, de pair à pair.",
   "Shared folder (recommended)": "Dossier partagé (recommandé)",
   "Shared publish folder": "Dossier de publication partagé",
+  "Show every near-duplicate too (a peer re-publishing the same roast several times shows as one entry by default)": "Afficher aussi tous les quasi-doublons (un pair qui republie plusieurs fois la même torréfaction n'apparaît qu'une seule fois par défaut)",
   "Show hidden roasts too": "Afficher aussi les torréfactions masquées",
   "Show:": "Afficher :",
   "Shown to peers who sync with you.": "Visible par les pairs qui se synchronisent avec vous.",

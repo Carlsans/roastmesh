@@ -502,8 +502,21 @@ def scrollable(parent: tk.Widget) -> ttk.Frame:
             delta = -1 if getattr(event, "delta", 0) > 0 else 1
         canvas.yview_scroll(delta, "units")
 
+    # Bound on this canvas's own toplevel, not bind_all: a wheel binding
+    # applies to a widget's whole bindtag chain (widget, class, toplevel,
+    # all), so binding on the toplevel already reaches every descendant --
+    # including one sitting over a child widget inside `inner`, which is
+    # why a plain `canvas.bind()` alone wouldn't be enough. bind_all would
+    # do that too, but application-wide and forever: a RoastDetailWindow is
+    # a Toplevel created and destroyed every time a search result is
+    # opened, and bind_all's handler is never removed on destroy -- each
+    # closed window would leave a dead closure over its own now-destroyed
+    # canvas permanently registered, raising TclError on every future
+    # scroll anywhere in the app. Binding on the toplevel instead means Tk
+    # discards the binding together with the window when it's destroyed.
+    toplevel = parent.winfo_toplevel()
     for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-        canvas.bind_all(seq, _wheel, add="+")
+        toplevel.bind(seq, _wheel, add="+")
     return inner
 
 

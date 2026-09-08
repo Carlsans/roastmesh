@@ -484,6 +484,62 @@ def test_search_favorites_only_excludes_roasts_from_an_unknown_author(conn) -> N
     assert repo.search_roasts(conn, favorites_only=True) == []
 
 
+def test_search_collapses_near_duplicate_entries_from_the_same_peer_by_default(conn) -> None:
+    """A peer re-exporting/re-publishing the same physical roast several
+    times in one sitting (incremental saves, say) produces several feed
+    entries with genuinely different bytes -- content-hash dedup correctly
+    doesn't collapse those, so without this they'd show up in search as
+    unrelated separate roasts sharing a title. Confirmed against a real
+    corpus: same-author/same-title/same-day groups with roast_epoch values
+    24-90 minutes apart."""
+    r1 = ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog", source_type="p2p", source_ref="alice:00000001")
+    r2 = ingest_file(conn, FIXTURES_DIR / "kaleido_2.alog", source_type="p2p", source_ref="alice:00000002")
+    r3 = ingest_file(conn, FIXTURES_DIR / "kaleido_3.alog", source_type="p2p", source_ref="alice:00000003")
+
+    # r1 and r2: same roast, re-exported 30 minutes later -- must collapse
+    # to just the later one. r3: four hours after r1, same author/title/day
+    # -- a genuinely separate session of the same bean, must NOT collapse.
+    base_epoch = 1_700_000_000
+    for roast_id, epoch in (
+        (r1.record.roast_id, base_epoch),
+        (r2.record.roast_id, base_epoch + 1800),
+        (r3.record.roast_id, base_epoch + 4 * 3600),
+    ):
+        conn.execute(
+            "UPDATE roasts SET title = ?, roast_date = ?, roast_epoch = ? WHERE roast_id = ?",
+            ("Same Bean Roast", "2026-01-01", epoch, roast_id),
+        )
+    conn.commit()
+
+    default_results = repo.search_roasts(conn)
+    assert {row.roast_id for row in default_results} == {r2.record.roast_id, r3.record.roast_id}
+
+    all_results = repo.search_roasts(conn, include_near_duplicates=True)
+    assert {row.roast_id for row in all_results} == {
+        r1.record.roast_id, r2.record.roast_id, r3.record.roast_id,
+    }
+
+
+def test_search_near_duplicate_collapsing_ignores_rows_missing_an_epoch(conn) -> None:
+    """A row with no roast_epoch can't be time-compared at all -- it must
+    never be silently dropped just for sharing a title/date with another
+    entry that does have one."""
+    r1 = ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog", source_type="p2p", source_ref="alice:00000001")
+    r2 = ingest_file(conn, FIXTURES_DIR / "kaleido_2.alog", source_type="p2p", source_ref="alice:00000002")
+    conn.execute(
+        "UPDATE roasts SET title = ?, roast_date = ?, roast_epoch = ? WHERE roast_id = ?",
+        ("Same Bean Roast", "2026-01-01", 1_700_000_000, r1.record.roast_id),
+    )
+    conn.execute(
+        "UPDATE roasts SET title = ?, roast_date = ?, roast_epoch = NULL WHERE roast_id = ?",
+        ("Same Bean Roast", "2026-01-01", r2.record.roast_id),
+    )
+    conn.commit()
+
+    results = repo.search_roasts(conn)
+    assert {row.roast_id for row in results} == {r1.record.roast_id, r2.record.roast_id}
+
+
 # ---------------------------------------------------------------------------
 # Users repository: upsert, favorite, likes, listing, distinct machine keys.
 # ---------------------------------------------------------------------------

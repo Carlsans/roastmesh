@@ -230,6 +230,7 @@ class RoastSearchRow:
     title: str | None
     beans_text: str | None
     roast_date: str | None
+    roast_epoch: int | None
     dtr_pct: float | None
     total_time_s: float | None
     drop_bt_c: float | None
@@ -273,10 +274,12 @@ def search_roasts(
     user_pubkey: str | None = None,
     favorites_only: bool = False,
     include_superseded: bool = False,
+    include_near_duplicates: bool = False,
 ) -> list[RoastSearchRow]:
     sql = """
         SELECT r.roast_id, r.machine_key, r.mechanism_family, r.roast_type,
                r.batch_weight_in_g, r.density_g_per_l, r.title, r.beans_text, r.roast_date,
+               r.roast_epoch,
                r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, s.author_pubkey,
                s.blob_local,
                EXISTS(
@@ -359,6 +362,7 @@ def search_roasts(
             title=row["title"],
             beans_text=row["beans_text"],
             roast_date=row["roast_date"],
+            roast_epoch=row["roast_epoch"],
             dtr_pct=row["dtr_pct"],
             total_time_s=row["total_time_s"],
             drop_bt_c=row["drop_bt_c"],
@@ -381,7 +385,59 @@ def search_roasts(
             and row["drop_bt_c"] >= row["sc_start_bt_c"]
         ) == after_second_crack
     ]
+    if not include_near_duplicates:
+        rows = _collapse_near_duplicates(rows)
     return rows
+
+
+# A peer re-exporting/re-publishing the same physical roast several times in
+# one sitting (e.g. incremental saves while editing notes, without using the
+# already-existing supersede mechanism) produces several feed entries with
+# genuinely different bytes -- so content-hash dedup correctly does not
+# collapse them, and they show up in search as what looks like unrelated
+# separate roasts sharing a title. Confirmed against a real corpus: several
+# same-author/same-title/same-day groups whose roast_epoch values were all
+# 24-90 minutes apart. This window is deliberately short (routine roasting
+# again the same bean, hours or days apart, must never collapse) and grouped
+# by day first so it can never span two different roast_date values.
+_NEAR_DUPLICATE_WINDOW_S = 3 * 3600
+
+
+def _collapse_near_duplicates(rows: list[RoastSearchRow]) -> list[RoastSearchRow]:
+    groups: dict[tuple[str, str, str], list[RoastSearchRow]] = {}
+    singletons: list[RoastSearchRow] = []
+    for row in rows:
+        # A superseded row only ever appears here when the caller explicitly
+        # asked to see it (include_superseded=True) -- its visibility is
+        # already governed by that signed, authoritative supersede chain,
+        # not this title/date/time heuristic. Collapsing it here too would
+        # mean --show-superseded silently hid what it was just asked to show
+        # (confirmed: the edited-notes/supersede test shares its original's
+        # title, date, and roast_epoch exactly, so without this exclusion it
+        # gets near-duplicate-collapsed right back down to one row).
+        #
+        # Ungroupable without all three otherwise: a missing
+        # pubkey/title/date/epoch means "not enough signal to safely
+        # collapse", not "assume it's a duplicate" -- e.g. a generic Artisan
+        # default title with no beans_text would otherwise merge unrelated
+        # roasts from the same day.
+        if row.superseded or not row.author_pubkey or not row.title or not row.roast_date or row.roast_epoch is None:
+            singletons.append(row)
+            continue
+        groups.setdefault((row.author_pubkey, row.title, row.roast_date), []).append(row)
+
+    kept = list(singletons)
+    for group in groups.values():
+        group.sort(key=lambda r: r.roast_epoch)  # type: ignore[arg-type, return-value]
+        cluster: list[RoastSearchRow] = [group[0]]
+        for row in group[1:]:
+            if row.roast_epoch - cluster[-1].roast_epoch <= _NEAR_DUPLICATE_WINDOW_S:  # type: ignore[operator]
+                cluster.append(row)
+                continue
+            kept.append(max(cluster, key=lambda r: r.roast_epoch))  # type: ignore[arg-type, return-value]
+            cluster = [row]
+        kept.append(max(cluster, key=lambda r: r.roast_epoch))  # type: ignore[arg-type, return-value]
+    return kept
 
 
 def load_full_record(conn: sqlite3.Connection, roast_id: str) -> dict | None:

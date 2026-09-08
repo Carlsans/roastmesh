@@ -212,6 +212,39 @@ def test_notes_edit_published_roast_publishes_a_superseding_entry(tmp_path: Path
     assert "OK" in verify_result.output
 
 
+def test_search_show_near_duplicates_reveals_a_collapsed_cluster(tmp_path: Path, monkeypatch) -> None:
+    from roastmesh.index.db import connect
+
+    _isolate_home(monkeypatch, tmp_path)
+    db_path = tmp_path / "cli.sqlite3"
+    feed_dir = tmp_path / "feed"
+    runner = CliRunner()
+    for name in ("kaleido_1.alog", "kaleido_2.alog"):
+        r = runner.invoke(
+            main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish", str(FIXTURES_DIR / name)],
+        )
+        assert r.exit_code == 0, r.output
+
+    conn = connect(db_path)
+    try:
+        roast_ids = [row["roast_id"] for row in conn.execute("SELECT roast_id FROM roasts ORDER BY roast_id")]
+        assert len(roast_ids) == 2
+        for i, roast_id in enumerate(roast_ids):
+            conn.execute(
+                "UPDATE roasts SET title = ?, roast_date = ?, roast_epoch = ? WHERE roast_id = ?",
+                ("Same Bean Roast", "2026-01-01", 1_700_000_000 + i * 1800, roast_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    default_search = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    assert len(json.loads(default_search.output)) == 1
+
+    all_search = runner.invoke(main, ["--db", str(db_path), "search", "--show-near-duplicates", "--json"])
+    assert len(json.loads(all_search.output)) == 2
+
+
 def test_notes_edit_requires_at_least_one_field(tmp_path: Path, monkeypatch) -> None:
     _isolate_home(monkeypatch, tmp_path)
     runner = CliRunner()

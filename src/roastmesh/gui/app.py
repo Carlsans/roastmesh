@@ -405,6 +405,13 @@ class SearchTab(Tab):
             variable=self.show_hidden,
         ).pack(anchor="w", padx=10, pady=(0, 2))
 
+        self.show_near_duplicates = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self, text=t("Show every near-duplicate too (a peer re-publishing the same roast "
+                          "several times shows as one entry by default)"),
+            variable=self.show_near_duplicates,
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+
         self._output: list[str] = []
         self.runbar = RunBar(self, t("Search"), self._on_run, self.cancel)
         self.table = ResultsTable(self)
@@ -478,6 +485,8 @@ class SearchTab(Tab):
             args.append("--own-only")
         if self.show_hidden.get():
             args.append("--show-hidden")
+        if self.show_near_duplicates.get():
+            args.append("--show-near-duplicates")
         args.append("--json")
         return args
 
@@ -676,10 +685,19 @@ class RoastDetailWindow(tk.Toplevel):
 
         unit = app.temp_unit.get()
 
-        heading(self, title)
-        RoastChart(self, record, unit=unit)
+        # A search result opened on a small/low-res screen (or with DPI
+        # scaling / a taskbar eating vertical space) can pack taller than
+        # the maximized window's actual height -- pack() doesn't clip or
+        # scroll, so without this the bottom controls (notably "Save
+        # notes") become permanently unreachable, with no error and no way
+        # to tell. scrollable() (widgets.py) is the same helper already
+        # used for the Settings tab for the same reason.
+        body = scrollable(self)
 
-        info = ttk.Frame(self)
+        heading(body, title)
+        RoastChart(body, record, unit=unit)
+
+        info = ttk.Frame(body)
         info.pack(fill="x", padx=14, pady=(0, 6))
 
         def row(label: str, value) -> None:
@@ -708,7 +726,7 @@ class RoastDetailWindow(tk.Toplevel):
 
         milestones = record.get("milestones") or []
         if milestones:
-            tk.Label(self, text=t("Milestones"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
+            tk.Label(body, text=t("Milestones"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
                 fill="x", padx=14, pady=(10, 2))
             for m in milestones:
                 time_text = format_mmss(m["time_s"]) if m.get("time_s") is not None else t("?")
@@ -720,9 +738,9 @@ class RoastDetailWindow(tk.Toplevel):
                 # (same reasoning as gui/chart.py's legend).
                 row(m.get("name") or t("?"), t("t={time}  BT={bt}  ET={et}", time=time_text, bt=bt_text, et=et_text))
 
-        tk.Label(self, text=t("Notes"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
+        tk.Label(body, text=t("Notes"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
             fill="x", padx=14, pady=(10, 2))
-        notes_frame = ttk.Frame(self)
+        notes_frame = ttk.Frame(body)
         notes_frame.pack(fill="x", padx=14)
         tk.Label(notes_frame, text=t("Roasting notes:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
                  anchor="w").pack(fill="x")
@@ -735,23 +753,23 @@ class RoastDetailWindow(tk.Toplevel):
         self.cupping_notes_text.insert("1.0", record.get("cupping_notes") or "")
         self.cupping_notes_text.pack(fill="x", pady=(0, 4))
 
-        notes_btn_row = ttk.Frame(self)
+        notes_btn_row = ttk.Frame(body)
         notes_btn_row.pack(fill="x", padx=14, pady=(0, 4))
         if is_from_paired_device:
-            explain(self, t("This roast belongs to a paired device -- saving stages the edit to sync "
+            explain(body, t("This roast belongs to a paired device -- saving stages the edit to sync "
                              "back to it, rather than changing anything here."))
             ttk.Button(notes_btn_row, text=t("Send edit to device"),
                        command=self._on_stage_edit).pack(side="left")
         else:
             if is_published:
-                explain(self, t("Already published -- saving publishes a new entry that supersedes "
+                explain(body, t("Already published -- saving publishes a new entry that supersedes "
                                  "this one. The original stays in your feed, unchanged."))
             ttk.Button(notes_btn_row, text=t("Save notes"), command=self._on_save_notes).pack(side="left")
         self.notes_status_var = tk.StringVar(value="")
         tk.Label(notes_btn_row, textvariable=self.notes_status_var, font=("TkDefaultFont", 9),
                  fg=theme.MUTED, bg=theme.BG, anchor="w").pack(side="left", padx=(8, 0))
 
-        btn_row = ttk.Frame(self)
+        btn_row = ttk.Frame(body)
         btn_row.pack(fill="x", padx=14, pady=(12, 2))
         if raw_path and blob_local:
             ttk.Button(btn_row, text=t("Open original file"),
@@ -765,20 +783,20 @@ class RoastDetailWindow(tk.Toplevel):
         ttk.Button(btn_row, text=t("Close"), command=self.destroy).pack(side="right")
 
         if raw_path and blob_local:
-            tk.Label(self, text=raw_path, font=FONT_MONO, fg=theme.MUTED, bg=theme.BG, anchor="w",
+            tk.Label(body, text=raw_path, font=FONT_MONO, fg=theme.MUTED, bg=theme.BG, anchor="w",
                      wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
         elif not blob_local:
             # A stub whose bytes are not local (opening it already tried to
             # fetch them and no holder was reachable). Say so instead of
             # offering an "Open" button for a file that isn't there.
-            tk.Label(self, text=t("Not downloaded -- held by other peers, none reachable "
+            tk.Label(body, text=t("Not downloaded -- held by other peers, none reachable "
                                   "right now. It will download automatically when a holder "
                                   "comes online."),
                      font=FONT_MONO, fg=theme.MUTED, bg=theme.BG, anchor="w",
                      wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(4, 0))
 
         self.status_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self.status_var, font=("TkDefaultFont", 9), fg=theme.MUTED,
+        tk.Label(body, textvariable=self.status_var, font=("TkDefaultFont", 9), fg=theme.MUTED,
                  bg=theme.BG, anchor="w", wraplength=sp(840), justify="left").pack(fill="x", padx=14, pady=(2, 12))
 
     def _on_open_file(self, path: str) -> None:
