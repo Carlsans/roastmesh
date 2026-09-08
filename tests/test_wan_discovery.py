@@ -291,6 +291,77 @@ async def test_rendezvous_hello_reciprocates_even_after_our_own_unconfirmed_atte
                 pass
 
 
+async def test_third_party_rendezvous_host_introduces_two_strangers_via_gossip(tmp_path) -> None:
+    """Regression test for a real architectural gap found via live testing
+    across three machines (2026-09-07): in PRODUCTION, net.serve() only ever
+    points rendezvous_hosts at the FIXED third-party list (moduloinfo.ca),
+    never at "the specific peer you're trying to reach" -- unlike the test
+    above, which points both sides directly at each other. A plain
+    (pubkey, ticket) hello carries no information about anyone else, so two
+    strangers who each only contact the SAME shared third party never learn
+    about each other, no matter how long either one waits. Confirmed
+    directly: a desktop and a Pi, each pointed only at a genuinely external
+    VPS, both discovered the VPS and NEVER each other.
+
+    C here plays that shared third party. A and B are configured to hello
+    ONLY C -- never each other -- exactly matching the real topology. If
+    gossip works, C's reciprocation to each of them relays what it just
+    heard from the other, and A and B discover each other through C without
+    either ever addressing the other directly.
+    """
+    port_a, port_b, port_c = 41999, 42000, 42001
+
+    discovered_by_a: list[tuple[str, str]] = []
+    discovered_by_b: list[tuple[str, str]] = []
+
+    async def on_a(pubkey: str, ticket: str) -> None:
+        discovered_by_a.append((pubkey, ticket))
+
+    async def on_b(pubkey: str, ticket: str) -> None:
+        discovered_by_b.append((pubkey, ticket))
+
+    async def on_c(pubkey: str, ticket: str) -> None:
+        pass
+
+    task_c = asyncio.create_task(run_wan_discovery(
+        "cc" * 32, "ticket-c", on_c, port=port_c, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], node_cache_path=tmp_path / "nodes_c.json", allow_loopback=True,
+    ))
+    await asyncio.sleep(0.2)  # let C's socket exist before A/B's first hello can reach it
+    task_a = asyncio.create_task(run_wan_discovery(
+        "aa" * 32, "ticket-a", on_a, port=port_a, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_c)],
+        node_cache_path=tmp_path / "nodes_a.json", allow_loopback=True,
+    ))
+    task_b = asyncio.create_task(run_wan_discovery(
+        "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_c)],
+        node_cache_path=tmp_path / "nodes_b.json", allow_loopback=True,
+    ))
+    try:
+        for _ in range(150):
+            if (("bb" * 32, "ticket-b") in discovered_by_a
+                    and ("aa" * 32, "ticket-a") in discovered_by_b):
+                break
+            await asyncio.sleep(0.1)
+        # Each side also legitimately discovers C itself (the ordinary
+        # reciprocation this shares with the two-party test above) -- the
+        # thing under test is specifically that B's entry reaches A and
+        # vice versa, via C's gossip, without either ever addressing the
+        # other directly.
+        assert ("bb" * 32, "ticket-b") in discovered_by_a, discovered_by_a
+        assert ("aa" * 32, "ticket-a") in discovered_by_b, discovered_by_b
+    finally:
+        task_a.cancel()
+        task_b.cancel()
+        task_c.cancel()
+        for t in (task_a, task_b, task_c):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
 async def test_rendezvous_host_falls_back_to_its_literal_ip_when_dns_fails() -> None:
     from roastmesh.wan_discovery import _resolve_rendezvous_hosts
 

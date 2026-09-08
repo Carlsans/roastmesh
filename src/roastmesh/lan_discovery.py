@@ -81,7 +81,7 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
         # -- pairing/code/hostname exist for discover_pairing_beacons below,
         # not this one, and a pairing-mode hello from a device also running
         # regular discovery is harmless noise here, not an error.
-        pubkey, ticket, _pairing, _code, _hostname = decoded
+        pubkey, ticket, _pairing, _code, _hostname, _known_peers = decoded
         if pubkey == self._own_pubkey_hex:
             # Routine: broadcasts/multicast loop back to the sender on the
             # same host, on every single beacon interval -- addr[0] is then
@@ -217,7 +217,7 @@ async def discover_pairing_beacons(
             decoded = decode_hello(data)
             if decoded is None:
                 return
-            pubkey, ticket, pairing, peer_code, peer_hostname = decoded
+            pubkey, ticket, pairing, peer_code, peer_hostname, _known_peers = decoded
             if not pairing or pubkey == own_pubkey_hex:
                 return  # a plain (non-pairing) beacon, or our own broadcast looping back
             candidates[pubkey] = PairingCandidate(pubkey, ticket, peer_code, peer_hostname)
@@ -270,7 +270,7 @@ async def probe_reachable_devices(*, port: int = BEACON_PORT, duration_s: float 
             decoded = decode_hello(data)
             if decoded is None:
                 return
-            pubkey, ticket, pairing, _code, _hostname = decoded
+            pubkey, ticket, pairing, _code, _hostname, _known_peers = decoded
             if not pairing:  # a regular beacon, not another device mid-pairing
                 seen[pubkey] = ticket
 

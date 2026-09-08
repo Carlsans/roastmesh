@@ -1,0 +1,35 @@
+[Unit]
+Description=roastmesh public rendezvous host (moduloinfo.ca)
+Documentation=https://github.com/Carlsans/roastmesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+# A dedicated fake HOME, NOT the operator's own -- this identity is a public
+# service endpoint, not "my personal roastmesh," and must never share the
+# operator's real identity/feed/devices. Same isolation technique
+# tools/network_test.sh already uses for test identities, applied here for
+# the opposite reason (a standing public identity, not a throwaway one).
+Environment=HOME=/home/%i/.roastmesh-rendezvous
+Environment=USERPROFILE=/home/%i/.roastmesh-rendezvous
+ExecStartPre=/bin/mkdir -p /home/%i/.roastmesh-rendezvous
+# --wan-port 41890 (not the default) because that is the exact port
+# BOOTSTRAP_NODES advertises for moduloinfo.ca -- --public-port auto asks
+# the router to forward that SAME internal port via PCP/NAT-PMP (confirmed
+# working on the deploying network 2026-09-07: the router granted external
+# port 41890 for internal port 41890, and node doctor's own genuine
+# readback check, not just the router's claim, reported the rendezvous
+# entry ok:true). --no-lan-discovery/--no-device-sync: this identity is
+# never meant to appear in LAN pairing or hold paired-device state.
+ExecStart=/home/%i/.local/bin/roastmesh --db /home/%i/.roastmesh-rendezvous/index.sqlite3 \
+    node serve --wan-discovery --wan-port 41890 --public-port auto \
+    --no-lan-discovery --no-device-sync
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

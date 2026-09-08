@@ -23,11 +23,19 @@
 #                                              # fresh isolated identities)
 #   tools/network_test.sh scenario <name>     # run one scenario against an
 #                                              # already-`setup` environment
-#                                              # (dht_baseline | rendezvous |
-#                                              # node_doctor | feed_sync |
-#                                              # supersede | cross_edit_staging
-#                                              # | watchdog_sync)
+#                                              # (dht_baseline |
+#                                              # fresh_install_discovery |
+#                                              # rendezvous | node_doctor |
+#                                              # feed_sync | supersede |
+#                                              # cross_edit_staging |
+#                                              # watchdog_sync)
 #   tools/network_test.sh teardown            # phase 4: clean up + restore
+#
+# `fresh_install_discovery` is NOT part of `all` -- it runs
+# FRESH_INSTALL_TRIALS repeated trials (several minutes) specifically to
+# measure real-world discovery timing, and is meant to be run on demand
+# (`scenario fresh_install_discovery`, after `setup`), not on every routine
+# feature-verification pass.
 #
 # `setup` must be re-run (which re-syncs+rebuilds+reinstalls on the Pi and
 # regenerates fresh identities on both ends) any time the code under test has
@@ -402,15 +410,100 @@ scenario_dht_baseline() {
     desktop_pid="$(start_desktop_node --wan-discovery --wan-port "$TEST_WAN_PORT")"
     log "pi test node pid=$pi_pid, desktop test node pid=$desktop_pid -- watching for mutual discovery, up to 120s"
 
+    # Both directions get the SAME 120s budget, live-polled -- a one-shot
+    # scp of the Pi's log followed by polling that unchanging snapshot for
+    # only 5 more seconds (the original shape here) is the exact measurement
+    # bug found and fixed in scenario_rendezvous: it can report a false
+    # TIMEOUT for a direction that would have succeeded moments later.
     elapsed_desktop="$(wait_for_pattern "$DESKTOP_LOGS/node.log" "wan: discovered $(pi_pubkey | cut -c1-16)" 120 "$start_epoch" || true)"
-    fetch_pi_log
-    elapsed_pi="$(wait_for_pattern "$DESKTOP_LOGS/pi_node.log" "wan: discovered $(desktop_pubkey | cut -c1-16)" 5 "$start_epoch" || true)"
+    elapsed_pi="$(wait_for_remote_pattern "$PI_LOGS/node.log" "$DESKTOP_LOGS/pi_node.log" "wan: discovered $(desktop_pubkey | cut -c1-16)" 120 "$start_epoch" || true)"
 
     log "RESULT dht_baseline: desktop discovered pi after ${elapsed_desktop}s; pi discovered desktop after ${elapsed_pi}s"
 
     kill "$desktop_pid" 2>/dev/null || true
     stop_pi_pid "$pi_pid"
     sleep 1
+}
+
+# --------------------------------------------------------------------------
+# Scenario: fresh_install_discovery -- repeatedly simulates a BRAND NEW Pi
+# install (fresh identity, empty DHT node cache, no prior state -- exactly
+# what install.sh produces) discovering an already-running, warmed-up
+# desktop peer, via the REAL production path (`node serve --wan-discovery`,
+# the same live BOOTSTRAP_NODES resolution net.serve() itself uses -- not
+# an isolated mechanism test like the rendezvous scenario below). Repeated
+# FRESH_INSTALL_TRIALS times so the result is a real efficiency distribution
+# instead of one noisy sample -- added 2026-09-07 specifically to measure
+# "how long does a new user actually wait" for the rendezvous+DHT combo as
+# it exists today.
+#
+# The desktop is started ONCE and stays warm across every trial -- that's
+# the realistic case ("my friend is already using roastmesh and I just
+# installed it"), not two simultaneous cold starts (dht_baseline above
+# already covers that). Only the Pi gets a genuinely fresh identity + empty
+# state each trial, matching what a real fresh install looks like every
+# single time, not just the first.
+# --------------------------------------------------------------------------
+FRESH_INSTALL_TRIALS=5
+FRESH_INSTALL_TIMEOUT_S=90
+
+scenario_fresh_install_discovery() {
+    log "Scenario fresh_install_discovery: $FRESH_INSTALL_TRIALS fresh-Pi-install trials against an already-running desktop, real production path"
+
+    local desktop_pid
+    desktop_pid="$(start_desktop_node --wan-discovery --wan-port "$TEST_WAN_PORT")"
+    log "desktop node warmed up (pid=$desktop_pid), giving it 5s before the first trial"
+    sleep 5
+
+    local trial results=() successes=0
+    for trial in $(seq 1 "$FRESH_INSTALL_TRIALS"); do
+        log "trial $trial/$FRESH_INSTALL_TRIALS: wiping the Pi's test identity/state -- simulating a fresh install"
+        ssh_retry "$PI_HOST" "rm -rf '$PI_TEST_HOME' && mkdir -p '$PI_TEST_HOME'"
+
+        local pi_pubkey_trial
+        pi_pubkey_trial="$(ssh "$PI_HOST" "HOME='$PI_TEST_HOME' USERPROFILE='$PI_TEST_HOME' '$PI_BIN' identity show")"
+
+        local start_epoch pi_pid elapsed
+        start_epoch="$(date +%s)"
+        # The real production command -- no test-only flags beyond --db
+        # (pointed inside the isolated test root so production data is
+        # never touched) and --wan-port (a fixed, clearly-non-default port,
+        # same reasoning as every other scenario here).
+        pi_pid="$(start_pi_node --wan-discovery --wan-port "$TEST_WAN_PORT")"
+
+        elapsed="$(wait_for_pattern "$DESKTOP_LOGS/node.log" "wan: discovered $(echo "$pi_pubkey_trial" | cut -c1-16)" "$FRESH_INSTALL_TIMEOUT_S" "$start_epoch" || true)"
+        if [ "$elapsed" != "TIMEOUT" ]; then
+            log "trial $trial: desktop discovered the fresh pi in ${elapsed}s"
+        else
+            log "trial $trial: TIMEOUT after ${FRESH_INSTALL_TIMEOUT_S}s -- fresh pi was NOT discovered"
+        fi
+        results+=("$elapsed")
+
+        stop_pi_pid "$pi_pid"
+        sleep 1
+    done
+
+    kill "$desktop_pid" 2>/dev/null || true
+    sleep 1
+
+    for r in "${results[@]}"; do
+        [ "$r" = "TIMEOUT" ] || successes=$(( successes + 1 ))
+    done
+    log "RESULT fresh_install_discovery: $successes/$FRESH_INSTALL_TRIALS succeeded -- individual results: ${results[*]}"
+
+    if [ "$successes" -gt 0 ]; then
+        local sum=0 n=0 fastest="" slowest=""
+        for r in "${results[@]}"; do
+            [ "$r" = "TIMEOUT" ] && continue
+            sum=$(( sum + r ))
+            n=$(( n + 1 ))
+            if [ -z "$fastest" ] || [ "$r" -lt "$fastest" ]; then fastest="$r"; fi
+            if [ -z "$slowest" ] || [ "$r" -gt "$slowest" ]; then slowest="$r"; fi
+        done
+        log "RESULT fresh_install_discovery: avg=$(( sum / n ))s fastest=${fastest}s slowest=${slowest}s (over $n successful trial(s) of $FRESH_INSTALL_TRIALS)"
+    else
+        log "RESULT fresh_install_discovery: 0 successful trials -- no timing stats to report"
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -887,13 +980,14 @@ EOF
 run_scenario() {
     case "$1" in
         dht_baseline) scenario_dht_baseline ;;
+        fresh_install_discovery) scenario_fresh_install_discovery ;;
         rendezvous) scenario_rendezvous ;;
         node_doctor) scenario_node_doctor ;;
         feed_sync) scenario_feed_sync ;;
         supersede) scenario_supersede ;;
         cross_edit_staging) scenario_cross_edit_staging ;;
         watchdog_sync) scenario_watchdog_sync ;;
-        *) die "unknown scenario: $1 (expected one of: dht_baseline rendezvous node_doctor feed_sync supersede cross_edit_staging watchdog_sync)" ;;
+        *) die "unknown scenario: $1 (expected one of: dht_baseline fresh_install_discovery rendezvous node_doctor feed_sync supersede cross_edit_staging watchdog_sync)" ;;
     esac
 }
 

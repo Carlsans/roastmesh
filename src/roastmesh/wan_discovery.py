@@ -39,6 +39,7 @@ import random
 import shutil
 import socket
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 
 from roastmesh.dht import (
@@ -534,7 +535,30 @@ async def run_wan_discovery(
     last_helloed: dict[Addr, float] = {}
     last_seen_pubkey: dict[str, float] = {}
 
-    def _maybe_hello(addr: Addr, *, retry: bool = True) -> None:
+    # Gossip cache: the last few peers we've actually heard a hello from,
+    # most-recently-seen last (OrderedDict.move_to_end on every sighting) so
+    # a stale ticket -- more likely to be unreachable than a fresh one --
+    # ages out before a fresh one does. See hello.py's known_peers docstring
+    # for why this exists: a fixed third-party rendezvous host with no
+    # gossip can only ever prove itself reachable, never introduce two
+    # strangers to each other, which live testing confirmed is exactly what
+    # was happening (2026-09-07).
+    _KNOWN_PEERS_CACHE_SIZE = 16
+    known_peers_cache: OrderedDict[str, str] = OrderedDict()
+
+    def _remember_peer(pubkey: str, ticket: str) -> None:
+        known_peers_cache[pubkey] = ticket
+        known_peers_cache.move_to_end(pubkey)
+        while len(known_peers_cache) > _KNOWN_PEERS_CACHE_SIZE:
+            known_peers_cache.popitem(last=False)
+
+    def _gossip_snapshot(*, exclude_pubkey: str | None = None) -> list[tuple[str, str]]:
+        # Most-recently-seen first; encode_hello truncates to its own cap,
+        # so freshness wins if the cache holds more than fits in a hello.
+        return [(pk, tk) for pk, tk in reversed(known_peers_cache.items())
+                if pk != own_pubkey_hex and pk != exclude_pubkey]
+
+    def _maybe_hello(addr: Addr, *, retry: bool = True, exclude_pubkey: str | None = None) -> None:
         now = time.monotonic()
         if now - last_helloed.get(addr, 0.0) < hello_resync_s:
             return
@@ -543,7 +567,11 @@ async def run_wan_discovery(
             asyncio.create_task(_hello_with_retries(addr))
             return
         try:
-            client.send_datagram(encode_hello(own_pubkey_hex, own_ticket), addr)
+            client.send_datagram(
+                encode_hello(own_pubkey_hex, own_ticket,
+                             known_peers=_gossip_snapshot(exclude_pubkey=exclude_pubkey)),
+                addr,
+            )
         except OSError:
             pass
 
@@ -564,7 +592,10 @@ async def run_wan_discovery(
         lost packet into an exponential hello storm -- which it did, firing
         five duplicate discoveries (and so five redundant syncs) for a single
         peer before this was split apart."""
-        payload = encode_hello(own_pubkey_hex, own_ticket)
+        # Snapshot once, not per-retry: retries span at most HELLO_RETRIES'
+        # ~8s total, freshness within that window doesn't matter enough to
+        # justify recomputing it up to 3 times for the same address.
+        payload = encode_hello(own_pubkey_hex, own_ticket, known_peers=_gossip_snapshot())
         for delay in HELLO_RETRIES:
             if delay:
                 await asyncio.sleep(delay)
@@ -595,7 +626,7 @@ async def run_wan_discovery(
         # Internet-wide discovery never runs pairing mode -- it only ever
         # sends/expects a plain hello, so pairing/code/hostname are unpacked
         # and ignored here rather than in lan_discovery specifically.
-        pubkey, ticket, _pairing, _code, _hostname = decoded
+        pubkey, ticket, _pairing, _code, _hostname, known_peers = decoded
         if pubkey == own_pubkey_hex:
             if (on_self_identity_collision is not None
                     and addr[0] not in _self_collision_reported
@@ -603,6 +634,7 @@ async def run_wan_discovery(
                 _self_collision_reported.add(addr[0])
                 on_self_identity_collision(addr[0])
             return
+        _remember_peer(pubkey, ticket)
         _acked.add(addr)  # heard from them -- no need to keep retransmitting
         # Reciprocate immediately: whoever reached us first might not yet
         # know about us (their own DHT lookup may not have found our
@@ -629,12 +661,32 @@ async def run_wan_discovery(
         # address is real and listening right now, which is a strictly
         # stronger signal than our own past unconfirmed attempt to it.
         last_helloed.pop(addr, None)
-        _maybe_hello(addr, retry=False)
+        _maybe_hello(addr, retry=False, exclude_pubkey=pubkey)
         now = time.monotonic()
-        if now - last_seen_pubkey.get(pubkey, 0.0) < hello_resync_s:
-            return
-        last_seen_pubkey[pubkey] = now
-        asyncio.create_task(on_peer_discovered(pubkey, ticket))
+        if now - last_seen_pubkey.get(pubkey, 0.0) >= hello_resync_s:
+            last_seen_pubkey[pubkey] = now
+            asyncio.create_task(on_peer_discovered(pubkey, ticket))
+
+        # Gossip: this sender may have recently heard from OTHER peers we
+        # haven't -- e.g. both of us only ever contacted the same third
+        # party (a rendezvous host, or any node we happen to share). A plain
+        # (pubkey, ticket) hello carries no information about anyone else,
+        # so without this two strangers who both only reach a shared third
+        # party never learn about each other at all, no matter how long
+        # either one waits -- confirmed directly with real hardware plus a
+        # genuinely external third machine (2026-09-07). Each gossiped
+        # ticket is itself a self-contained dialable address, so simply
+        # firing on_peer_discovered for a new one is enough for the caller
+        # to reach them -- no separate hello exchange with them is needed.
+        for gossiped_pubkey, gossiped_ticket in known_peers:
+            if gossiped_pubkey == own_pubkey_hex:
+                continue
+            _remember_peer(gossiped_pubkey, gossiped_ticket)
+            now = time.monotonic()
+            if now - last_seen_pubkey.get(gossiped_pubkey, 0.0) < hello_resync_s:
+                continue
+            last_seen_pubkey[gossiped_pubkey] = now
+            asyncio.create_task(on_peer_discovered(gossiped_pubkey, gossiped_ticket))
 
     client.on_foreign_datagram = _on_foreign
 

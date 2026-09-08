@@ -10,14 +10,14 @@ from roastmesh.hello import decode_hello, encode_hello
 def test_round_trips_a_well_formed_hello() -> None:
     pubkey = "a" * 64
     ticket = "endpointaaaa"
-    assert decode_hello(encode_hello(pubkey, ticket)) == (pubkey, ticket, False, None, None)
+    assert decode_hello(encode_hello(pubkey, ticket)) == (pubkey, ticket, False, None, None, [])
 
 
 def test_round_trips_a_pairing_hello_with_code_and_hostname() -> None:
     pubkey = "a" * 64
     ticket = "endpointaaaa"
     encoded = encode_hello(pubkey, ticket, pairing=True, code="4821", hostname="Carl's Pi")
-    assert decode_hello(encoded) == (pubkey, ticket, True, "4821", "Carl's Pi")
+    assert decode_hello(encoded) == (pubkey, ticket, True, "4821", "Carl's Pi", [])
 
 
 def test_a_plain_hello_is_byte_identical_to_before_pairing_existed() -> None:
@@ -39,13 +39,13 @@ def test_a_v1_payload_with_no_new_fields_still_decodes() -> None:
     pubkey = "a" * 64
     ticket = "endpointaaaa"
     v1_payload = json.dumps({"v": 1, "pubkey": pubkey, "ticket": ticket}).encode("utf-8")
-    assert decode_hello(v1_payload) == (pubkey, ticket, False, None, None)
+    assert decode_hello(v1_payload) == (pubkey, ticket, False, None, None, [])
 
 
 def test_pairing_hello_omits_code_and_hostname_when_not_given() -> None:
     pubkey = "a" * 64
     ticket = "endpointaaaa"
-    assert decode_hello(encode_hello(pubkey, ticket, pairing=True)) == (pubkey, ticket, True, None, None)
+    assert decode_hello(encode_hello(pubkey, ticket, pairing=True)) == (pubkey, ticket, True, None, None, [])
 
 
 def test_rejects_a_pubkey_that_is_not_64_hex_chars() -> None:
@@ -77,4 +77,66 @@ def test_an_oversized_or_malformed_code_or_hostname_is_dropped_not_rejected() ->
         "v": 2, "pubkey": pubkey, "ticket": ticket, "pairing": True,
         "code": "x" * 999, "hostname": 12345,
     }).encode("utf-8")
-    assert decode_hello(payload) == (pubkey, ticket, True, None, None)
+    assert decode_hello(payload) == (pubkey, ticket, True, None, None, [])
+
+
+def test_round_trips_known_peers_gossip() -> None:
+    pubkey = "a" * 64
+    ticket = "endpointaaaa"
+    other_pubkey = "b" * 64
+    other_ticket = "endpointbbbb"
+    encoded = encode_hello(pubkey, ticket, known_peers=[(other_pubkey, other_ticket)])
+    assert decode_hello(encoded) == (pubkey, ticket, False, None, None,
+                                      [(other_pubkey, other_ticket)])
+
+
+def test_known_peers_is_capped_at_max_entries() -> None:
+    """A hello must stay comfortably within a safe UDP payload size -- a
+    hostile or buggy peer relaying an unbounded gossip list must not be able
+    to inflate every hello it causes to be sent onward."""
+    from roastmesh.hello import _MAX_KNOWN_PEERS
+
+    pubkey = "a" * 64
+    ticket = "endpointaaaa"
+    many_peers = [(f"{i:064x}", f"endpoint{i}") for i in range(_MAX_KNOWN_PEERS + 10)]
+    decoded = decode_hello(encode_hello(pubkey, ticket, known_peers=many_peers))
+    assert decoded is not None
+    assert len(decoded[5]) == _MAX_KNOWN_PEERS
+    assert decoded[5] == many_peers[:_MAX_KNOWN_PEERS]
+
+
+def test_known_peers_with_a_malformed_entry_drops_only_that_entry() -> None:
+    """Gossip is unauthenticated third-party data relayed by an intermediary
+    -- one bad entry (a hostile pubkey, an oversized ticket, wrong shape)
+    must not take down an otherwise-valid introduction to everyone else in
+    the same list, and must not reject the hello's own (pubkey, ticket)."""
+    import json
+
+    pubkey = "a" * 64
+    ticket = "endpointaaaa"
+    good_pubkey = "b" * 64
+    payload = json.dumps({
+        "v": 3, "pubkey": pubkey, "ticket": ticket,
+        "known_peers": [
+            [good_pubkey, "endpointgood"],
+            ["not-a-pubkey", "endpointbad"],
+            [good_pubkey, "x" * 9999],  # oversized ticket
+            "not-a-list",
+            [good_pubkey],  # wrong length
+        ],
+    }).encode("utf-8")
+    decoded = decode_hello(payload)
+    assert decoded is not None
+    assert decoded[:5] == (pubkey, ticket, False, None, None)
+    assert decoded[5] == [(good_pubkey, "endpointgood")]
+
+
+def test_known_peers_absent_on_an_older_payload_decodes_to_empty_list() -> None:
+    """A hello from a build that has never heard of gossip -- decode_hello
+    must still parse it and default known_peers to [], not crash or None."""
+    import json
+
+    pubkey = "a" * 64
+    ticket = "endpointaaaa"
+    v1_payload = json.dumps({"v": 1, "pubkey": pubkey, "ticket": ticket}).encode("utf-8")
+    assert decode_hello(v1_payload) == (pubkey, ticket, False, None, None, [])

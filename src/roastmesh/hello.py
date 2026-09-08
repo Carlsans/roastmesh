@@ -38,19 +38,41 @@ _PUBKEY_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _MAX_CODE_LEN = 16
 _MAX_HOSTNAME_LEN = 128
 
+# `known_peers`: a small, bounded gossip payload -- "here are a few other
+# roastmesh nodes I've recently heard from" -- added 2026-09-07 after live
+# testing showed a fixed third-party rendezvous host (moduloinfo.ca) was
+# USELESS for its actual purpose: it can only ever prove "I can reach this
+# one specific host," never introduce two strangers to each other, because a
+# plain (pubkey, ticket) hello carries no information about anyone else.
+# Confirmed directly on real hardware (desktop, Pi, a genuinely external
+# VPS): with the old wire format, both sides discovered the third party and
+# NEVER each other, no matter how long they waited.
+#
+# Capped at _MAX_KNOWN_PEERS entries to keep the datagram comfortably under
+# any real-world path MTU -- a real ticket runs roughly 180-220 chars, so 4
+# of them plus pubkeys and JSON overhead stays well under 1200 bytes, a
+# generally-safe unfragmented UDP payload size. This is deliberately NOT
+# rendezvous-host-specific: ANY node populates it from whoever it has
+# recently heard from, so introduction propagates as ordinary gossip through
+# the whole mesh rather than depending on one always-on host being up --
+# see run_wan_discovery's own recent-peers cache for how it's populated.
+_MAX_KNOWN_PEERS = 4
+_MAX_TICKET_LEN = 512  # generous headroom over a real ticket's ~180-220 chars
+
 
 def encode_hello(
     pubkey_hex: str, ticket: str, *, pairing: bool = False,
     code: str | None = None, hostname: str | None = None,
+    known_peers: list[tuple[str, str]] | None = None,
 ) -> bytes:
     """The always-on discovery beacon calls this with just (pubkey, ticket),
     and that call's output must stay byte-for-byte what it always was --
     every already-deployed node's decode_hello (this version's and any
     older one's) already parses that exact shape, and there is no reason to
-    disturb it. `pairing`/`code`/`hostname` are additive and only ever
-    appear when pairing mode actually asks for them, which is also why `v`
-    only bumps to 2 in that case: a plain discovery hello has no new fields
-    to be versioned for.
+    disturb it. `pairing`/`code`/`hostname` and `known_peers` are additive
+    and only ever appear when the caller actually asks for them, which is
+    also why `v` only bumps when one of them is used: a plain discovery
+    hello has no new fields to be versioned for.
     """
     msg: dict = {"v": 1, "pubkey": pubkey_hex, "ticket": ticket}
     if pairing:
@@ -60,18 +82,29 @@ def encode_hello(
             msg["code"] = code
         if hostname is not None:
             msg["hostname"] = hostname
+    if known_peers:
+        msg["v"] = 3
+        msg["known_peers"] = [[pk, tk] for pk, tk in known_peers[:_MAX_KNOWN_PEERS]]
     return json.dumps(msg).encode("utf-8")
 
 
-def decode_hello(data: bytes) -> tuple[str, str, bool, str | None, str | None] | None:
-    """Returns (pubkey, ticket, pairing, code, hostname), or None if `data`
-    doesn't parse as a well-formed hello at all. `pairing` defaults to
-    False and `code`/`hostname` to None for a hello with none of those keys
-    -- including one from an older build that has never heard of them, or a
-    pairing beacon with an optional field simply omitted -- so every
-    existing caller that only ever cared about (pubkey, ticket) keeps
-    working unchanged; the two discovery loops (lan_discovery, wan_discovery)
-    just unpack and ignore the extra three.
+def decode_hello(
+    data: bytes,
+) -> tuple[str, str, bool, str | None, str | None, list[tuple[str, str]]] | None:
+    """Returns (pubkey, ticket, pairing, code, hostname, known_peers), or
+    None if `data` doesn't parse as a well-formed hello at all. `pairing`
+    defaults to False, `code`/`hostname` to None, and `known_peers` to an
+    empty list for a hello with none of those keys -- including one from an
+    older build that has never heard of them -- so every existing caller
+    that only ever cared about (pubkey, ticket) keeps working unchanged; the
+    discovery loops that don't use `known_peers` just unpack and ignore it.
+
+    Each known_peers entry is independently validated (a well-formed pubkey,
+    a non-empty ticket under _MAX_TICKET_LEN) and a malformed entry is
+    dropped rather than rejecting the whole hello -- this is unauthenticated
+    input from a peer relaying THIRD-PARTY data it received itself, so a
+    single bad entry (buggy or hostile) must not take down an otherwise
+    valid introduction to everyone else in the same list.
     """
     try:
         msg = json.loads(data.decode("utf-8"))
@@ -94,4 +127,14 @@ def decode_hello(data: bytes) -> tuple[str, str, bool, str | None, str | None] |
     if not isinstance(hostname, str) or not hostname or len(hostname) > _MAX_HOSTNAME_LEN:
         hostname = None
 
-    return pubkey, ticket, pairing, code, hostname
+    known_peers: list[tuple[str, str]] = []
+    raw_known_peers = msg.get("known_peers")
+    if isinstance(raw_known_peers, list):
+        for entry in raw_known_peers[:_MAX_KNOWN_PEERS]:
+            if (isinstance(entry, list) and len(entry) == 2
+                    and isinstance(entry[0], str) and isinstance(entry[1], str)
+                    and _PUBKEY_RE.match(entry[0])
+                    and 0 < len(entry[1]) <= _MAX_TICKET_LEN):
+                known_peers.append((entry[0], entry[1]))
+
+    return pubkey, ticket, pairing, code, hostname, known_peers
