@@ -608,6 +608,27 @@ async def run_wan_discovery(
         # know about us (their own DHT lookup may not have found our
         # address yet even though theirs found ours) -- a direct hello
         # back closes the loop without waiting for their next lookup round.
+        #
+        # The last_helloed debounce this goes through is for rate-limiting
+        # OUR OWN proactive re-hellos, not for "did this address already get
+        # a working hello" -- if our own earlier attempt to this exact addr
+        # was what's populating last_helloed, it was necessarily UNCONFIRMED
+        # (we have no ack mechanism for a plain send), and the two very
+        # commonly land within the same hello_resync_s window: two nodes
+        # started around the same time each try the other first, one packet
+        # arrives before the other side is even listening, and the debounce
+        # then silently swallows the one reply that would have closed the
+        # loop. Live-confirmed 2026-09-07: with two real machines started a
+        # couple of seconds apart, the later-started one discovered the
+        # earlier one in under a second, but the earlier one never
+        # discovered the later one at all -- because its own reciprocation
+        # here was dropped by this exact debounce, every single time,
+        # regardless of how long the test waited afterward. Popping the
+        # entry first forces this specific send through regardless of any
+        # prior unconfirmed attempt -- an incoming hello is proof this
+        # address is real and listening right now, which is a strictly
+        # stronger signal than our own past unconfirmed attempt to it.
+        last_helloed.pop(addr, None)
         _maybe_hello(addr, retry=False)
         now = time.monotonic()
         if now - last_seen_pubkey.get(pubkey, 0.0) < hello_resync_s:

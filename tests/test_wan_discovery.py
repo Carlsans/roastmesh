@@ -216,6 +216,81 @@ async def test_rendezvous_host_hello_finds_a_peer_immediately_without_the_dht(tm
                 pass
 
 
+async def test_rendezvous_hello_reciprocates_even_after_our_own_unconfirmed_attempt(tmp_path) -> None:
+    """Regression test for a real bug found via live two-machine testing
+    (2026-09-07): when BOTH sides are actively hello-ing each other (not
+    just one active + one passive, unlike the test above), the SECOND side
+    to receive a hello would still fail to discover the FIRST side, no
+    matter how long it waited.
+
+    Mechanism: A hellos B's address at startup (last_helloed[B] = t0) --
+    this send is necessarily UNCONFIRMED (a plain UDP send has no ack), and
+    is genuinely LOST here because B's socket does not exist yet (B starts
+    0.3s later, below). Once B starts, B's own startup hello reaches A fine.
+    `_on_foreign` is supposed to reciprocate immediately so B doesn't have
+    to wait for its own next lookup round -- but that reciprocation goes
+    through the SAME `_maybe_hello` debounce that A's own earlier (lost)
+    send already populated, so "we tried this address moments ago" (true,
+    but unconfirmed) silently suppresses "reply to the address that just
+    proved it's listening" (the actually-relevant fact). B never hears
+    back, and A's own retry schedule has already stopped too (`_acked` was
+    set the moment A received B's hello), so B is stuck with no way to be
+    discovered within HELLO_RETRIES' ~8s window, or ever, since
+    hello_resync_s (60s here, matching production) outlives that window.
+
+    The 0.3s stagger mirrors what made this reproducible on real hardware:
+    two machines starting even a couple of seconds apart, where one side's
+    own first attempt lands before the other side's socket exists yet.
+    Starting both tasks back-to-back on the same event loop (no stagger)
+    does NOT reproduce it -- both sides' own direct sends independently
+    succeed against an already-bound peer, and reciprocation ends up
+    unneeded either way, masking the bug entirely.
+    """
+    port_a, port_b = 41997, 41998
+
+    discovered_by_a: list[tuple[str, str]] = []
+    discovered_by_b: list[tuple[str, str]] = []
+
+    async def on_a(pubkey: str, ticket: str) -> None:
+        discovered_by_a.append((pubkey, ticket))
+
+    async def on_b(pubkey: str, ticket: str) -> None:
+        discovered_by_b.append((pubkey, ticket))
+
+    # Both sides configured with rendezvous_hosts pointing at EACH OTHER --
+    # both actively hello on startup, unlike test_rendezvous_host_hello_
+    # finds_a_peer_immediately_without_the_dht above, where only one side
+    # ever initiates and the other is purely reactive (which never exercises
+    # this bug, since a purely reactive side has no prior last_helloed entry
+    # of its own to collide with).
+    task_a = asyncio.create_task(run_wan_discovery(
+        "aa" * 32, "ticket-a", on_a, port=port_a, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_b)],
+        node_cache_path=tmp_path / "nodes_a.json", allow_loopback=True,
+    ))
+    await asyncio.sleep(0.3)  # A's first hello fires and is lost -- B doesn't exist yet
+    task_b = asyncio.create_task(run_wan_discovery(
+        "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_a)],
+        node_cache_path=tmp_path / "nodes_b.json", allow_loopback=True,
+    ))
+    try:
+        for _ in range(150):
+            if discovered_by_a and discovered_by_b:
+                break
+            await asyncio.sleep(0.1)
+        assert discovered_by_a == [("bb" * 32, "ticket-b")]
+        assert discovered_by_b == [("aa" * 32, "ticket-a")]
+    finally:
+        task_a.cancel()
+        task_b.cancel()
+        for t in (task_a, task_b):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
 async def test_rendezvous_host_falls_back_to_its_literal_ip_when_dns_fails() -> None:
     from roastmesh.wan_discovery import _resolve_rendezvous_hosts
 
