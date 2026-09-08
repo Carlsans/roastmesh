@@ -546,11 +546,26 @@ async def run_wan_discovery(
     _KNOWN_PEERS_CACHE_SIZE = 16
     known_peers_cache: OrderedDict[str, str] = OrderedDict()
 
-    def _remember_peer(pubkey: str, ticket: str) -> None:
+    # Separate from known_peers_cache (which maps pubkey -> TICKET, an iroh
+    # dial address, not reachable via this module's raw hello datagrams at
+    # all) -- this maps pubkey -> the UDP addr we actually received a hello
+    # FROM. Only ever populated in _on_foreign's own top-level sender, never
+    # for a gossiped sub-entry (we have no UDP address for those, only a
+    # ticket) -- it's what makes _push_new_peer_to_known_contacts below able
+    # to send a raw datagram at all. Same size cap and eviction policy as
+    # known_peers_cache, kept in lockstep with it.
+    pubkey_to_addr: OrderedDict[str, Addr] = OrderedDict()
+
+    def _remember_peer(pubkey: str, ticket: str, addr: Addr | None = None) -> None:
         known_peers_cache[pubkey] = ticket
         known_peers_cache.move_to_end(pubkey)
         while len(known_peers_cache) > _KNOWN_PEERS_CACHE_SIZE:
             known_peers_cache.popitem(last=False)
+        if addr is not None:
+            pubkey_to_addr[pubkey] = addr
+            pubkey_to_addr.move_to_end(pubkey)
+            while len(pubkey_to_addr) > _KNOWN_PEERS_CACHE_SIZE:
+                pubkey_to_addr.popitem(last=False)
 
     def _gossip_snapshot(*, exclude_pubkey: str | None = None) -> list[tuple[str, str]]:
         # Most-recently-seen first; encode_hello truncates to its own cap,
@@ -574,6 +589,31 @@ async def run_wan_discovery(
             )
         except OSError:
             pass
+
+    def _push_new_peer_to_known_contacts(new_pubkey: str) -> None:
+        """Forward news of a brand-new peer to everyone we can currently
+        reach directly, instead of waiting for each of them to re-hello us
+        on their own schedule (up to lookup_interval_s, 120s by default in
+        production) -- without this, an already-running, already-warmed-up
+        node only learns about a friend who just joined on its own next
+        scheduled DHT round, even though the rest of the mechanism works in
+        well under a second. Confirmed live (2026-09-08): an already-running
+        desktop never discovered a freshly-installed Pi within a 90s test
+        window for exactly this reason -- gossip alone (pull: propagates
+        only when the OTHER side happens to re-contact us) wasn't enough:
+        this is the push half.
+
+        Bypasses the last_helloed debounce for the same reason the
+        reciprocation path does: this delivers genuinely new information a
+        moment ago, not a redundant re-announcement of something the
+        recipient may already have -- see _on_foreign's own comment on
+        popping the debounce for the full reasoning.
+        """
+        for other_pubkey, other_addr in list(pubkey_to_addr.items()):
+            if other_pubkey in (new_pubkey, own_pubkey_hex):
+                continue
+            last_helloed.pop(other_addr, None)
+            _maybe_hello(other_addr, retry=False, exclude_pubkey=other_pubkey)
 
     async def _hello_with_retries(addr: Addr) -> None:
         """Send the first hello more than once.
@@ -634,8 +674,8 @@ async def run_wan_discovery(
                 _self_collision_reported.add(addr[0])
                 on_self_identity_collision(addr[0])
             return
-        _remember_peer(pubkey, ticket)
-        _acked.add(addr)  # heard from them -- no need to keep retransmitting
+        is_new_direct_peer = pubkey not in known_peers_cache
+        _remember_peer(pubkey, ticket, addr)
         # Reciprocate immediately: whoever reached us first might not yet
         # know about us (their own DHT lookup may not have found our
         # address yet even though theirs found ours) -- a direct hello
@@ -655,17 +695,37 @@ async def run_wan_discovery(
         # earlier one in under a second, but the earlier one never
         # discovered the later one at all -- because its own reciprocation
         # here was dropped by this exact debounce, every single time,
-        # regardless of how long the test waited afterward. Popping the
-        # entry first forces this specific send through regardless of any
-        # prior unconfirmed attempt -- an incoming hello is proof this
-        # address is real and listening right now, which is a strictly
-        # stronger signal than our own past unconfirmed attempt to it.
-        last_helloed.pop(addr, None)
+        # regardless of how long the test waited afterward.
+        #
+        # BUT: only bypass the debounce on this address's FIRST-EVER contact
+        # (addr not already in _acked) -- unconditionally popping it on
+        # EVERY incoming hello, first contact or the hundredth, was itself a
+        # real bug found immediately after fixing the one above: two nodes
+        # that had already exchanged hellos would each keep unconditionally
+        # reciprocating to the other's reciprocation, forever, an unbounded
+        # ping-pong flood confirmed live with debug tracing (2026-09-08,
+        # 26MB of identical exchanges in under 20 seconds). Once `addr` is
+        # already acked, a repeat hello from it goes through the NORMAL
+        # debounced path instead -- correctly rate-limited, since by then
+        # we already know reciprocation works and don't need to force
+        # another one through just because they happened to hello us again.
+        was_already_acked = addr in _acked
+        _acked.add(addr)  # heard from them -- no need to keep retransmitting
+        if not was_already_acked:
+            last_helloed.pop(addr, None)
         _maybe_hello(addr, retry=False, exclude_pubkey=pubkey)
         now = time.monotonic()
         if now - last_seen_pubkey.get(pubkey, 0.0) >= hello_resync_s:
             last_seen_pubkey[pubkey] = now
             asyncio.create_task(on_peer_discovered(pubkey, ticket))
+
+        # Push: tell everyone else we can currently reach directly about
+        # this brand-new arrival right now, rather than letting them find
+        # out only whenever THEY next happen to re-hello us -- see
+        # _push_new_peer_to_known_contacts's own docstring for why this
+        # half is needed even though gossip (below) already exists.
+        if is_new_direct_peer:
+            _push_new_peer_to_known_contacts(pubkey)
 
         # Gossip: this sender may have recently heard from OTHER peers we
         # haven't -- e.g. both of us only ever contacted the same third

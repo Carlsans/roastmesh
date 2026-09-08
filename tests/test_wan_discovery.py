@@ -362,6 +362,130 @@ async def test_third_party_rendezvous_host_introduces_two_strangers_via_gossip(t
                 pass
 
 
+async def test_reciprocation_does_not_ping_pong_forever(tmp_path, monkeypatch) -> None:
+    """Regression test for a real bug introduced by, and found immediately
+    after, the reciprocation-debounce-bypass fix above: unconditionally
+    popping last_helloed on EVERY incoming hello -- not just an address's
+    first-ever contact -- made two already-acquainted nodes reciprocate to
+    each other's reciprocation forever. Confirmed live with debug tracing
+    (2026-09-08): two nodes produced 26MB of identical exchanges in under
+    20 seconds and never converged. The fix bypasses the debounce only on
+    an address's first contact; once acked, a repeat hello from it goes
+    through the normal debounced path instead.
+    """
+    import roastmesh.wan_discovery as wd
+
+    call_count = 0
+    real_encode_hello = wd.encode_hello
+
+    def counting_encode_hello(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_encode_hello(*args, **kwargs)
+
+    monkeypatch.setattr(wd, "encode_hello", counting_encode_hello)
+
+    port_a, port_b = 42005, 42006
+
+    async def on_a(pubkey: str, ticket: str) -> None:
+        pass
+
+    async def on_b(pubkey: str, ticket: str) -> None:
+        pass
+
+    task_a = asyncio.create_task(run_wan_discovery(
+        "aa" * 32, "ticket-a", on_a, port=port_a, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_b)],
+        node_cache_path=tmp_path / "nodes_a.json", allow_loopback=True,
+    ))
+    task_b = asyncio.create_task(run_wan_discovery(
+        "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_a)],
+        node_cache_path=tmp_path / "nodes_b.json", allow_loopback=True,
+    ))
+    try:
+        await asyncio.sleep(3.0)  # let a runaway ping-pong loop show itself
+        # A healthy exchange here is a small, fixed number of hellos (each
+        # side's own startup burst plus a couple of reciprocations) -- a
+        # ping-pong loop sends orders of magnitude more within this window.
+        assert call_count < 20, f"sent {call_count} hellos in 3s -- looks like a ping-pong loop"
+    finally:
+        task_a.cancel()
+        task_b.cancel()
+        for t in (task_a, task_b):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
+async def test_a_late_arrival_is_pushed_to_an_already_warmed_up_peer(tmp_path) -> None:
+    """Regression test for a real latency gap found via live testing
+    (2026-09-08), the one behind the gossip fix above but distinct from it:
+    gossip alone is PULL-based -- it only reaches A when A itself re-hellos
+    C, which A does once at startup and then not again until its own next
+    scheduled DHT round (lookup_interval_s, 120s by default in production).
+    An already-running node -- someone who's had roastmesh open for a
+    while -- would then not hear about a brand-new friend joining for up to
+    that long, even though every other part of the mechanism works in well
+    under a second.
+
+    A hellos C once and is given a long lookup_interval_s so it does NOT
+    get a second scheduled chance within this test's own timeout -- if A
+    ever learns about B, it can only be because C PUSHED that news to A
+    the moment C itself learned about B, not because A asked again.
+    """
+    port_a, port_b, port_c = 42002, 42003, 42004
+
+    discovered_by_a: list[tuple[str, str]] = []
+
+    async def on_a(pubkey: str, ticket: str) -> None:
+        discovered_by_a.append((pubkey, ticket))
+
+    async def on_b(pubkey: str, ticket: str) -> None:
+        pass
+
+    async def on_c(pubkey: str, ticket: str) -> None:
+        pass
+
+    task_c = asyncio.create_task(run_wan_discovery(
+        "cc" * 32, "ticket-c", on_c, port=port_c, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], node_cache_path=tmp_path / "nodes_c.json", allow_loopback=True,
+    ))
+    await asyncio.sleep(0.2)
+    task_a = asyncio.create_task(run_wan_discovery(
+        "aa" * 32, "ticket-a", on_a, port=port_a,
+        lookup_interval_s=999.0,  # no second scheduled chance within this test
+        hello_resync_s=60.0, bootstrap_nodes=[],
+        rendezvous_hosts=[("127.0.0.1", None, port_c)],
+        node_cache_path=tmp_path / "nodes_a.json", allow_loopback=True,
+    ))
+    # A's own startup burst (HELLO_RETRIES, ~8s) finishes well before this --
+    # B arriving only after it is what makes this "late", the case gossip
+    # alone cannot cover.
+    await asyncio.sleep(9.0)
+    task_b = asyncio.create_task(run_wan_discovery(
+        "bb" * 32, "ticket-b", on_b, port=port_b, lookup_interval_s=60.0, hello_resync_s=60.0,
+        bootstrap_nodes=[], rendezvous_hosts=[("127.0.0.1", None, port_c)],
+        node_cache_path=tmp_path / "nodes_b.json", allow_loopback=True,
+    ))
+    try:
+        for _ in range(100):
+            if ("bb" * 32, "ticket-b") in discovered_by_a:
+                break
+            await asyncio.sleep(0.1)
+        assert ("bb" * 32, "ticket-b") in discovered_by_a, discovered_by_a
+    finally:
+        task_a.cancel()
+        task_b.cancel()
+        task_c.cancel()
+        for t in (task_a, task_b, task_c):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
 async def test_rendezvous_host_falls_back_to_its_literal_ip_when_dns_fails() -> None:
     from roastmesh.wan_discovery import _resolve_rendezvous_hosts
 
