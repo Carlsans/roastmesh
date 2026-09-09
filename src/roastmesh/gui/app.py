@@ -650,6 +650,7 @@ class SearchTab(Tab):
             blob_local=bool(payload.get("blob_local", True)),
             is_published=bool(payload.get("is_published")),
             is_from_paired_device=bool(payload.get("is_from_paired_device")),
+            paired_device_name=payload.get("paired_device_name"),
         )
 
 
@@ -666,6 +667,7 @@ class RoastDetailWindow(tk.Toplevel):
         self, parent: tk.Widget, app: "RoastmeshApp", roast_id: str, record: dict,
         raw_path: str | None, hidden: bool, *, on_change: Callable[[], None] | None = None,
         blob_local: bool = True, is_published: bool = False, is_from_paired_device: bool = False,
+        paired_device_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.app = app
@@ -740,6 +742,11 @@ class RoastDetailWindow(tk.Toplevel):
 
         tk.Label(body, text=t("Notes"), font=FONT_H2, fg=theme.FG, bg=theme.BG, anchor="w").pack(
             fill="x", padx=14, pady=(10, 2))
+        if is_from_paired_device:
+            tk.Label(body, text=t("(This roast is on your other device: {name})",
+                                   name=paired_device_name or t("unknown")),
+                     font=("TkDefaultFont", 9), fg=theme.MUTED, bg=theme.BG, anchor="w").pack(
+                fill="x", padx=14, pady=(0, 2))
         notes_frame = ttk.Frame(body)
         notes_frame.pack(fill="x", padx=14)
         tk.Label(notes_frame, text=t("Roasting notes:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
@@ -755,16 +762,13 @@ class RoastDetailWindow(tk.Toplevel):
 
         notes_btn_row = ttk.Frame(body)
         notes_btn_row.pack(fill="x", padx=14, pady=(0, 4))
-        if is_from_paired_device:
-            explain(body, t("This roast belongs to a paired device -- saving stages the edit to sync "
-                             "back to it, rather than changing anything here."))
-            ttk.Button(notes_btn_row, text=t("Send edit to device"),
-                       command=self._on_stage_edit).pack(side="left")
-        else:
-            if is_published:
-                explain(body, t("Already published -- saving publishes a new entry that supersedes "
-                                 "this one. The original stays in your feed, unchanged."))
-            ttk.Button(notes_btn_row, text=t("Save notes"), command=self._on_save_notes).pack(side="left")
+        # The paired-device case needs no extra explanation here -- the
+        # inline note above the notes fields already says where this roast
+        # actually lives; "Save notes" below does the right thing either way.
+        if not is_from_paired_device and is_published:
+            explain(body, t("Already published -- saving publishes a new entry that supersedes "
+                             "this one. The original stays in your feed, unchanged."))
+        ttk.Button(notes_btn_row, text=t("Save notes"), command=self._on_save_notes).pack(side="left")
         self.notes_status_var = tk.StringVar(value="")
         tk.Label(notes_btn_row, textvariable=self.notes_status_var, font=("TkDefaultFont", 9),
                  fg=theme.MUTED, bg=theme.BG, anchor="w").pack(side="left", padx=(8, 0))
@@ -828,7 +832,13 @@ class RoastDetailWindow(tk.Toplevel):
     def _on_save_notes(self) -> None:
         roasting_notes = self.roasting_notes_text.get("1.0", "end-1c")
         cupping_notes = self.cupping_notes_text.get("1.0", "end-1c")
-        argv = roastmesh_argv("--db", self.app.db_path.get(), "notes", "edit", self.roast_id,
+        # A paired device's roast goes through `device stage-edit` instead of
+        # `notes edit` -- it writes into this identity's own devices folder
+        # and immediately tries to deliver it to the owning device (a brief
+        # LAN probe, then a direct push if it answers), rather than editing
+        # a roast that isn't this identity's own to publish/supersede.
+        command = ("device", "stage-edit") if self.is_from_paired_device else ("notes", "edit")
+        argv = roastmesh_argv("--db", self.app.db_path.get(), *command, self.roast_id,
                                "--roasting-notes", roasting_notes, "--cupping-notes", cupping_notes)
         self.notes_status_var.set(t("Saving..."))
         buf: list[str] = []
@@ -841,27 +851,13 @@ class RoastDetailWindow(tk.Toplevel):
         if code != 0:
             self.notes_status_var.set(t("Couldn't save: {error}", error="".join(buf).strip()))
             return
-        self.notes_status_var.set(t("Saved."))
+        # Show the CLI's own outcome text rather than a generic "Saved." --
+        # for a paired device's roast that's genuinely informative (delivered
+        # right now vs. staged because the device wasn't reachable), not
+        # just decorative.
+        self.notes_status_var.set("".join(buf).strip() or t("Saved."))
         if self.on_change:
             self.on_change()
-
-    def _on_stage_edit(self) -> None:
-        roasting_notes = self.roasting_notes_text.get("1.0", "end-1c")
-        cupping_notes = self.cupping_notes_text.get("1.0", "end-1c")
-        argv = roastmesh_argv("--db", self.app.db_path.get(), "device", "stage-edit", self.roast_id,
-                               "--roasting-notes", roasting_notes, "--cupping-notes", cupping_notes)
-        self.notes_status_var.set(t("Staging..."))
-        buf: list[str] = []
-        task = Task(argv=argv)
-        task.start()
-        stream_into(task, buf.append, lambda code: self._on_edit_staged(code, buf),
-                    lambda ms, fn: self.after(ms, fn))
-
-    def _on_edit_staged(self, code: int, buf: list[str]) -> None:
-        if code != 0:
-            self.notes_status_var.set(t("Couldn't stage the edit: {error}", error="".join(buf).strip()))
-            return
-        self.notes_status_var.set(t("Staged -- will sync to that device once it's reachable."))
 
 
 class PublishTab(Tab):

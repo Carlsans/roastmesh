@@ -53,21 +53,22 @@ def _run_headless(body: str, timeout: int = 30) -> subprocess.CompletedProcess:
     does not reliably tolerate repeated create/destroy cycles of the root
     window inside one interpreter, which would make test ORDER affect
     results.
+
+    Isolation from this machine's real display is handled once, globally,
+    by conftest.py's _force_isolated_display() -- it overrides $DISPLAY (and
+    strips WAYLAND_DISPLAY) for this whole pytest process before any test
+    runs, and every subprocess spawned here inherits that safely via
+    os.environ. This function used to ALSO wrap its own subprocess in a
+    fresh `xvfb-run` on top of that, which is not just redundant: confirmed
+    as the root cause of a real regression in
+    test_sigterm_cleans_up_the_background_node_serve_process --
+    `xvfb-run` is a wrapper shell script, so `proc` (what a caller sends
+    SIGTERM to) was that shell, not the actual Python process underneath,
+    and the shell does not reliably forward the signal to it. Since the
+    environment is already safe, there's nothing left for a second Xvfb
+    layer to do except break signal delivery like that.
     """
     cmd = [sys.executable, "-c", HEADLESS.format(body=body)]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        # This system's xvfb-run defaults to a 640x480 virtual screen --
-        # confirmed as the root cause of a real intermittent failure: the
-        # search results Treeview's requested size (~850x400) didn't fit
-        # inside the app's own default 900x680 window once packed under a
-        # tab bar/heading at that resolution, leaving it unmapped
-        # (winfo_ismapped() == 0) so Treeview.bbox() returned nothing for
-        # an otherwise perfectly real, populated row. 1920x1080 comfortably
-        # fits this app's window at any of its resolution-based UI scales
-        # (gui/widgets.py's detect_ui_scale) -- a laptop-sized screen is
-        # exactly the scenario this whole feature is about, not a corner
-        # case to shrink away.
-        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
@@ -160,9 +161,11 @@ def _patched(self):
 appmod.RoastmeshApp.__init__ = _patched
 appmod.main(single_instance_port={port})
 """)
+    # No xvfb-run wrapping here -- conftest.py's _force_isolated_display()
+    # already made $DISPLAY safe for this whole process (and everything it
+    # spawns); see _run_headless's docstring for why adding another Xvfb
+    # layer on top is actively harmful, not just redundant.
     cmd = [sys.executable, str(script)]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
     subprocess.run(cmd, capture_output=True, text=True, timeout=90)
 
     # The relaunched instance is a separate process on Windows, so it can
@@ -754,21 +757,14 @@ def _gui_launch_argv(port: int) -> list[str]:
         "from roastmesh.gui.app import main\n"
         f"main(single_instance_port={port})\n"
     )
-    cmd = [sys.executable, "-c", body]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        # This system's xvfb-run defaults to a 640x480 virtual screen --
-        # confirmed as the root cause of a real intermittent failure: the
-        # search results Treeview's requested size (~850x400) didn't fit
-        # inside the app's own default 900x680 window once packed under a
-        # tab bar/heading at that resolution, leaving it unmapped
-        # (winfo_ismapped() == 0) so Treeview.bbox() returned nothing for
-        # an otherwise perfectly real, populated row. 1920x1080 comfortably
-        # fits this app's window at any of its resolution-based UI scales
-        # (gui/widgets.py's detect_ui_scale) -- a laptop-sized screen is
-        # exactly the scenario this whole feature is about, not a corner
-        # case to shrink away.
-        cmd = ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", *cmd]
-    return cmd
+    # No xvfb-run wrapping here -- conftest.py's _force_isolated_display()
+    # already made $DISPLAY safe (at 1920x1080, wide enough for this app's
+    # own resolution-based UI scales -- the concern a per-call xvfb-run used
+    # to address here) for this whole process and everything it spawns; see
+    # _run_headless's docstring for why adding another Xvfb layer on top of
+    # that is actively harmful (breaks SIGTERM delivery to the wrapped
+    # process), not just redundant.
+    return [sys.executable, "-c", body]
 
 
 def test_second_launch_focuses_the_first_instead_of_opening_a_second_window(tmp_path: Path) -> None:
@@ -1310,7 +1306,11 @@ print("OK")
     assert "CUPPING_TEXT 'existing cupping note'" in r.stdout, r.stdout
 
 
-def test_roast_detail_window_offers_send_to_device_for_a_paired_devices_roast(tmp_path: Path) -> None:
+def test_roast_detail_window_uses_a_single_save_button_for_a_paired_devices_roast(tmp_path: Path) -> None:
+    """A paired device's roast gets the SAME "Save notes" button as any
+    other -- no separate "Send edit to device" flow -- just an inline note
+    saying where it actually lives. _on_save_notes itself decides which CLI
+    command to run (see its own branch on is_from_paired_device)."""
     home = tmp_path / "home"
     home.mkdir()
     r = _run_headless(f"""
@@ -1321,17 +1321,33 @@ app = RoastmeshApp()
 app.update()
 record = {{"roasting_notes": "", "cupping_notes": "", "beans_text": "", "milestones": []}}
 win = RoastDetailWindow(app, app, "abc123", record, "/tmp/fake.alog", False,
-                        is_published=True, is_from_paired_device=True)
+                        is_published=True, is_from_paired_device=True,
+                        paired_device_name="their-laptop")
 app.update()
 print("IS_FROM_PAIRED_DEVICE", win.is_from_paired_device)
-print("HAS_STAGE_EDIT_METHOD", hasattr(win, "_on_stage_edit"))
+print("HAS_SAVE_NOTES_METHOD", hasattr(win, "_on_save_notes"))
+print("NO_SEPARATE_STAGE_METHOD", not hasattr(win, "_on_stage_edit"))
+
+def find_labels(widget):
+    found = []
+    if isinstance(widget, tk.Label):
+        found.append(widget.cget("text"))
+    for child in widget.winfo_children():
+        found.extend(find_labels(child))
+    return found
+
+import tkinter as tk
+labels = find_labels(win)
+print("DEVICE_NAME_SHOWN", any("their-laptop" in l for l in labels))
 win.destroy()
 app._on_close()
 print("OK")
 """)
     assert "OK" in r.stdout, r.stderr
     assert "IS_FROM_PAIRED_DEVICE True" in r.stdout, r.stdout
-    assert "HAS_STAGE_EDIT_METHOD True" in r.stdout, r.stdout
+    assert "HAS_SAVE_NOTES_METHOD True" in r.stdout, r.stdout
+    assert "NO_SEPARATE_STAGE_METHOD True" in r.stdout, r.stdout
+    assert "DEVICE_NAME_SHOWN True" in r.stdout, r.stdout
 
 
 def test_roast_detail_window_scrolls_when_content_overflows(tmp_path: Path) -> None:

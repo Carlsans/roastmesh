@@ -772,6 +772,7 @@ _DEVICE_COLUMNS = [
     ("pubkey", "Pubkey", 170),
     ("platform", "Platform", 90),
     ("paired_at", "Paired", 150),
+    ("pending", "Pending", 70),
 ]
 
 
@@ -810,10 +811,12 @@ class DeviceTable(ttk.Frame):
         for row in rows:
             pubkey = row.get("pubkey") or ""
             online = bool(row.get("online"))
+            pending = row.get("pending_edit_count") or 0
             self.tree.insert("", "end", iid=pubkey, text="●", tags=("online" if online else "offline",),
                              values=(
                                  row.get("name") or t("?"),
                                  (pubkey[:16] + "...") if len(pubkey) > 16 else pubkey,
                                  row.get("platform") or "",
                                  (row.get("paired_at") or "")[:10],
+                                 str(pending) if pending else "",
                              ))

@@ -240,6 +240,7 @@ class RoastSearchRow:
     is_user_log: bool
     hidden: bool
     author_pubkey: str | None
+    author_seq: int | None
     # False for a roast whose blob was evicted to a search-only stub
     # (replication.py): still findable, bytes fetched on demand when opened.
     blob_local: bool = True
@@ -281,7 +282,7 @@ def search_roasts(
                r.batch_weight_in_g, r.density_g_per_l, r.title, r.beans_text, r.roast_date,
                r.roast_epoch,
                r.is_user_log, r.hidden, s.source_ref, s.source_type, s.raw_path, s.author_pubkey,
-               s.blob_local,
+               s.author_seq, s.blob_local,
                EXISTS(
                    SELECT 1 FROM sources s2
                    WHERE s2.author_pubkey = s.author_pubkey AND s2.supersedes_seq = s.author_seq
@@ -372,6 +373,7 @@ def search_roasts(
             is_user_log=bool(row["is_user_log"]),
             hidden=bool(row["hidden"]),
             author_pubkey=row["author_pubkey"],
+            author_seq=row["author_seq"],
             blob_local=bool(row["blob_local"]),
             superseded=bool(row["is_superseded"]),
         )
@@ -401,6 +403,20 @@ def search_roasts(
 # again the same bean, hours or days apart, must never collapse) and grouped
 # by day first so it can never span two different roast_date values.
 _NEAR_DUPLICATE_WINDOW_S = 3 * 3600
+
+
+def _canonical_key(row: RoastSearchRow) -> tuple[int, int]:
+    # roast_epoch alone is not a reliable "which is newer" signal within a
+    # cluster: a notes-only edit republished as a fresh, unlinked entry (the
+    # scenario this whole heuristic exists for) carries the SAME roast_epoch
+    # as the original, since only the notes text changed, not the roast's
+    # own recorded start time. Confirmed as a real bug against a live
+    # corpus: two entries tied on roast_epoch, and plain max() silently kept
+    # whichever came first in SQL row order -- the stale one, discarding an
+    # edit a user had just made. author_seq (the feed's own append order)
+    # has no such tie: it strictly increases with every publish, so it's
+    # authoritative whenever both sides of a tie have one.
+    return (row.roast_epoch, row.author_seq if row.author_seq is not None else -1)  # type: ignore[return-value]
 
 
 def _collapse_near_duplicates(rows: list[RoastSearchRow]) -> list[RoastSearchRow]:
@@ -434,9 +450,9 @@ def _collapse_near_duplicates(rows: list[RoastSearchRow]) -> list[RoastSearchRow
             if row.roast_epoch - cluster[-1].roast_epoch <= _NEAR_DUPLICATE_WINDOW_S:  # type: ignore[operator]
                 cluster.append(row)
                 continue
-            kept.append(max(cluster, key=lambda r: r.roast_epoch))  # type: ignore[arg-type, return-value]
+            kept.append(max(cluster, key=_canonical_key))
             cluster = [row]
-        kept.append(max(cluster, key=lambda r: r.roast_epoch))  # type: ignore[arg-type, return-value]
+        kept.append(max(cluster, key=_canonical_key))
     return kept
 
 

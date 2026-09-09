@@ -520,6 +520,39 @@ def test_search_collapses_near_duplicate_entries_from_the_same_peer_by_default(c
     }
 
 
+def test_search_near_duplicate_collapsing_prefers_the_higher_author_seq_on_a_tied_epoch(conn) -> None:
+    """A notes-only edit republished as a fresh, unlinked entry (the exact
+    scenario near-duplicate collapsing exists for) carries the SAME
+    roast_epoch as the original -- only the notes text changed, not the
+    roast's own recorded start time. Confirmed as a real regression on a
+    live corpus: plain max(roast_epoch) ties, and silently kept whichever
+    row SQL happened to return first -- the stale one, discarding an edit
+    the user had just made. author_seq (feed append order) must be the
+    tiebreaker whenever both sides of a tie have one."""
+    r1 = ingest_file(conn, FIXTURES_DIR / "kaleido_1.alog", source_type="p2p", source_ref="alice:00000010")
+    r2 = ingest_file(conn, FIXTURES_DIR / "kaleido_2.alog", source_type="p2p", source_ref="alice:00000011")
+    conn.execute(
+        "UPDATE sources SET author_seq = 10 WHERE source_id = ?",
+        (conn.execute("SELECT source_id FROM roasts WHERE roast_id = ?", (r1.record.roast_id,)).fetchone()[0],),
+    )
+    conn.execute(
+        "UPDATE sources SET author_seq = 11 WHERE source_id = ?",
+        (conn.execute("SELECT source_id FROM roasts WHERE roast_id = ?", (r2.record.roast_id,)).fetchone()[0],),
+    )
+    tied_epoch = 1_787_796_436
+    for roast_id in (r1.record.roast_id, r2.record.roast_id):
+        conn.execute(
+            "UPDATE roasts SET title = ?, roast_date = ?, roast_epoch = ? WHERE roast_id = ?",
+            ("Kaafa Anderacha Dark", "2026-08-26", tied_epoch, roast_id),
+        )
+    conn.commit()
+
+    results = repo.search_roasts(conn)
+
+    assert len(results) == 1
+    assert results[0].roast_id == r2.record.roast_id  # the higher author_seq -- the newer publish
+
+
 def test_search_near_duplicate_collapsing_ignores_rows_missing_an_epoch(conn) -> None:
     """A row with no roast_epoch can't be time-compared at all -- it must
     never be silently dropped just for sharing a title/date with another

@@ -322,11 +322,17 @@ def show(ctx: click.Context, roast_id: str, as_json: bool) -> None:
 
     if as_json:
         author_pubkey = source["author_pubkey"] if source else None
+        is_from_paired_device = bool(author_pubkey and devices_mod.is_trusted(author_pubkey))
+        paired_device_name = None
+        if is_from_paired_device:
+            match = next((d for d in devices_mod.load_devices() if d.pubkey == author_pubkey), None)
+            paired_device_name = match.name if match else None
         click.echo(json.dumps({
             "record": record, "raw_path": raw_path, "hidden": hidden, "blob_local": bool(blob_local),
             "author_pubkey": author_pubkey,
             "is_published": bool(source and source["author_seq"] is not None),
-            "is_from_paired_device": bool(author_pubkey and devices_mod.is_trusted(author_pubkey)),
+            "is_from_paired_device": is_from_paired_device,
+            "paired_device_name": paired_device_name,
         }))
         return
 
@@ -1403,9 +1409,20 @@ def device_list(as_json: bool, no_probe: bool) -> None:
     online: dict[str, str] = {}
     if paired and not no_probe:
         online = asyncio.run(probe_reachable_devices())
+    # Edits staged via `device stage-edit` that haven't been delivered yet
+    # (the owning device wasn't reachable the last time push_staged_edits
+    # ran) are otherwise invisible until they happen to land -- the whole
+    # point of exposing this is answering "did my edit actually go out yet?"
+    # on the machine where it was made, without waiting for delivery.
+    staged = device_sync.load_staged(default_device_sync_state_path())
+    pending_by_owner: dict[str, int] = {}
+    for meta in staged.values():
+        if isinstance(meta, dict) and meta.get("owner_pubkey"):
+            pending_by_owner[meta["owner_pubkey"]] = pending_by_owner.get(meta["owner_pubkey"], 0) + 1
     if as_json:
         click.echo(json.dumps([
-            {**asdict(d), "online": d.pubkey in online} for d in paired
+            {**asdict(d), "online": d.pubkey in online, "pending_edit_count": pending_by_owner.get(d.pubkey, 0)}
+            for d in paired
         ]))
         return
     if not paired:
@@ -1413,7 +1430,9 @@ def device_list(as_json: bool, no_probe: bool) -> None:
         return
     for d in paired:
         status = "online" if d.pubkey in online else "not seen"
-        click.echo(f"{d.pubkey[:16]}...  {d.name:<24} {d.platform:<8} paired={d.paired_at}  {status}")
+        pending = pending_by_owner.get(d.pubkey, 0)
+        pending_note = f"  {pending} edit(s) pending delivery" if pending else ""
+        click.echo(f"{d.pubkey[:16]}...  {d.name:<24} {d.platform:<8} paired={d.paired_at}  {status}{pending_note}")
 
 
 @device.command("remove")
@@ -1482,12 +1501,16 @@ def device_stage_edit(ctx: click.Context, roast_id: str, roasting_notes: str | N
     a stranger's or an unpaired peer's content. The edit is written into
     your own private devices folder, addressed to that specific device
     only (never mirrored to any other paired device -- see
-    device_sync.stage_file_for_owner), and delivered automatically the next
-    time that device is reachable (`device sync`, or the background watch
-    loop if a node is already running). Nothing here publishes anything --
-    it only gets the edited bytes to the machine that owns them; what that
-    device does with them next (e.g. `roastmesh notes edit --supersedes`
-    against its own feed) is up to whoever is at that device.
+    device_sync.stage_file_for_owner), and this command immediately tries
+    to deliver it too (a brief LAN probe for that device, then a direct
+    push if it answers) -- not just left for the background watch loop,
+    which only runs at all while a node happens to already be serving. If
+    the device isn't reachable right now, the edit stays staged and is
+    retried the next time it's reachable (`device sync`, or that watch
+    loop). Nothing here publishes anything -- it only gets the edited bytes
+    to the machine that owns them; what that device does with them next
+    (e.g. `roastmesh notes edit --supersedes` against its own feed) is up
+    to whoever is at that device.
     """
     if roasting_notes is None and cupping_notes is None:
         raise click.ClickException("nothing to edit -- pass --roasting-notes and/or --cupping-notes")
@@ -1516,8 +1539,24 @@ def device_stage_edit(ctx: click.Context, roast_id: str, roasting_notes: str | N
     )
     match = next((d for d in devices_mod.load_devices() if d.pubkey == owner_pubkey), None)
     device_label = match.name if match else f"{owner_pubkey[:16]}..."
-    click.echo(f"staged edit for {device_label} at {staging_relpath} -- "
-               f"will sync to their RoastMeshDevices/{return_relpath} once reachable")
+
+    async def _deliver_now() -> bool:
+        ident, _created = load_or_create_identity()
+        reachable = await probe_reachable_devices(duration_s=5.0)
+        ticket = reachable.get(owner_pubkey)
+        if ticket is None:
+            return False
+        delivered = await device_sync.push_staged_edits(
+            devices_dir, state_path, ident, {owner_pubkey: ticket},
+        )
+        return delivered > 0
+
+    if asyncio.run(_deliver_now()):
+        click.echo(f"edit delivered to {device_label} just now")
+    else:
+        click.echo(f"{device_label} isn't reachable right now -- staged at {staging_relpath}, "
+                   f"will deliver to their RoastMeshDevices/{return_relpath} automatically "
+                   f"once it's reachable (`device sync`, or a running node's own watch loop)")
 
 
 @device.command("folder")

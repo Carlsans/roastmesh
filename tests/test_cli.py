@@ -1126,6 +1126,46 @@ def test_device_list_json_reports_a_seeded_device_as_not_online_without_a_real_p
     assert rows[0]["online"] is False
 
 
+def test_device_list_reports_pending_edit_count_for_a_staged_but_undelivered_edit(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A staged cross-edit (`device stage-edit`) that hasn't been delivered
+    yet (the owning device wasn't reachable) is otherwise invisible until it
+    happens to land -- `device list` is where a user would look to answer
+    "did my edit actually go out yet?" on the machine where they made it."""
+    _isolate_home(monkeypatch, tmp_path)
+    owner_pubkey = "d" * 64
+    _seed_device(owner_pubkey, "their-laptop")
+    db_path = tmp_path / "cli.sqlite3"
+    runner = CliRunner()
+
+    ingest_result = runner.invoke(main, ["--db", str(db_path), "ingest", str(FIXTURES_DIR / "kaleido_1.alog")])
+    assert ingest_result.exit_code == 0, ingest_result.output
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE sources SET author_pubkey = ?", (owner_pubkey,))
+    conn.commit()
+    conn.close()
+
+    stage_result = runner.invoke(
+        main, ["--db", str(db_path), "device", "stage-edit", roast_id, "--roasting-notes", "not delivered yet"],
+    )
+    assert stage_result.exit_code == 0, stage_result.output
+
+    result = runner.invoke(main, ["device", "list", "--json", "--no-probe"])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)
+    assert len(rows) == 1
+    assert rows[0]["pubkey"] == owner_pubkey
+    assert rows[0]["pending_edit_count"] == 1
+
+    text_result = runner.invoke(main, ["device", "list", "--no-probe"])
+    assert "1 edit(s) pending delivery" in text_result.output
+
+
 def test_device_remove_a_seeded_device(tmp_path: Path, monkeypatch) -> None:
     from roastmesh.devices import load_devices
 

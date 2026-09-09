@@ -14,9 +14,64 @@ this was found) and handed the same junk to every other user via the DHT.
 ROASTMESH_DISCOVERY_OFFLINE stops that at the source, for the whole session
 and every subprocess it spawns. See net._discovery_is_offline.
 """
+import atexit
 import os
+import shutil
+import subprocess
+import time
 
 from roastmesh import asyncio_policy
+
+
+def _pick_free_display_number() -> int:
+    for n in range(99, 150):
+        if not os.path.exists(f"/tmp/.X{n}-lock"):
+            return n
+    return 199
+
+
+def _force_isolated_display() -> None:
+    """Force every test that builds a real Tk widget onto a dedicated
+    virtual display -- never this machine's real one, no matter which
+    test file does it or how.
+
+    Confirmed as a real, repeated incident, not a hypothetical: several
+    tests build a live Tk root directly in THIS process (test_chart.py,
+    parts of test_widgets.py) gated only by a `_has_display()` check that
+    treats "DISPLAY is already set" as "safe to proceed" -- on a machine
+    whose own desktop session sets a real DISPLAY (this one does, under
+    niri), that sent real, visible windows straight to the developer's
+    actual screen mid-test-run. test_gui.py's own fix (always route its
+    subprocess through xvfb-run, regardless of the inherited DISPLAY) does
+    NOT cover these: they never spawn a subprocess, they call tk.Tk()
+    right here. Overriding DISPLAY for this whole pytest process, before
+    any test module runs, is the only fix that covers every current and
+    future in-process Tk usage at once.
+    """
+    if os.environ.get("ROASTMESH_TEST_REAL_DISPLAY"):
+        return  # explicit opt-out, e.g. a deliberate one-off visual check
+    if not shutil.which("Xvfb"):
+        return
+    display_num = _pick_free_display_number()
+    proc = subprocess.Popen(
+        ["Xvfb", f":{display_num}", "-screen", "0", "1920x1080x24"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(50):
+        if os.path.exists(f"/tmp/.X11-unix/X{display_num}"):
+            break
+        time.sleep(0.1)
+    os.environ["DISPLAY"] = f":{display_num}"
+    # Same reasoning as test_gui.py's own hardening: a Wayland-aware bit of
+    # the stack finding WAYLAND_DISPLAY in its environment is a plausible
+    # way to still reach the real compositor even with DISPLAY correctly
+    # pointed at an isolated Xvfb X11 server.
+    os.environ.pop("WAYLAND_DISPLAY", None)
+    os.environ["GDK_BACKEND"] = "x11"
+    atexit.register(proc.terminate)
+
+
+_force_isolated_display()
 
 os.environ.setdefault("ROASTMESH_DISCOVERY_OFFLINE", "1")
 # Every GUI test builds RoastmeshApp with a throwaway HOME (no config), which
