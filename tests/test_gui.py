@@ -944,6 +944,121 @@ print("OK")
     assert "COUNT_AFTER_UNHIDE 1 result" in r.stdout, r.stdout
 
 
+def test_reopening_a_just_edited_roast_shows_the_edit_even_before_the_table_refreshes(
+    tmp_path: Path,
+) -> None:
+    """Confirmed as a real, reported bug: editing an already-published
+    roast publishes a NEW entry (superseding the old one, which is never
+    touched -- append-only) under a brand new roast_id. The search
+    results table doesn't refresh instantly -- that's one more
+    asynchronous round trip -- so reopening the SAME row (still holding
+    the now-stale, pre-edit roast_id) before that refresh completes used
+    to show the stale content, even though the edit itself had saved
+    successfully seconds earlier. This test deliberately does NOT wait
+    for the table to refresh before reopening, to prove the fix holds
+    regardless of that timing: `show` (cli.py's _resolve_roast_id) now
+    always resolves a superseded id forward to its current version."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    env = {**os.environ, "HOME": str(home)}
+
+    publish = subprocess.run(
+        [sys.executable, "-m", "roastmesh.cli", "--db", str(db_path), "feed", "publish",
+         str(FIXTURES_DIR / "kaleido_1.alog")],
+        env=env, cwd=str(home), capture_output=True, text=True, timeout=30,
+    )
+    assert publish.returncode == 0, publish.stderr
+
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+tab = app.tabs[0]
+
+def run_search():
+    tab._on_run()
+    for _ in range(200):
+        app.update()
+        if tab.task is not None and not tab.task.running and tab.table.count_var.get() != "running...":
+            return
+        time.sleep(0.05)
+    raise AssertionError("a search never finished within 10s")
+
+def open_first_row():
+    row_id = tab.table.tree.get_children()[0]
+    x, y, w, h = tab.table.tree.bbox(row_id)
+    class FakeEvent:
+        pass
+    event = FakeEvent()
+    event.y = y + h // 2
+    tab._last_detail_window = None
+    tab._on_open_row(event)
+    for _ in range(100):
+        app.update()
+        if tab._last_detail_window is not None:
+            return tab._last_detail_window
+        time.sleep(0.05)
+    raise AssertionError("the detail window never opened within 5s")
+
+run_search()
+stale_roast_id = tab.table.tree.get_children()[0]
+detail = open_first_row()
+
+detail.roasting_notes_text.delete("1.0", "end")
+detail.roasting_notes_text.insert("1.0", "the fast-follow edit")
+detail._on_save_notes()
+saved = False
+for _ in range(100):
+    app.update()
+    if detail.notes_status_var.get().startswith("published entry"):
+        saved = True
+        break
+    time.sleep(0.05)
+if not saved:
+    raise AssertionError("the save never completed within 5s")
+print("SAVE_STATUS", detail.notes_status_var.get())
+detail.destroy()
+
+# Reopen using the CAPTURED stale_roast_id directly -- exactly what a real
+# double-click on the search table's row would still do at this instant
+# (on_change()'s own refresh only clears/repopulates the table
+# asynchronously; a click landing before that finishes reads the OLD iid),
+# without depending on the table's own row state, which set_error("running...")
+# empties the moment the refresh starts. This is the exact same code path
+# _on_open_row uses, just skipping "which row did the pixel click land on".
+from roastmesh.gui.runner import Task, stream_into, roastmesh_argv
+tab._last_detail_window = None
+reopen_task = Task(argv=roastmesh_argv("--db", tab.app.db_path.get(), "show", stale_roast_id, "--json"))
+reopen_buf = []
+reopen_task.start()
+stream_into(reopen_task, reopen_buf.append, lambda code: tab._open_row_loaded(code, reopen_buf, stale_roast_id),
+            lambda ms, fn: app.after(ms, fn))
+for _ in range(100):
+    app.update()
+    if tab._last_detail_window is not None:
+        break
+    time.sleep(0.05)
+reopened = tab._last_detail_window
+notes_seen = None
+for _ in range(100):
+    app.update()
+    notes_seen = reopened.roasting_notes_text.get("1.0", "end-1c")
+    if notes_seen:
+        break
+    time.sleep(0.05)
+print("REOPENED_NOTES", repr(notes_seen))
+
+app._on_close()
+print("OK")
+""", timeout=60)
+    assert "OK" in r.stdout, r.stderr
+    assert "REOPENED_NOTES 'the fast-follow edit'" in r.stdout, r.stdout
+
+
 def test_configured_language_applies_before_any_tab_is_built(tmp_path: Path) -> None:
     """The language must be resolved from config and set (gui/i18n.py)
     before RoastmeshApp builds its notebook -- every tab label is baked in
@@ -1304,6 +1419,114 @@ print("OK")
     assert "OK" in r.stdout, r.stderr
     assert "ROASTING_TEXT 'existing roasting note'" in r.stdout, r.stdout
     assert "CUPPING_TEXT 'existing cupping note'" in r.stdout, r.stdout
+
+
+def test_roast_detail_window_autosaves_an_edit_after_the_configured_idle_delay(tmp_path: Path) -> None:
+    """The user shouldn't have to remember to click "Save notes" -- an edit
+    left alone (no further keystrokes) for _AUTOSAVE_DELAY_MS saves itself.
+    Overrides the real 60s delay to something a test can actually wait out."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    fixture = tmp_path / "kaleido_1.alog"
+    fixture.write_bytes((FIXTURES_DIR / "kaleido_1.alog").read_bytes())
+    conn = connect(db_path)
+    ingest_path(conn, fixture)
+    roast_id = conn.execute("SELECT roast_id FROM roasts").fetchone()[0]
+    conn.close()
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp, RoastDetailWindow
+from roastmesh.index.db import connect
+app = RoastmeshApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+record = {{"roasting_notes": "", "cupping_notes": "", "beans_text": "", "milestones": []}}
+win = RoastDetailWindow(app, app, {roast_id!r}, record, {str(fixture)!r}, False,
+                        is_published=False, is_from_paired_device=False)
+win._AUTOSAVE_DELAY_MS = 300
+app.update()
+win.roasting_notes_text.insert("1.0", "autosaved without clicking anything")
+app.update()
+for _ in range(100):
+    app.update()
+    if not win._notes_dirty and win.notes_status_var.get():
+        break
+    import time; time.sleep(0.05)
+print("DIRTY_AFTER_WAIT", win._notes_dirty)
+print("STATUS", win.notes_status_var.get())
+win.destroy()
+app.update()
+
+conn2 = connect({str(db_path)!r})
+row = conn2.execute("SELECT roasting_notes FROM roasts WHERE roast_id = ?", ({roast_id!r},)).fetchone()
+print("PERSISTED_NOTES", row["roasting_notes"])
+conn2.close()
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "DIRTY_AFTER_WAIT False" in r.stdout, r.stdout
+    assert "PERSISTED_NOTES autosaved without clicking anything" in r.stdout, r.stdout
+
+
+def test_roast_detail_window_saves_a_pending_edit_on_close(tmp_path: Path) -> None:
+    """Closing the window (the button, or the OS close) with an edit still
+    pending must save it first, before the window actually goes away --
+    information must not be lost just because the user closed instead of
+    clicking "Save notes"."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db_path = tmp_path / "gui.sqlite3"
+    fixture = tmp_path / "kaleido_1.alog"
+    fixture.write_bytes((FIXTURES_DIR / "kaleido_1.alog").read_bytes())
+    conn = connect(db_path)
+    ingest_path(conn, fixture)
+    roast_id = conn.execute("SELECT roast_id FROM roasts").fetchone()[0]
+    conn.close()
+
+    r = _run_headless(f"""
+import os
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp, RoastDetailWindow
+from roastmesh.index.db import connect
+app = RoastmeshApp()
+app.db_path.set({str(db_path)!r})
+app.update()
+record = {{"roasting_notes": "", "cupping_notes": "", "beans_text": "", "milestones": []}}
+win = RoastDetailWindow(app, app, {roast_id!r}, record, {str(fixture)!r}, False,
+                        is_published=False, is_from_paired_device=False)
+app.update()
+win.roasting_notes_text.insert("1.0", "saved by closing, not by clicking save")
+app.update()
+# Close immediately -- well before the (real, 60s) autosave delay would
+# ever fire on its own -- exercising the same path the window's own
+# WM_DELETE_WINDOW protocol and Close button both use.
+win._on_close_window()
+for _ in range(100):
+    app.update()
+    try:
+        still_open = bool(win.winfo_exists())
+    except Exception:
+        still_open = False
+    if not still_open:
+        break
+    import time; time.sleep(0.05)
+print("WINDOW_CLOSED", not still_open)
+app.update()
+
+conn2 = connect({str(db_path)!r})
+row = conn2.execute("SELECT roasting_notes FROM roasts WHERE roast_id = ?", ({roast_id!r},)).fetchone()
+print("PERSISTED_NOTES", row["roasting_notes"])
+conn2.close()
+app._on_close()
+print("OK")
+""")
+    assert "OK" in r.stdout, r.stderr
+    assert "WINDOW_CLOSED True" in r.stdout, r.stdout
+    assert "PERSISTED_NOTES saved by closing, not by clicking save" in r.stdout, r.stdout
 
 
 def test_roast_detail_window_uses_a_single_save_button_for_a_paired_devices_roast(tmp_path: Path) -> None:

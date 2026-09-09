@@ -271,15 +271,30 @@ def search(
 
 
 def _resolve_roast_id(conn, roast_id_prefix: str) -> str:
-    """ROAST_ID arguments across show/hide/unhide may be a prefix, e.g. the
-    8 characters `search` displays -- resolve it to exactly one full id,
-    or fail clearly if it matches none or more than one."""
+    """ROAST_ID arguments across show/hide/unhide/notes edit/device stage-edit
+    may be a prefix, e.g. the 8 characters `search` displays -- resolve it
+    to exactly one full id, or fail clearly if it matches none or more than
+    one.
+
+    Also resolves forward through any supersede chain to whatever is
+    CURRENTLY the latest version -- confirmed as a real, reported bug
+    otherwise: nothing that's ever held onto a roast_id (a GUI search
+    results table, in particular) refreshes the instant an edit is saved,
+    so a caller could easily be holding a roast_id that was just
+    superseded. For `show`, that meant reopening the very roast you just
+    edited (fast enough to beat that refresh) showed the stale pre-edit
+    content. For `notes edit`/`device stage-edit`, it would have been worse
+    than stale: editing an already-superseded id would publish yet another
+    entry ALSO claiming to supersede the same original, splitting the
+    history instead of extending it. Resolving here, at read time, means
+    the answer is always correct regardless of any UI refresh timing.
+    """
     matches = repo.find_ids_by_prefix(conn, roast_id_prefix)
     if not matches:
         raise click.ClickException(f"no roast found matching {roast_id_prefix!r}")
     if len(matches) > 1:
         raise click.ClickException(f"{roast_id_prefix!r} matches {len(matches)} roasts -- use more characters")
-    return matches[0]
+    return repo.resolve_to_latest_roast_id(conn, matches[0])
 
 
 def _resolve_user_id(conn, pubkey_prefix: str) -> str:
@@ -461,6 +476,7 @@ def notes_edit(
         )
         ingest_file(
             conn, blob_path_for(resolved_feed_dir, entry), is_user_log=True,
+            local_pubkey_hex=ident.public_key_hex,
             author_seq=entry.seq, supersedes_seq=source["author_seq"],
         )
     finally:
@@ -1526,6 +1542,13 @@ def device_stage_edit(ctx: click.Context, roast_id: str, roasting_notes: str | N
     owner_pubkey = source["author_pubkey"]
     if not owner_pubkey or not devices_mod.is_trusted(owner_pubkey):
         raise click.ClickException("this roast isn't from one of your paired devices")
+    if source["author_seq"] is None:
+        # Can't happen in practice -- the only way a roast can be visible to
+        # US at all, for it to be "from one of your paired devices" above,
+        # is via that device's own public feed, which means it already has
+        # a seq -- but never silently address a delivery with something
+        # that doesn't exist rather than asserting it here.
+        raise click.ClickException(f"{roast_id} has no feed sequence number -- can't address a delivery to it")
 
     old_bytes = Path(source["raw_path"]).read_bytes()
     new_bytes = set_notes(old_bytes, roasting_notes=roasting_notes, cupping_notes=cupping_notes)
@@ -1533,7 +1556,12 @@ def device_stage_edit(ctx: click.Context, roast_id: str, roasting_notes: str | N
     cfg = gui_config.load_config()
     devices_dir = Path(cfg.devices_dir) if cfg.devices_dir else default_devices_dir()
     state_path = default_device_sync_state_path()
-    return_relpath = f"edited/{full_id}.alog"
+    # Addressed by (owner_pubkey, author_seq), NOT roast_id -- roast_id is a
+    # fresh random UUID minted independently on every machine that ingests
+    # the same content, so a roast_id WE know means nothing on the owning
+    # device. author_seq is that device's own feed sequence number, which
+    # both sides agree on since it's how we ever saw this roast at all.
+    return_relpath = f"{device_sync.EDITED_DIR_NAME}/{owner_pubkey}/{source['author_seq']}.alog"
     staging_relpath = device_sync.stage_file_for_owner(
         devices_dir, state_path, owner_pubkey=owner_pubkey, return_relpath=return_relpath, content=new_bytes,
     )

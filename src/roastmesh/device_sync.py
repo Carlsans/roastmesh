@@ -80,6 +80,20 @@ _VERSIONS_DIR_NAME = ".roastmesh-versions"
 # leak into the normal full-mirror manifest.
 _STAGING_DIR_NAME = ".staging"
 
+# Where a delivered cross-edit lands on the OWNING device (return_relpath is
+# f"{EDITED_DIR_NAME}/{roast_id}.alog" -- see cli.py's device_stage_edit).
+# This must be excluded from scan_folder for exactly the same reason
+# _STAGING_DIR_NAME is: confirmed as a real bug (not just a theoretical one)
+# -- without this, a delivered edit landing here gets picked up on the
+# OWNING device's own next scan as "my own new local file" and broadcast-
+# mirrored right back out to every OTHER paired device (observed live: a
+# file delivered to one machine showed up, unrequested, on the sender's own
+# copy of this same folder a minute later). Worse, once treated as an
+# ordinary mirrored file, a manual delete on either side would propagate
+# and silently erase the other side's copy too, which is indistinguishable
+# from real data loss to whoever notices only the disappearance.
+EDITED_DIR_NAME = "edited"
+
 
 # --------------------------------------------------------------------------
 # Sync state: {"records": relpath -> {sha256, size, mtime_ns, deleted,
@@ -229,7 +243,7 @@ def scan_folder(devices_dir: Path, prev: dict) -> dict:
                 rel = path.relative_to(devices_dir).as_posix()
             except ValueError:
                 continue
-            if rel.split("/", 1)[0] in (_VERSIONS_DIR_NAME, _STAGING_DIR_NAME):
+            if rel.split("/", 1)[0] in (_VERSIONS_DIR_NAME, _STAGING_DIR_NAME, EDITED_DIR_NAME):
                 continue
             safe = _safe_relpath(rel)
             if safe is None:

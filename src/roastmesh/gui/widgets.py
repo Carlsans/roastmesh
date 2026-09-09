@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import tkinter as tk
+from datetime import datetime
 from collections.abc import Callable
 from tkinter import ttk
 
@@ -520,6 +521,26 @@ def scrollable(parent: tk.Widget) -> ttk.Frame:
     return inner
 
 
+def _format_roast_date(roast_date: str | None, roast_epoch: float | None) -> str:
+    """"YYYY-MM-DD HH:MM", not just the date -- the date string alone
+    (Artisan's own roastisodate/roastdate, no time component) doesn't say
+    when in the day a roast happened, which matters when comparing several
+    roasts from the same day. The date portion is kept exactly as already
+    trusted; only the clock time is derived from roast_epoch (converted to
+    this machine's local time), and only appended when available -- an
+    older or malformed entry with no roast_epoch just shows the date alone,
+    same as before."""
+    if not roast_date:
+        return ""
+    if roast_epoch is None:
+        return roast_date
+    try:
+        clock = datetime.fromtimestamp(roast_epoch).strftime("%H:%M")
+    except (OSError, OverflowError, TypeError, ValueError):
+        return roast_date
+    return f"{roast_date} {clock}"
+
+
 # title, roast_date, machine_key, roast_type, dtr_pct, drop_bt_c, beans_text
 # -- no roast_id column; it's still the Treeview's iid under the hood
 # (double-click handlers read it back via identify_row/selection), just
@@ -529,7 +550,7 @@ def scrollable(parent: tk.Widget) -> ttk.Frame:
 # the selected temperature unit whenever set_rows() runs.
 _COLUMNS = [
     ("title", "Title", 160),
-    ("roast_date", "Roast date", 100),
+    ("roast_date", "Roast date", 145),
     ("machine_key", "Machine", 110),
     ("roast_type", "Roast type", 90),
     ("dtr_pct", "DTR %", 60),
@@ -591,8 +612,8 @@ class ResultsTable(ttk.Frame):
             dtr = f"{row['dtr_pct']:.1f}" if row.get("dtr_pct") is not None else ""
             drop = f"{drop_c:.0f}" if drop_c is not None else ""
             self.tree.insert("", "end", iid=row.get("roast_id"), values=(
-                title, row.get("roast_date") or "", row.get("machine_key") or "",
-                row.get("roast_type") or "", dtr, drop, beans,
+                title, _format_roast_date(row.get("roast_date"), row.get("roast_epoch")),
+                row.get("machine_key") or "", row.get("roast_type") or "", dtr, drop, beans,
             ))
         self.count_var.set(tn(len(rows), "{n} result", "{n} results"))
         self._refresh_headers()

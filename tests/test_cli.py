@@ -206,6 +206,38 @@ def test_notes_edit_published_roast_publishes_a_superseding_entry(tmp_path: Path
     all_search = runner.invoke(main, ["--db", str(db_path), "search", "--show-superseded", "--json"])
     assert len(json.loads(all_search.output)) == 2
 
+
+def test_show_on_a_since_superseded_roast_id_returns_the_current_version(tmp_path: Path, monkeypatch) -> None:
+    """Confirmed as a real, reported bug: nothing that's ever held onto a
+    roast_id (a GUI search-results table, in particular) refreshes the
+    instant an edit is saved -- a user who reopens the very roast they just
+    edited, fast enough to beat that refresh, would see the stale pre-edit
+    content via the OLD (now-superseded) roast_id, even though the edit
+    itself saved successfully. `show` on that exact stale id must return
+    the CURRENT version instead, regardless of any UI refresh timing."""
+    _isolate_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+    feed_dir = tmp_path / "feed"
+    db_path = tmp_path / "cli.sqlite3"
+
+    runner.invoke(main, ["--db", str(db_path), "feed", "--feed-dir", str(feed_dir), "publish",
+                          str(FIXTURES_DIR / "kaleido_1.alog")])
+    search_json = runner.invoke(main, ["--db", str(db_path), "search", "--json"])
+    stale_roast_id = json.loads(search_json.output)[0]["roast_id"]
+
+    result = runner.invoke(
+        main, ["--db", str(db_path), "notes", "edit", stale_roast_id,
+               "--feed-dir", str(feed_dir), "--roasting-notes", "the fast-follow edit"],
+    )
+    assert result.exit_code == 0, result.output
+
+    # The EXACT stale id from before the edit -- as if a GUI's own
+    # search-results table hadn't refreshed yet.
+    show_result = runner.invoke(main, ["--db", str(db_path), "show", stale_roast_id, "--json"])
+    assert show_result.exit_code == 0, show_result.output
+    payload = json.loads(show_result.output)
+    assert payload["record"]["roasting_notes"] == "the fast-follow edit"
+
     # the ORIGINAL published entry/blob is untouched
     verify_result = runner.invoke(main, ["feed", "--feed-dir", str(feed_dir), "verify"])
     assert verify_result.exit_code == 0, verify_result.output
@@ -282,7 +314,10 @@ def test_device_stage_edit_stages_a_paired_devices_roast(tmp_path: Path, monkeyp
 
     import sqlite3
     conn = sqlite3.connect(db_path)
-    conn.execute("UPDATE sources SET author_pubkey = ?", (owner_pubkey,))
+    # author_seq must be set too: it's the (author_pubkey, author_seq) pair
+    # a delivery is addressed by, since roast_id (a fresh random UUID minted
+    # independently per machine) means nothing on the owning device.
+    conn.execute("UPDATE sources SET author_pubkey = ?, author_seq = 7", (owner_pubkey,))
     conn.commit()
     conn.close()
 
@@ -296,7 +331,7 @@ def test_device_stage_edit_stages_a_paired_devices_roast(tmp_path: Path, monkeyp
     assert len(staged) == 1
     meta = next(iter(staged.values()))
     assert meta["owner_pubkey"] == owner_pubkey
-    assert meta["return_relpath"] == f"edited/{roast_id}.alog"
+    assert meta["return_relpath"] == f"edited/{owner_pubkey}/7.alog"
 
     staging_relpath = next(iter(staged))
     staged_bytes = (default_devices_dir() / staging_relpath).read_bytes()
@@ -1146,7 +1181,7 @@ def test_device_list_reports_pending_edit_count_for_a_staged_but_undelivered_edi
 
     import sqlite3
     conn = sqlite3.connect(db_path)
-    conn.execute("UPDATE sources SET author_pubkey = ?", (owner_pubkey,))
+    conn.execute("UPDATE sources SET author_pubkey = ?, author_seq = 3", (owner_pubkey,))
     conn.commit()
     conn.close()
 

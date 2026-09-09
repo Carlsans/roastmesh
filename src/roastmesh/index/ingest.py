@@ -8,12 +8,14 @@ peer ingestion exists.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from roastmesh.alog.parser import SourceMeta
 from roastmesh import formats
 from roastmesh.alog.record import to_roast_record
+from roastmesh.identity import Identity
 from roastmesh.index import repository as repo
 from roastmesh.models import RoastRecord
 
@@ -186,7 +188,17 @@ def edit_unpublished_roast_notes(
     except (OSError, AlogEditError) as exc:
         return IngestResult(None, False, f"could not rewrite {path}: {exc}")
 
-    raw_bytes = path.read_bytes()
+    return _apply_rewritten_content(conn, roast_id, source, path.read_bytes())
+
+
+def _apply_rewritten_content(
+    conn: sqlite3.Connection, roast_id: str, source: sqlite3.Row, raw_bytes: bytes,
+) -> IngestResult:
+    """Shared tail of edit_unpublished_roast_notes and apply_delivered_edit:
+    `raw_bytes` has ALREADY been written to source["raw_path"] (or in
+    apply_delivered_edit's case, is about to be) -- this just re-parses it
+    and updates the SAME roast_id/source_id row in place."""
+    path = Path(source["raw_path"])
     content_sha256 = repo.sha256_bytes(raw_bytes)
     try:
         raw, _fmt = formats.detect_and_parse(raw_bytes)
@@ -201,6 +213,60 @@ def edit_unpublished_roast_notes(
     repo.insert_roast(conn, record, source["source_id"])
     conn.commit()
     return IngestResult(record, False, None)
+
+
+def apply_delivered_edit(
+    conn: sqlite3.Connection, feed_dir: Path, identity: Identity, author_seq: int, new_bytes: bytes,
+) -> IngestResult:
+    """Turn a cross-device edit delivered to devices_dir/EDITED_DIR_NAME
+    (device_sync.stage_file_for_owner, pushed by device_sync.push_staged_edits)
+    into this identity's own actual, visible update -- same effective
+    result as running `notes edit --supersedes` by hand against the
+    delivered bytes, so the person at the OTHER end of a `device stage-edit`
+    never has to do anything manual for their edit to actually show up.
+
+    Looked up by author_seq, NOT roast_id: roast_id is a fresh random UUID
+    minted independently by every machine that ingests the same content
+    (RoastRecord.new_roast_id), so a roast_id the EDITING device knows means
+    nothing on this (the owning) device -- confirmed as a real bug, not a
+    theoretical one (the very first live test of this function failed with
+    "no such roast" on the receiving machine for exactly this reason).
+    (author_pubkey, author_seq) is the one identifier both sides actually
+    agree on: it's this identity's own feed's sequence number, assigned
+    when this device itself originally published the entry -- which every
+    roast reachable via `device stage-edit` in the first place must already
+    have, since the only way another device could see it at all is via that
+    same public feed entry. So there is no "not yet published" case to
+    handle here (unlike edit_unpublished_roast_notes/notes_edit): this
+    always supersedes.
+
+    Refuses if `author_seq` isn't currently one of this identity's own
+    entries -- a delivered file's addressing is just what the OTHER device
+    claims, never trusted blindly as "this is really mine to overwrite".
+    """
+    source = repo.find_source_by_author_seq(conn, identity.public_key_hex, author_seq)
+    if source is None:
+        return IngestResult(None, False, f"no entry at seq {author_seq} in this identity's own feed")
+
+    import tempfile
+    from roastmesh.feed import append_entry, blob_path_for
+
+    fd, tmp_name = tempfile.mkstemp(suffix=".alog")
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "wb") as tmp_file:
+            tmp_file.write(new_bytes)
+        entry = append_entry(
+            feed_dir, identity, tmp_path, timestamp=datetime.now(timezone.utc).isoformat(),
+            supersedes=author_seq,
+        )
+        return ingest_file(
+            conn, blob_path_for(feed_dir, entry), is_user_log=True,
+            local_pubkey_hex=identity.public_key_hex,
+            author_seq=entry.seq, supersedes_seq=author_seq,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def ingest_path(conn: sqlite3.Connection, path: Path, **kwargs) -> list[IngestResult]:

@@ -113,6 +113,29 @@ def test_autocomplete_field_filter_values_with_no_match_returns_empty_list() -> 
     assert AutocompleteField._filter_values(["hottop", "kaleido"], "zzz") == []
 
 
+def test_format_roast_date_appends_the_local_clock_time_from_roast_epoch() -> None:
+    import time
+    from datetime import datetime
+
+    # A fixed local time, computed the same way the function under test
+    # does, so this test is correct regardless of which timezone it runs in.
+    epoch = time.mktime((2026, 8, 25, 20, 44, 0, 0, 0, -1))
+    expected = datetime.fromtimestamp(epoch).strftime("%H:%M")
+    assert widgets._format_roast_date("2026-08-25", epoch) == f"2026-08-25 {expected}"
+
+
+def test_format_roast_date_with_no_epoch_shows_the_date_alone() -> None:
+    assert widgets._format_roast_date("2026-08-25", None) == "2026-08-25"
+
+
+def test_format_roast_date_with_no_date_at_all_is_blank() -> None:
+    assert widgets._format_roast_date(None, 1787685057) == ""
+
+
+def test_format_roast_date_with_a_malformed_epoch_falls_back_to_the_date_alone() -> None:
+    assert widgets._format_roast_date("2026-08-25", "not-a-number") == "2026-08-25"
+
+
 def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY")) or shutil.which("Xvfb") is not None
 

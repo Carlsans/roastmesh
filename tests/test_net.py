@@ -1371,3 +1371,74 @@ async def test_device_watch_loop_delivers_a_staged_cross_edit(tmp_path: Path, mo
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def test_device_watch_loop_applies_a_delivered_edit(tmp_path: Path, monkeypatch) -> None:
+    """A cross-edit delivered to EDITED_DIR_NAME (by the OTHER device's own
+    push_staged_edits) must actually become a visible update, not just sit
+    there as an inert file -- confirmed as a real, reported bug: from
+    search alone, a delivered-but-never-applied edit looked exactly like
+    the edit had been lost. Delivered edits only ever target an already-
+    published entry (device_stage_edit requires it -- the editing device
+    could only see this roast at all via that same feed entry), addressed
+    by (author_pubkey, author_seq), never roast_id: roast_id is a fresh
+    random UUID minted independently per machine, meaningless on this
+    (the owning) machine -- confirmed as a real bug in this feature's very
+    first live end-to-end test."""
+    from roastmesh import device_sync
+    from roastmesh.alog.edit import set_notes
+    from roastmesh.feed import append_entry
+    from roastmesh.index.db import connect
+    from roastmesh.index.ingest import ingest_feed
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    identity = generate_identity()
+    devices_dir = tmp_path / "devices"
+    state_path = tmp_path / "state.json"
+    db_path = tmp_path / "index.sqlite3"
+    feed_dir = tmp_path / "feed"
+
+    local_copy = tmp_path / "kaleido_1.alog"
+    local_copy.write_bytes((FIXTURES_DIR / "kaleido_1.alog").read_bytes())
+    entry = append_entry(feed_dir, identity, local_copy, timestamp="2026-01-01T00:00:00Z")
+    conn = connect(db_path)
+    results = ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex)
+    original_roast_id = results[0].record.roast_id
+    conn.close()
+
+    edited_dir = devices_dir / device_sync.EDITED_DIR_NAME / identity.public_key_hex
+    edited_dir.mkdir(parents=True)
+    delivered_path = edited_dir / f"{entry.seq}.alog"
+    delivered_path.write_bytes(set_notes(local_copy.read_bytes(), roasting_notes="delivered by another device"))
+
+    task = asyncio.create_task(net._device_watch_loop(
+        devices_dir, state_path, identity, True, {}, interval_s=0.05,
+        db_path=db_path, feed_dir=feed_dir,
+    ))
+    try:
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            if not delivered_path.exists():
+                break
+        assert not delivered_path.exists()  # applied, then cleaned up
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    conn2 = connect(db_path)
+    try:
+        # A superseding entry, not the original (append-only) -- the
+        # original roast_id's own row must be untouched.
+        untouched = conn2.execute(
+            "SELECT roasting_notes FROM roasts WHERE roast_id = ?", (original_roast_id,)
+        ).fetchone()
+        assert untouched["roasting_notes"] is None
+        stored = conn2.execute(
+            "SELECT roasting_notes FROM roasts WHERE roast_id != ?", (original_roast_id,)
+        ).fetchone()
+    finally:
+        conn2.close()
+    assert stored["roasting_notes"] == "delivered by another device"

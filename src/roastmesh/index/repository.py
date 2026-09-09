@@ -25,6 +25,20 @@ def find_roast_id_by_source(conn: sqlite3.Connection, source_id: str) -> str | N
     return row["roast_id"] if row else None
 
 
+def find_source_by_author_seq(conn: sqlite3.Connection, author_pubkey: str, author_seq: int) -> sqlite3.Row | None:
+    """The only cross-machine-stable way to look up "the entry this
+    identity published at seq N": roast_id is a fresh random UUID minted
+    independently on every machine that ingests the same content (see
+    RoastRecord.new_roast_id), so it means nothing on a machine other than
+    the one that minted it. A device delivering a cross-edit back to its
+    owner cannot address it by roast_id -- (author_pubkey, author_seq) is
+    what the owner's own feed actually agrees on."""
+    cur = conn.execute(
+        "SELECT * FROM sources WHERE author_pubkey = ? AND author_seq = ?", (author_pubkey, author_seq),
+    )
+    return cur.fetchone()
+
+
 def find_source_for_roast(conn: sqlite3.Connection, roast_id: str) -> sqlite3.Row | None:
     """The sources row backing one roast -- source_id, raw_path, source_type,
     author_pubkey, author_seq/supersedes_seq -- everything an in-place notes
@@ -34,6 +48,45 @@ def find_source_for_roast(conn: sqlite3.Connection, roast_id: str) -> sqlite3.Ro
         "SELECT s.* FROM sources s JOIN roasts r ON r.source_id = s.source_id WHERE r.roast_id = ?",
         (roast_id,),
     ).fetchone()
+
+
+def resolve_to_latest_roast_id(conn: sqlite3.Connection, roast_id: str) -> str:
+    """If ROAST_ID has since been superseded (a later entry from the same
+    author points its supersedes_seq at this one's author_seq), follow the
+    chain forward to whatever is CURRENTLY the latest version and return
+    that roast_id instead -- walks multiple hops if the roast has been
+    edited more than once. Returns roast_id unchanged if it was never
+    superseded, or has no author_seq at all (a purely local, never-
+    published roast can't be superseded in the first place).
+
+    Confirmed as a real, reported bug otherwise: nothing that's ever held
+    onto a roast_id (the GUI's search-results table, in particular)
+    refreshes the instant an edit is saved -- it's one more asynchronous
+    round trip. A user who reopens the very roast they just edited fast
+    enough to beat that refresh would see the stale pre-edit content (the
+    original entry is never touched -- append-only), even though the edit
+    itself saved successfully; a full app restart "fixed" it only because
+    by then the refresh had long since finished. Resolving to the latest
+    version here, at read time, means the answer is always correct
+    regardless of any UI refresh timing -- the actual fix, not a race to
+    refresh fast enough.
+    """
+    seen: set[str] = set()
+    current = roast_id
+    while current not in seen:
+        seen.add(current)
+        source = find_source_for_roast(conn, current)
+        if source is None or source["author_pubkey"] is None or source["author_seq"] is None:
+            return current
+        row = conn.execute(
+            "SELECT r2.roast_id FROM sources s2 JOIN roasts r2 ON r2.source_id = s2.source_id "
+            "WHERE s2.author_pubkey = ? AND s2.supersedes_seq = ?",
+            (source["author_pubkey"], source["author_seq"]),
+        ).fetchone()
+        if row is None:
+            return current
+        current = row["roast_id"]
+    return current  # a supersede cycle would be a data bug -- never loop forever over it
 
 
 def update_source_content(conn: sqlite3.Connection, source_id: str, *, content_sha256: str, raw_path: str) -> None:

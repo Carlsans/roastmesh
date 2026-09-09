@@ -767,6 +767,7 @@ class _DeviceWatchHandler:
 async def _device_watch_loop(
     devices_dir: Path, state_path: Path, identity: Identity, relay: bool,
     known_tickets: dict[str, str], interval_s: float = DEVICE_WATCH_INTERVAL_S,
+    db_path: Path | None = None, feed_dir: Path | None = None,
 ) -> None:
     """React to changes in the private device-sync folder and push them out
     right away to every paired device this node currently knows how to
@@ -793,6 +794,14 @@ async def _device_watch_loop(
     delivery this instant". A device that's offline (not in `known_tickets`)
     catches up the moment it's next discovered instead
     (_auto_sync_discovered_peer's own device-sync catch-up, above).
+
+    Also, if `db_path`/`feed_dir` are given, applies any of THIS identity's
+    own roasts a paired device has delivered an edit for
+    (devices_dir/device_sync.EDITED_DIR_NAME/<roast_id>.alog, written by
+    that device's own push_staged_edits) -- without this, a delivered edit
+    just sits there forever as an inert file: nothing ever turns it into an
+    actual, visible update, which from search alone looks exactly like the
+    edit was lost. Confirmed as a real, reported bug, not a hypothetical.
     """
     # Local import: device_sync.py imports net.py right back.
     from roastmesh import device_sync
@@ -825,6 +834,46 @@ async def _device_watch_loop(
                 await device_sync.push_staged_edits(devices_dir, state_path, identity, known_tickets, relay=relay)
             except Exception as exc:  # noqa: BLE001 -- one failed delivery must not kill the loop
                 print(f"device-sync: staged-edit delivery failed: {exc!r}", flush=True)
+            # Independent of the above too: a delivered edit sitting in
+            # EDITED_DIR_NAME needs no reachability at all to apply -- it's
+            # already here, addressed to this identity's own feed entries.
+            # Path shape is EDITED_DIR_NAME/<owner_pubkey>/<author_seq>.alog
+            # (cli.py's device_stage_edit) -- NOT roast_id, which is a fresh
+            # random UUID minted independently per machine and so means
+            # nothing here; author_seq is this identity's own feed sequence
+            # number, the one thing both sides actually agree on.
+            if db_path is not None and feed_dir is not None:
+                edited_dir = devices_dir / device_sync.EDITED_DIR_NAME
+                if edited_dir.is_dir():
+                    from roastmesh.index.db import connect
+                    from roastmesh.index.ingest import apply_delivered_edit
+                    for owner_dir in sorted(p for p in edited_dir.iterdir() if p.is_dir()):
+                        if owner_dir.name != identity.public_key_hex:
+                            continue  # addressed to a different identity -- not ours to touch
+                        for delivered_path in sorted(owner_dir.glob("*.alog")):
+                            try:
+                                author_seq = int(delivered_path.stem)
+                            except ValueError:
+                                continue
+                            try:
+                                new_bytes = delivered_path.read_bytes()
+                            except OSError:
+                                continue
+                            conn = connect(db_path)
+                            try:
+                                result = apply_delivered_edit(conn, feed_dir, identity, author_seq, new_bytes)
+                            except Exception as exc:  # noqa: BLE001 -- one bad delivery must not kill the loop
+                                print(f"device-sync: applying delivered edit for seq {author_seq} failed: {exc!r}",
+                                      flush=True)
+                                continue
+                            finally:
+                                conn.close()
+                            if result.error is not None:
+                                print(f"device-sync: could not apply delivered edit for seq {author_seq}: "
+                                      f"{result.error}", flush=True)
+                                continue
+                            delivered_path.unlink(missing_ok=True)
+                            print(f"device-sync: applied a delivered edit for seq {author_seq}", flush=True)
         except Exception as exc:  # noqa: BLE001 -- housekeeping must not kill serve()
             print(f"device-sync: watch loop error: {exc!r}", flush=True)
 
@@ -1178,7 +1227,7 @@ async def serve(
     if device_sync_active:
         background_tasks.append(asyncio.create_task(_device_watch_loop(
             resolved_devices_dir, resolved_device_sync_state_path, identity, relay, known_device_tickets,
-            interval_s=device_sync_interval_s,
+            interval_s=device_sync_interval_s, db_path=db_path, feed_dir=feed_dir,
         )))
 
     try:

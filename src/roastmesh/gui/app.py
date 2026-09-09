@@ -676,6 +676,9 @@ class RoastDetailWindow(tk.Toplevel):
         self.on_change = on_change
         self.is_published = is_published
         self.is_from_paired_device = is_from_paired_device
+        self.save_task: Task | None = None
+        self._notes_dirty = False
+        self._autosave_after_id: str | None = None
         self.configure(bg=theme.BG)
         self.geometry(screen_geometry(self, 1040, 820))
         # Same on Windows: the chart is the point of this window, and it reads
@@ -753,11 +756,18 @@ class RoastDetailWindow(tk.Toplevel):
                  anchor="w").pack(fill="x")
         self.roasting_notes_text = tk.Text(notes_frame, height=3, wrap="word", font=("TkDefaultFont", 10))
         self.roasting_notes_text.insert("1.0", record.get("roasting_notes") or "")
+        # The insert above already counts as "modified" as far as Tk is
+        # concerned -- reset before binding <<Modified>> so opening the
+        # window doesn't itself look like an unsaved change.
+        self.roasting_notes_text.edit_modified(False)
+        self.roasting_notes_text.bind("<<Modified>>", self._on_notes_text_modified)
         self.roasting_notes_text.pack(fill="x", pady=(0, 6))
         tk.Label(notes_frame, text=t("Cupping notes:"), font=FONT_BOLD, bg=theme.BG, fg=theme.FG,
                  anchor="w").pack(fill="x")
         self.cupping_notes_text = tk.Text(notes_frame, height=3, wrap="word", font=("TkDefaultFont", 10))
         self.cupping_notes_text.insert("1.0", record.get("cupping_notes") or "")
+        self.cupping_notes_text.edit_modified(False)
+        self.cupping_notes_text.bind("<<Modified>>", self._on_notes_text_modified)
         self.cupping_notes_text.pack(fill="x", pady=(0, 4))
 
         notes_btn_row = ttk.Frame(body)
@@ -784,7 +794,8 @@ class RoastDetailWindow(tk.Toplevel):
             btn_row, text=(t("Unhide") if hidden else t("Hide")), command=self._on_toggle_hidden,
         )
         self.hide_button.pack(side="left", padx=(6, 0))
-        ttk.Button(btn_row, text=t("Close"), command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text=t("Close"), command=self._on_close_window).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
         if raw_path and blob_local:
             tk.Label(body, text=raw_path, font=FONT_MONO, fg=theme.MUTED, bg=theme.BG, anchor="w",
@@ -829,7 +840,56 @@ class RoastDetailWindow(tk.Toplevel):
         if self.on_change:
             self.on_change()
 
-    def _on_save_notes(self) -> None:
+    # How long after the LAST keystroke, with no further edits, an
+    # untouched change auto-saves on its own -- the user shouldn't have to
+    # remember to click "Save notes" (or close the window) for the edit to
+    # actually stick. _AUTOSAVE_RETRY_MS is only for the rare case a save is
+    # already running when this fires; it is not itself a save interval.
+    _AUTOSAVE_DELAY_MS = 60_000
+    _AUTOSAVE_RETRY_MS = 5_000
+
+    def _on_notes_text_modified(self, event: tk.Event) -> None:
+        widget = event.widget
+        # Tk only fires <<Modified>> on the False->True transition of the
+        # widget's own flag -- reset it immediately so the next keystroke
+        # fires again too, instead of only the first one ever.
+        if widget.edit_modified():
+            widget.edit_modified(False)
+        self._notes_dirty = True
+        if self._autosave_after_id is not None:
+            self.after_cancel(self._autosave_after_id)
+        self._autosave_after_id = self.after(self._AUTOSAVE_DELAY_MS, self._on_autosave_fire)
+
+    def _on_autosave_fire(self) -> None:
+        self._autosave_after_id = None
+        if not self._notes_dirty:
+            return
+        if self.save_task is not None and self.save_task.running:
+            # A manual save (or a previous autosave) is already in flight --
+            # retry shortly rather than dropping this change on the floor.
+            self._autosave_after_id = self.after(self._AUTOSAVE_RETRY_MS, self._on_autosave_fire)
+            return
+        self._on_save_notes()
+
+    def _on_close_window(self) -> None:
+        if self._autosave_after_id is not None:
+            self.after_cancel(self._autosave_after_id)
+            self._autosave_after_id = None
+        if self.save_task is not None and self.save_task.running:
+            # Let an in-flight save finish (and re-check _notes_dirty
+            # against its result) before deciding whether to close --
+            # otherwise a save started moments ago could lose a race with
+            # this window being destroyed out from under it.
+            self.after(100, self._on_close_window)
+            return
+        if self._notes_dirty:
+            self._on_save_notes(then_close=True)
+        else:
+            self.destroy()
+
+    def _on_save_notes(self, *, then_close: bool = False) -> None:
+        if self.save_task is not None and self.save_task.running:
+            return
         roasting_notes = self.roasting_notes_text.get("1.0", "end-1c")
         cupping_notes = self.cupping_notes_text.get("1.0", "end-1c")
         # A paired device's roast goes through `device stage-edit` instead of
@@ -842,15 +902,19 @@ class RoastDetailWindow(tk.Toplevel):
                                "--roasting-notes", roasting_notes, "--cupping-notes", cupping_notes)
         self.notes_status_var.set(t("Saving..."))
         buf: list[str] = []
-        task = Task(argv=argv)
-        task.start()
-        stream_into(task, buf.append, lambda code: self._on_notes_saved(code, buf),
+        self.save_task = Task(argv=argv)
+        self.save_task.start()
+        stream_into(self.save_task, buf.append, lambda code: self._on_notes_saved(code, buf, then_close=then_close),
                     lambda ms, fn: self.after(ms, fn))
 
-    def _on_notes_saved(self, code: int, buf: list[str]) -> None:
+    def _on_notes_saved(self, code: int, buf: list[str], *, then_close: bool = False) -> None:
+        self.save_task = None
         if code != 0:
+            # Never silently close on a real failure -- that would hide the
+            # one situation ("save didn't work") the user most needs to see.
             self.notes_status_var.set(t("Couldn't save: {error}", error="".join(buf).strip()))
             return
+        self._notes_dirty = False
         # Show the CLI's own outcome text rather than a generic "Saved." --
         # for a paired device's roast that's genuinely informative (delivered
         # right now vs. staged because the device wasn't reachable), not
@@ -858,6 +922,8 @@ class RoastDetailWindow(tk.Toplevel):
         self.notes_status_var.set("".join(buf).strip() or t("Saved."))
         if self.on_change:
             self.on_change()
+        if then_close:
+            self.destroy()
 
 
 class PublishTab(Tab):

@@ -64,7 +64,7 @@ def publish_new_files(
     if not watch_dir.is_dir():
         return []
 
-    existing_hashes = {e.content_sha256 for e in read_entries(feed_dir)}
+    existing_seq_by_hash = {e.content_sha256: e.seq for e in read_entries(feed_dir)}
     published: list[FeedEntry] = []
     from roastmesh import formats
     watch_files = sorted(f for pat in formats.SUPPORTED_GLOBS for f in watch_dir.glob(pat))
@@ -77,7 +77,7 @@ def publish_new_files(
             continue
         raw_bytes = path.read_bytes()
         content_sha256 = hashlib.sha256(raw_bytes).hexdigest()
-        if content_sha256 in existing_hashes:
+        if content_sha256 in existing_seq_by_hash:
             if skip_cache is not None:
                 skip_cache[path] = fingerprint
             # Already in the feed doesn't mean already in the local search
@@ -93,19 +93,34 @@ def publish_new_files(
             if db_path is not None:
                 conn = connect(db_path)
                 try:
-                    ingest_file(conn, path, is_user_log=True)
+                    ingest_file(
+                        conn, path, is_user_log=True, local_pubkey_hex=identity.public_key_hex,
+                        author_seq=existing_seq_by_hash[content_sha256],
+                    )
                 finally:
                     conn.close()
             continue
         entry = append_entry(feed_dir, identity, path, timestamp=datetime.now(timezone.utc).isoformat())
-        existing_hashes.add(content_sha256)
+        existing_seq_by_hash[content_sha256] = entry.seq
         published.append(entry)
         if skip_cache is not None:
             skip_cache[path] = fingerprint
         if db_path is not None:
             conn = connect(db_path)
             try:
-                ingest_file(conn, path, is_user_log=True)
+                # author_seq (and local_pubkey_hex, rather than letting
+                # ingest_file fall back to auto-detecting it from disk) must
+                # be recorded here too -- confirmed as a real, separate bug:
+                # without it, this identity's OWN local index never learns
+                # its own feed position for a freshly-published entry, so
+                # anything keyed on (author_pubkey, author_seq) later --
+                # e.g. index.ingest.apply_delivered_edit, resolving a
+                # cross-device edit delivered back to this exact entry --
+                # can never find it.
+                ingest_file(
+                    conn, path, is_user_log=True, local_pubkey_hex=identity.public_key_hex,
+                    author_seq=entry.seq,
+                )
             finally:
                 conn.close()
     return published

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from roastmesh.device_sync import (
+    EDITED_DIR_NAME,
     Action,
     _build_sync_response,
     _safe_relpath,
@@ -166,6 +167,22 @@ def test_scan_folder_ignores_the_reserved_versions_directory(tmp_path: Path) -> 
     versions = tmp_path / ".roastmesh-versions"
     versions.mkdir()
     (versions / "old.alog").write_bytes(b"old")
+    (tmp_path / "current.alog").write_bytes(b"current")
+    manifest = scan_folder(tmp_path, {})
+    assert set(manifest) == {"current.alog"}
+
+
+def test_scan_folder_ignores_the_delivered_edits_directory(tmp_path: Path) -> None:
+    """A delivered cross-edit (device_sync.stage_file_for_owner's
+    return_relpath, under EDITED_DIR_NAME) must never enter the normal
+    full-mirror manifest -- confirmed as a real bug otherwise: the OWNING
+    device's own next scan would treat a just-delivered edit as ITS OWN new
+    local file and broadcast-mirror it right back out to every other paired
+    device, and a manual delete on either side would then silently
+    propagate and erase the other side's copy too."""
+    edited = tmp_path / EDITED_DIR_NAME
+    edited.mkdir()
+    (edited / "some-roast-id.alog").write_bytes(b"delivered")
     (tmp_path / "current.alog").write_bytes(b"current")
     manifest = scan_folder(tmp_path, {})
     assert set(manifest) == {"current.alog"}

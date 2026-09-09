@@ -6,7 +6,10 @@ from roastmesh.feed import append_entry
 from roastmesh.identity import generate_identity
 from roastmesh.index import repository as repo
 from roastmesh.index.db import connect
-from roastmesh.index.ingest import edit_unpublished_roast_notes, ingest_feed, ingest_file, ingest_path, refresh_known_sources
+from roastmesh.index.ingest import (
+    apply_delivered_edit, edit_unpublished_roast_notes, ingest_feed, ingest_file, ingest_path,
+    refresh_known_sources,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -838,3 +841,136 @@ def test_edit_unpublished_roast_notes_rejects_an_unknown_roast_id(conn) -> None:
     result = edit_unpublished_roast_notes(conn, "not-a-real-roast-id", roasting_notes="x")
     assert result.error is not None
     assert "no such roast" in result.error
+
+
+# ---------------------------------------------------------------------------
+# apply_delivered_edit: turning a delivered cross-device edit
+# (device_sync.EDITED_DIR_NAME/<owner_pubkey>/<author_seq>.alog) into this
+# identity's own actual, visible update -- confirmed as a real gap
+# otherwise: a delivered edit just sat there forever as an inert file,
+# invisible to search, which looked exactly like data loss to a user
+# checking search alone.
+#
+# Looked up by (author_pubkey, author_seq), NOT roast_id: confirmed as a
+# real, live bug during the very first end-to-end test of this function --
+# roast_id is a fresh random UUID minted independently by every machine
+# that ingests the same content, so a roast_id the EDITING device knows is
+# meaningless on the OWNING device, which is the one this function runs on.
+# author_seq is this identity's own feed sequence number, the one thing
+# both sides actually agree on. There is no "not yet published" case to
+# handle here (unlike edit_unpublished_roast_notes): the only way another
+# device could see this roast at all, for it to deliver an edit back, is
+# via that same public feed entry -- so it is always already published.
+# ---------------------------------------------------------------------------
+
+def test_apply_delivered_edit_publishes_a_superseding_entry_for_an_already_published_roast(
+    conn, tmp_path: Path,
+) -> None:
+    from roastmesh.alog.edit import set_notes
+
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    path = _copy_fixture(tmp_path)
+    entry = append_entry(feed_dir, identity, path, timestamp="2026-01-01T00:00:00Z")
+    results = ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex)
+    original_roast_id = results[0].record.roast_id
+
+    new_bytes = set_notes(path.read_bytes(), roasting_notes="delivered edit, already published")
+    result = apply_delivered_edit(conn, feed_dir, identity, entry.seq, new_bytes)
+
+    assert result.error is None
+    assert result.record.roast_id != original_roast_id  # a NEW row, the original is untouched
+
+    original = conn.execute(
+        "SELECT roasting_notes FROM roasts WHERE roast_id = ?", (original_roast_id,)
+    ).fetchone()
+    assert original["roasting_notes"] is None  # unedited -- append-only, never touched
+
+    default_search = repo.search_roasts(conn)
+    assert len(default_search) == 1
+    assert default_search[0].roast_id == result.record.roast_id
+
+    with_superseded = repo.search_roasts(conn, include_superseded=True)
+    assert len(with_superseded) == 2
+
+
+def test_apply_delivered_edit_refuses_a_seq_that_is_not_this_identitys_own(conn, tmp_path: Path) -> None:
+    owner_identity = generate_identity()
+    someone_else = generate_identity()
+    feed_dir = tmp_path / "feed"
+    path = _copy_fixture(tmp_path)
+    entry = append_entry(feed_dir, owner_identity, path, timestamp="2026-01-01T00:00:00Z")
+    results = ingest_feed(conn, feed_dir, expected_pubkey_hex=owner_identity.public_key_hex)
+    roast_id = results[0].record.roast_id
+
+    # someone_else has no entry at this seq in THEIR OWN feed -- must not
+    # find (and overwrite) owner_identity's entry just because the seq
+    # number happens to match.
+    result = apply_delivered_edit(conn, tmp_path / "someone_elses_feed", someone_else, entry.seq, b"forged content")
+    assert result.error is not None
+    assert "no entry at seq" in result.error
+
+    stored = conn.execute("SELECT roasting_notes FROM roasts WHERE roast_id = ?", (roast_id,)).fetchone()
+    assert stored["roasting_notes"] is None  # untouched
+
+
+def test_apply_delivered_edit_rejects_an_unknown_author_seq(conn, tmp_path: Path) -> None:
+    identity = generate_identity()
+    result = apply_delivered_edit(conn, tmp_path / "feed", identity, 999, b"content")
+    assert result.error is not None
+    assert "no entry at seq 999" in result.error
+
+
+# ---------------------------------------------------------------------------
+# resolve_to_latest_roast_id: following a supersede chain forward so a
+# caller holding a stale roast_id (e.g. a GUI search-results table that
+# hasn't refreshed yet) always gets the current version, not the frozen
+# original -- confirmed as a real, reported bug: a user who reopened the
+# very roast they just edited, fast enough to beat the GUI's own
+# (asynchronous) refresh, saw the stale pre-edit content.
+# ---------------------------------------------------------------------------
+
+def test_resolve_to_latest_roast_id_follows_a_single_supersede(conn, tmp_path: Path) -> None:
+    from roastmesh.alog.edit import set_notes
+
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    path = _copy_fixture(tmp_path)
+    append_entry(feed_dir, identity, path, timestamp="2026-01-01T00:00:00Z")
+    results = ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex)
+    original_roast_id = results[0].record.roast_id
+
+    new_bytes = set_notes(path.read_bytes(), roasting_notes="the edit")
+    new_entry = apply_delivered_edit(conn, feed_dir, identity, 0, new_bytes)
+
+    assert repo.resolve_to_latest_roast_id(conn, original_roast_id) == new_entry.record.roast_id
+
+
+def test_resolve_to_latest_roast_id_follows_a_multi_hop_chain(conn, tmp_path: Path) -> None:
+    from roastmesh.alog.edit import set_notes
+
+    identity = generate_identity()
+    feed_dir = tmp_path / "feed"
+    path = _copy_fixture(tmp_path)
+    append_entry(feed_dir, identity, path, timestamp="2026-01-01T00:00:00Z")
+    results = ingest_feed(conn, feed_dir, expected_pubkey_hex=identity.public_key_hex)
+    original_roast_id = results[0].record.roast_id
+
+    first_edit = apply_delivered_edit(
+        conn, feed_dir, identity, 0, set_notes(path.read_bytes(), roasting_notes="first edit"),
+    )
+    second_edit = apply_delivered_edit(
+        conn, feed_dir, identity, 1, set_notes(path.read_bytes(), roasting_notes="second edit"),
+    )
+
+    # From the ORIGINAL id, and from the first edit's own (now itself
+    # superseded) id -- both must resolve all the way to the tip.
+    assert repo.resolve_to_latest_roast_id(conn, original_roast_id) == second_edit.record.roast_id
+    assert repo.resolve_to_latest_roast_id(conn, first_edit.record.roast_id) == second_edit.record.roast_id
+    assert repo.resolve_to_latest_roast_id(conn, second_edit.record.roast_id) == second_edit.record.roast_id
+
+
+def test_resolve_to_latest_roast_id_returns_unchanged_for_a_never_superseded_roast(conn, tmp_path: Path) -> None:
+    path = _copy_fixture(tmp_path)
+    result = ingest_file(conn, path, is_user_log=True)
+    assert repo.resolve_to_latest_roast_id(conn, result.record.roast_id) == result.record.roast_id
