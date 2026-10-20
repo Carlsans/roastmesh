@@ -19,7 +19,9 @@ def test_unit_quotes_every_word_and_escapes_specifiers() -> None:
 
 def test_unit_for_a_module_run() -> None:
     unit = autostart.render_unit([sys.executable, "-m", "roastmesh.cli"])
-    assert f'"{sys.executable}" "-m" "roastmesh.cli" "background" "run"' in unit
+    # systemd escapes backslashes, which only a Windows interpreter path has
+    exe = sys.executable.replace("\\", "\\\\")
+    assert f'"{exe}" "-m" "roastmesh.cli" "background" "run"' in unit
 
 
 def test_unit_path_honours_xdg_config_home(monkeypatch, tmp_path: Path) -> None:
@@ -27,6 +29,7 @@ def test_unit_path_honours_xdg_config_home(monkeypatch, tmp_path: Path) -> None:
     assert autostart.unit_path() == tmp_path / "systemd" / "user" / "roastmesh-background.service"
     monkeypatch.delenv("XDG_CONFIG_HOME")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))   # Path.home() reads this on Windows
     assert autostart.unit_path() == tmp_path / ".config" / "systemd" / "user" / "roastmesh-background.service"
 
 
@@ -145,6 +148,7 @@ def windows(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("USERDOMAIN", "WORKGROUP")
     monkeypatch.setenv("USERNAME", "carl")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     created: list[str] = []
     rec = Recorder()
     real = rec.__call__
