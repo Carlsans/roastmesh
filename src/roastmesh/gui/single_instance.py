@@ -38,6 +38,27 @@ def another_instance_is_running(*, port: int = PORT, timeout: float = 0.3) -> bo
         return False
 
 
+def port_is_held(port: int = PORT) -> bool:
+    """True if something is listening on the instance port, without
+    contacting it. another_instance_is_running() is no use for a mere check:
+    it sends a focus request, which would raise the window every time. The
+    background service (background.py) asks this once a second to learn
+    whether the GUI is open, so it must be silent.
+
+    Tries to bind rather than connect. The listener sets SO_EXCLUSIVEADDRUSE
+    on Windows and holds a listening socket on POSIX, so on both a second bind
+    fails for as long as the first is alive and succeeds the moment it is not.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((_HOST, port))
+    except OSError:
+        return True
+    finally:
+        probe.close()
+    return False
+
+
 def start_focus_listener(on_focus_requested: Callable[[], None], *, port: int = PORT) -> socket.socket | None:
     """Best-effort: listen for focus requests from later launches, calling
     `on_focus_requested` (from a background thread -- the caller must

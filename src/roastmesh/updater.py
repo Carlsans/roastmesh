@@ -279,6 +279,7 @@ def _update_linux(install_dir: Path, target: str | None, progress: Progress) -> 
 
         for tmp, dest in swaps:
             os.replace(tmp, dest)
+        _restart_background(progress)
         progress(f"updated to {got}. restart roastmesh to run it.")
     except UpdateError:
         raise
@@ -286,6 +287,20 @@ def _update_linux(install_dir: Path, target: str | None, progress: Progress) -> 
         raise UpdateError(f"update failed: {exc}") from exc
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _restart_background(progress: Progress) -> None:
+    """A running background service still has the old binary loaded; enabling
+    again rewrites its unit and restarts it on the new one. Best effort: the
+    update itself has already succeeded."""
+    from roastmesh import autostart
+
+    try:
+        if autostart.status().enabled:
+            autostart.enable()
+            progress("restarted the background service on the new version.")
+    except autostart.AutostartError:
+        pass
 
 
 def _update_windows(progress: Progress, wait_pid: int | None) -> None:

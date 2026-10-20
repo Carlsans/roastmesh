@@ -86,6 +86,30 @@ jobs:
         continue-on-error: true      # a runner's egress may block the DHT; informational
         run: .\dist\roastmesh\roastmesh.exe node doctor
 
+      - name: Check the background service starts and stops
+        # Registers the sign-in task, waits for the windowed supervisor it
+        # launches to come up, then removes everything again. A runner has no
+        # interactive desktop session, so Task Scheduler may refuse an
+        # InteractiveToken task there; that is why this reports rather than
+        # gates -- a failure here still means look at it before releasing.
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = ".\dist\roastmesh\roastmesh.exe"
+          & $exe background enable
+          if ($LASTEXITCODE -ne 0) { throw "background enable failed ($LASTEXITCODE)" }
+          $running = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            $st = (& $exe background status --json) | ConvertFrom-Json
+            if ($st.enabled -and $st.running) { $running = $true; break }
+          }
+          & $exe background disable
+          if (-not $running) { throw "the background supervisor never came up" }
+          & $exe background status --quiet
+          if ($LASTEXITCODE -eq 0) { throw "background is still enabled after disable" }
+          Write-Host "background service enable/run/disable -- OK"
+
       - name: Build the installer
         shell: pwsh
         run: |

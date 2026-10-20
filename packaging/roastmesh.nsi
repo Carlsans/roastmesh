@@ -44,6 +44,13 @@ BrandingText    "${APPNAME} ${VERSION}"
 !define MUI_FINISHPAGE_TITLE "roastmesh is installed"
 !define MUI_FINISHPAGE_TEXT "roastmesh asked Windows Firewall to allow incoming connections on private and domain networks, so other machines can reach this one.$\r$\n$\r$\nIf you declined that prompt, or if Windows later asks again, allow it for PRIVATE NETWORKS. Without it roastmesh can still find other machines, but they cannot find this one -- it looks like it is working and quietly receives nothing.$\r$\n$\r$\nYou can change this at any time under Windows Security > Firewall & network protection > Allow an app through firewall."
 
+; Offers the background service as an optional component. Unchecked on a fresh
+; install (it is opt-in: it keeps a node running and announcing this machine's
+; public IP whenever you are signed in), but pre-checked by .onInit when it is
+; already set up, so an upgrade -- including the silent /S one the in-app
+; updater runs -- keeps whatever the user had instead of quietly dropping it.
+!define MUI_COMPONENTSPAGE_TEXT_TOP "roastmesh is installed in your user profile and needs no administrator rights."
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -54,6 +61,15 @@ BrandingText    "${APPNAME} ${VERSION}"
 Section "roastmesh" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
+
+  ; A running background service holds roastmesh.exe and roastmesh-gui.exe
+  ; open, and Windows will not overwrite a file in use. Stop it first (it is
+  ; started again, or removed, in the section after this one). On a first
+  ; install there is nothing to stop.
+  ${If} ${FileExists} "$INSTDIR\roastmesh.exe"
+    nsExec::ExecToLog '"$INSTDIR\roastmesh.exe" background stop'
+    Pop $0
+  ${EndIf}
 
   ; The Windows build is onedir (see roastmesh.spec): dist\roastmesh\ holds
   ; both .exe files plus the shared _internal\ runtime they both load. The
@@ -82,6 +98,38 @@ Section "roastmesh" SecMain
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 SectionEnd
+
+Section /o "Run in the background when I sign in" SecBackground
+  ; Marker only: the work is done by the section below, once the files are in
+  ; place and whether this one is ticked is known either way.
+SectionEnd
+
+Section "-ApplyBackground"
+  ${If} ${SectionIsSelected} ${SecBackground}
+    DetailPrint "Starting roastmesh in the background..."
+    nsExec::ExecToLog '"$INSTDIR\roastmesh.exe" background enable'
+  ${Else}
+    nsExec::ExecToLog '"$INSTDIR\roastmesh.exe" background disable'
+  ${EndIf}
+  Pop $0
+  ClearErrors
+SectionEnd
+
+LangString DESC_SecBackground ${LANG_ENGLISH} "Keep roastmesh running with no window open, starting when you sign in to Windows. It only serves other roasters, and steps aside while the app is open. Change it any time in Settings."
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecBackground} $(DESC_SecBackground)
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+; Defined after the sections because it refers to SecBackground's index. The
+; Task Scheduler entry's existence is the source of truth for "already on".
+Function .onInit
+  nsExec::ExecToStack 'schtasks.exe /Query /TN "roastmesh-background"'
+  Pop $0   ; exit code
+  Pop $1   ; captured output, unused -- ExecToStack leaves it on the stack
+  ${If} $0 == 0
+    SectionSetFlags ${SecBackground} ${SF_SELECTED}
+  ${EndIf}
+FunctionEnd
 
 ; Only roastmesh.exe needs a rule. It is the process that serves: the GUI
 ; shells out to it for everything (gui/runner.py's roastmesh_argv), and binds
@@ -114,6 +162,12 @@ Function AddFirewallRule
 FunctionEnd
 
 Section "Uninstall"
+  ; Remove the sign-in task and stop what it started before deleting the
+  ; binaries it runs -- otherwise the files are locked and the task is left
+  ; pointing at nothing.
+  nsExec::ExecToLog '"$INSTDIR\roastmesh.exe" background disable'
+  Pop $0
+
   Delete "$INSTDIR\roastmesh.exe"
   Delete "$INSTDIR\roastmesh-gui.exe"
   Delete "$INSTDIR\roastmesh.ico"

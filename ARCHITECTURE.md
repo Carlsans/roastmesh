@@ -219,6 +219,19 @@ a tab that lives four minutes cannot hold a network up. So, split:
 
 Target platforms: Linux, macOS, Windows.
 
+### Background node
+
+A full node is only useful while it runs, so the installers can leave one running with no window
+(`background.py`, started by `autostart.py`): a systemd user unit on Linux, a sign-in Task
+Scheduler task on Windows, both per-user and without admin rights. It is a small supervisor around
+the same `node serve` the GUI runs, built from the same saved settings (`node_serve_args`).
+
+There must never be two nodes with one identity against one database, so the supervisor yields to
+the GUI: while the GUI's single-instance port is held it stops its node, and restarts it once the
+port is free. It watches the port instead of being told, so a crashed GUI cannot leave the server
+down. The GUI in turn waits for the supervisor's node to stop (`background.json`) before starting
+its own.
+
 ## Key handling
 
 - Generated silently on first publish. No signup, no fields, no email.

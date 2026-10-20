@@ -197,6 +197,28 @@ Four tabs, left to right:
 That's the whole interface — every button just runs the equivalent command shown in the console
 under it, so nothing here is hidden from you.
 
+## Running in the background
+
+roastmesh can keep running with no window open, so other roasters can still reach you and your
+roasts stay available while the app is closed. It only *serves* — it uses the settings from the
+Settings tab, and never shows a window.
+
+Turn it on from the installer or from **Settings → Background service**:
+
+- **Linux:** `install.sh` asks at the end (`--background` / `--no-background` to decide up front).
+  It installs a systemd *user* service — no `sudo` — and enables lingering so it starts at boot
+  rather than at first login. If your system refuses that, it still starts when you log in, and
+  Settings tells you the one command that makes it start at boot.
+- **Windows:** the installer has an optional **Run in the background when I sign in** component.
+  It starts when you sign in to Windows, not before — starting before anyone has signed in needs a
+  Windows service, which needs administrator rights this per-user install doesn't ask for.
+
+While the roastmesh window is open, its own node does the serving and the background one steps
+aside; it takes over again about a second after you close the window (or if the app crashes).
+Settings changes apply the next time it starts. Its log is `~/.local/share/roastmesh/background.log`.
+
+From a terminal: `roastmesh background enable | disable | status | stop | start`.
+
 ## Peer discovery: LAN and internet
 
 Two independent, both opt-out-able, layers on top of manual ticket-pasting:

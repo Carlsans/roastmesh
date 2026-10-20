@@ -11,7 +11,7 @@ from pathlib import Path
 import click
 
 import roastmesh
-from roastmesh import device_sync
+from roastmesh import autostart, device_sync
 from roastmesh import devices as devices_mod
 from roastmesh import net
 from roastmesh import replication
@@ -1859,6 +1859,81 @@ def gateway_serve(ctx: click.Context, host: str, port: int) -> None:
     server = make_server(ctx.obj["db_path"], host=host, port=port)
     print(f"serving on http://{host}:{port}", flush=True)
     server.serve_forever()
+
+
+@main.group("background")
+def background_group() -> None:
+    """Run roastmesh as an always-on server that starts with the machine.
+
+    Serves other nodes with no window open, using the settings saved in the
+    app. While the app window is open the app's own node takes over; the
+    background one resumes when it closes.
+    """
+
+
+@background_group.command("run")
+def background_run() -> None:
+    """Run the background server in the foreground (what the autostart entry runs)."""
+    from roastmesh import background
+
+    raise SystemExit(background.run_forever())
+
+
+@background_group.command("enable")
+def background_enable() -> None:
+    """Start the background server now and at every boot (Linux) or sign-in (Windows)."""
+    _background_change(autostart.enable)
+
+
+@background_group.command("disable")
+def background_disable() -> None:
+    """Stop the background server and remove it from startup."""
+    _background_change(autostart.disable)
+
+
+@background_group.command("stop")
+def background_stop() -> None:
+    """Stop the background server for now, leaving it enabled (used by installers)."""
+    _background_change(lambda: (autostart.stop(), autostart.status())[1])
+
+
+@background_group.command("start")
+def background_start() -> None:
+    """Start an enabled background server now."""
+    _background_change(lambda: (autostart.start(), autostart.status())[1])
+
+
+@background_group.command("status")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option("--quiet", is_flag=True, help="Print nothing; exit 0 if enabled, 1 if not.")
+def background_status(as_json: bool, quiet: bool) -> None:
+    """Report whether the background server is set to start automatically."""
+    st = autostart.status()
+    if quiet:
+        raise SystemExit(0 if st.enabled else 1)
+    if as_json:
+        click.echo(json.dumps(st.as_dict()))
+    else:
+        click.echo(_describe_background(st))
+    raise SystemExit(0 if st.enabled else 1)
+
+
+def _describe_background(st: autostart.Status) -> str:
+    if not st.supported:
+        return f"not available: {st.detail}"
+    if not st.enabled:
+        return "disabled"
+    when = "at boot" if st.trigger == "boot" else "at sign-in"
+    line = f"enabled ({when}), {'running' if st.running else 'not running'}"
+    return f"{line}\n{st.detail}" if st.detail else line
+
+
+def _background_change(action) -> None:
+    try:
+        st = action()
+    except autostart.AutostartError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(_describe_background(st))
 
 
 @main.command("update")

@@ -1620,3 +1620,70 @@ print("OK")
     assert "CONTENT_TALLER_THAN_VIEWPORT True" in r.stdout, r.stdout
     assert "NO_ERROR_AFTER_CLOSE_AND_SCROLL" in r.stdout, r.stdout
     assert "TclError" not in r.stderr, r.stderr
+
+
+def test_settings_background_toggle_reflects_the_system_state(tmp_path: Path) -> None:
+    """The Settings checkbox starts disabled, then shows what the OS says --
+    here a fresh HOME with no service installed, so unchecked and "Off."."""
+    home = tmp_path / "home"
+    home.mkdir()
+    r = _run_headless(f"""
+import os, time
+os.environ["HOME"] = {str(home)!r}
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+settings = app.tabs[-1]
+print("INITIAL_DISABLED", settings._background_check.instate(["disabled"]))
+for _ in range(120):          # status runs in a subprocess; let it land
+    app.update()
+    time.sleep(0.05)
+    if settings.background_status.get() == "Off.":
+        break
+print("STATUS", settings.background_status.get())
+print("CHECKED", settings.background_var.get())
+print("ENABLED_NOW", not settings._background_check.instate(["disabled"]))
+app._on_close()
+print("OK")
+""", timeout=60)
+    assert "OK" in r.stdout, r.stderr
+    assert "INITIAL_DISABLED True" in r.stdout, r.stdout
+    assert "STATUS Off." in r.stdout, r.stdout
+    assert "CHECKED False" in r.stdout, r.stdout
+    assert "ENABLED_NOW True" in r.stdout, r.stdout
+
+
+def test_gui_waits_for_the_background_node_before_serving(tmp_path: Path) -> None:
+    """With the background node still holding the identity and ports, the GUI
+    must not start its own -- two nodes with one identity on one database --
+    and must start as soon as the background one has stepped aside."""
+    home = tmp_path / "home"
+    state_dir = home / ".local" / "share" / "roastmesh"
+    state_dir.mkdir(parents=True)
+    state = state_dir / "background.json"
+    r = _run_headless(f"""
+import json, os, time
+os.environ["HOME"] = {str(home)!r}
+state = {str(state)!r}
+# the pytest process is alive and stands in for the background node
+json.dump({{"supervisor": os.getppid(), "node": os.getppid()}}, open(state, "w"))
+from roastmesh.gui.app import RoastmeshApp
+app = RoastmeshApp()
+net_tab = app.network_tab
+t0 = time.time()
+while time.time() - t0 < 1.5:
+    app.update()
+    time.sleep(0.05)
+print("SERVING_WHILE_BACKGROUND_UP", net_tab.serve_task is not None)
+os.remove(state)                                   # the background node steps aside
+for _ in range(60):
+    app.update()
+    time.sleep(0.05)
+    if net_tab.serve_task is not None:
+        break
+print("SERVING_AFTER_HANDOVER", net_tab.serve_task is not None)
+app._on_close()
+print("OK")
+""", timeout=60)
+    assert "OK" in r.stdout, r.stderr
+    assert "SERVING_WHILE_BACKGROUND_UP False" in r.stdout, r.stdout
+    assert "SERVING_AFTER_HANDOVER True" in r.stdout, r.stdout

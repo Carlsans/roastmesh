@@ -272,5 +272,19 @@
   "{rounds} rounds, {replied} of {queried} answered, closest {closest}": "{rounds} tours, {replied} réponses sur {queried}, plus proche {closest}",
   "{time}   BT {bt}   ET {et}   ΔBT {ror}": "{time}   BT {bt}   ET {et}   ΔBT {ror}",
   "{title} (hidden)": "{title} (masqué)",
-  "{v}°{unit}/min": "{v}°{unit}/min"
+  "{v}°{unit}/min": "{v}°{unit}/min",
+  "waiting for the background service to hand over...": "en attente du service d'arrière-plan...",
+  "Background service": "Service d'arrière-plan",
+  "Keeps roastmesh running with no window open, so other roasters can still reach you and your roasts stay available. It only serves: it uses the settings on this tab, steps aside while this window is open, and takes over again when you close it. Applies right away.": "Garde roastmesh actif sans fenêtre ouverte, pour que les autres torréfacteurs puissent toujours vous joindre et que vos torréfactions restent disponibles. Il ne fait que servir : il utilise les réglages de cet onglet, s'efface tant que cette fenêtre est ouverte et reprend dès que vous la fermez. S'applique immédiatement.",
+  "Run in the background when the computer starts": "Exécuter en arrière-plan au démarrage de l'ordinateur",
+  "Could not read the background service state.": "Impossible de lire l'état du service d'arrière-plan.",
+  "Not available on this system.": "Non disponible sur ce système.",
+  "Off.": "Désactivé.",
+  "at boot": "au démarrage",
+  "when you sign in": "à l'ouverture de session",
+  "not running": "arrêté",
+  "On: starts {when}, currently {state}.": "Activé : démarre {when}, actuellement {state}.",
+  "Turning on...": "Activation...",
+  "Turning off...": "Désactivation...",
+  "Could not change it: {error}": "Changement impossible : {error}"
 }

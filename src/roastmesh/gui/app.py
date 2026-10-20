@@ -28,7 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from roastmesh import updater
+from roastmesh import background, updater
 from roastmesh.alog.curves import format_mmss
 from roastmesh.gui import config as gui_config
 from roastmesh.gui import i18n
@@ -1114,7 +1114,7 @@ class NetworkTab(Tab):
         peers_section = section(body, t("Known peers"))
         self.peers_table = PeerTable(peers_section)
 
-        self._on_start_serve()
+        self._start_serving_when_background_idle()
         self._schedule_peer_refresh()
 
     def cancel(self) -> None:
@@ -1155,32 +1155,36 @@ class NetworkTab(Tab):
         self.clipboard_clear()
         self.clipboard_append(ticket)
 
+    # How long to wait for the background service to hand over before starting
+    # our own node anyway (a stale state file after a crash would otherwise
+    # hold serving back forever).
+    _BACKGROUND_HANDOFF_MS = 10_000
+
+    def _start_serving_when_background_idle(self, waited_ms: int = 0) -> None:
+        """Start serving, but not while the background service still holds the
+        identity and ports. It notices this window's single-instance port
+        within about a second and stops its node; starting ours first would
+        briefly run two nodes with one identity against one database."""
+        if self._closed:
+            return
+        if background.node_is_running() and waited_ms < self._BACKGROUND_HANDOFF_MS:
+            self.serve_runbar.set_running(True, t("waiting for the background service to hand over..."))
+            self.after(500, lambda: self._start_serving_when_background_idle(waited_ms + 500))
+            return
+        self._on_start_serve()
+
     def _on_start_serve(self) -> None:
         if self.serve_task is not None and self.serve_task.running:
             return
-        argv = roastmesh_argv("--db", self.app.db_path.get(), "node", "serve",
-                              "--publish-watch-dir", self.app.watch_dir.get())
-        if getattr(self, "debug_logging", None) is not None and self.debug_logging.get():
-            argv.append("--debug")
-        if self.app.wan_discovery_enabled.get():
-            argv.append("--wan-discovery")
-            port = self.app.public_port.get().strip().lower()
-            if port == "auto":
-                # No --wan-port here: the router picks the external number, so
-                # pinning both would only work if we happened to guess the one
-                # it was going to grant.
-                argv += ["--public-port", "auto"]
-            elif port.isdigit():
-                # Both, and the same number: --wan-port is the socket we listen
-                # on, --public-port is what we tell other nodes to use. A
-                # forward is only useful if the port it delivers to is ours.
-                argv += ["--wan-port", port, "--public-port", port]
-        if self.app.enable_device_sync.get():
-            devices_dir = self.app.devices_dir.get().strip()
-            if devices_dir:
-                argv += ["--devices-dir", devices_dir]
-        else:
-            argv.append("--no-device-sync")
+        debug = getattr(self, "debug_logging", None) is not None and self.debug_logging.get()
+        argv = roastmesh_argv(*background.node_serve_args(background.Settings(
+            db_path=self.app.db_path.get(),
+            watch_dir=self.app.watch_dir.get(),
+            wan_discovery=self.app.wan_discovery_enabled.get(),
+            public_port=self.app.public_port.get(),
+            device_sync=self.app.enable_device_sync.get(),
+            devices_dir=self.app.devices_dir.get(),
+        ), debug=debug))
         self.serve_console.clear()
         self.serve_console.set_command(describe(argv))
         self.ticket_var.set("")
@@ -1909,6 +1913,8 @@ class SettingsTab(Tab):
         tk.Label(scale_row, text=t("x (e.g. 1.0 = normal, 2.0 = double)"), font=FONT_SMALL,
                  bg=theme.BG, fg=theme.MUTED).pack(side="left", padx=(6, 0))
 
+        self._build_background_section(container)
+
         updates_section = section(container, t("Updates"))
         explain(updates_section,
                 t("When on, roastmesh checks for a newer release on startup and shows a banner "
@@ -1916,6 +1922,74 @@ class SettingsTab(Tab):
                   "you click that banner and confirm."))
         ttk.Checkbutton(updates_section, text=t("Check for updates when roastmesh starts"),
                         variable=self.app.check_for_updates).pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _build_background_section(self, container: tk.Widget) -> None:
+        section_frame = section(container, t("Background service"))
+        explain(section_frame,
+                t("Keeps roastmesh running with no window open, so other roasters can still reach you "
+                  "and your roasts stay available. It only serves: it uses the settings on this tab, "
+                  "steps aside while this window is open, and takes over again when you close it. "
+                  "Applies right away."))
+        self.background_var = tk.BooleanVar(value=False)
+        self._background_check = ttk.Checkbutton(
+            section_frame, text=t("Run in the background when the computer starts"),
+            variable=self.background_var, command=self._on_background_toggled)
+        self._background_check.pack(anchor="w", padx=10, pady=(0, 2))
+        self._background_check.state(["disabled"])   # until we know what the system says
+        self.background_status = tk.StringVar(value=t("checking..."))
+        tk.Label(section_frame, textvariable=self.background_status, font=FONT_SMALL, fg=theme.MUTED,
+                 bg=theme.BG, anchor="w", justify="left", wraplength=sp(840)).pack(
+            fill="x", padx=10, pady=(0, 8))
+        self._refresh_background_status()
+
+    def _background_command(self, *args: str, on_done) -> None:
+        buf: list[str] = []
+        task = Task(argv=roastmesh_argv("background", *args))
+        task.start()
+        stream_into(task, buf.append, lambda code: on_done(code, "".join(buf)),
+                    lambda ms, fn: self.after(ms, fn))
+
+    def _refresh_background_status(self) -> None:
+        self._background_command("status", "--json", on_done=self._background_status_loaded)
+
+    def _background_status_loaded(self, _code: int, output: str) -> None:
+        # status exits 1 when merely disabled, so the exit code says nothing here.
+        try:
+            info = parse_json_output(output)
+        except json.JSONDecodeError:
+            self.background_status.set(t("Could not read the background service state."))
+            return
+        if not info.get("supported"):
+            self.background_var.set(False)
+            self._background_check.state(["disabled"])
+            self.background_status.set(info.get("detail") or t("Not available on this system."))
+            return
+        enabled = bool(info.get("enabled"))
+        self.background_var.set(enabled)
+        self._background_check.state(["!disabled"])
+        if not enabled:
+            self.background_status.set(t("Off."))
+            return
+        when = t("at boot") if info.get("trigger") == "boot" else t("when you sign in")
+        state = t("running") if info.get("running") else t("not running")
+        text = t("On: starts {when}, currently {state}.", when=when, state=state)
+        if info.get("detail"):
+            text += "\n" + info["detail"]
+        self.background_status.set(text)
+
+    def _on_background_toggled(self) -> None:
+        wanted = self.background_var.get()
+        self._background_check.state(["disabled"])
+        self.background_status.set(t("Turning on...") if wanted else t("Turning off..."))
+        self._background_command("enable" if wanted else "disable", on_done=self._on_background_changed)
+
+    def _on_background_changed(self, code: int, output: str) -> None:
+        if code != 0:
+            # Re-read the truth rather than assume a failed change left things as they were.
+            self._refresh_background_status()
+            self.background_status.set(t("Could not change it: {error}", error=output.strip() or code))
+            return
+        self._refresh_background_status()
 
     def _update_wan_caution(self) -> None:
         if self.app.wan_discovery_enabled.get():
@@ -2385,6 +2459,13 @@ class RoastmeshApp(tk.Tk):
 
 
 def main(*, single_instance_port: int = single_instance.PORT) -> None:
+    if "--background" in sys.argv[1:]:
+        # The Windows sign-in task runs this windowed binary rather than the
+        # console `roastmesh.exe`, which would open a console window every
+        # time. No window, no Tk, no single-instance port: this is the
+        # background server (roastmesh.background), nothing else.
+        from roastmesh import background as background_service
+        raise SystemExit(background_service.run_forever())
     if single_instance.another_instance_is_running(port=single_instance_port):
         return  # asked it to focus itself instead -- nothing else to do here
 

@@ -12,6 +12,13 @@
 # An env var works too, and needs no `-s --`:
 #   curl -fsSL https://raw.githubusercontent.com/Carlsans/roastmesh/master/install.sh | ROASTMESH_LANG=fr bash
 #
+# Also offers to keep roastmesh running in the background from boot, serving
+# other nodes with no window open. You are asked at the end when run from a
+# terminal; to decide up front (or when there is no terminal, as in CI):
+#   ... | bash -s -- --background        (or ROASTMESH_BACKGROUND=yes)
+#   ... | bash -s -- --no-background     (or ROASTMESH_BACKGROUND=no)
+# With neither, and no terminal to ask on, nothing about it is changed.
+#
 # Downloads the prebuilt roastmesh/roastmesh-gui binaries from the latest
 # GitHub release, installs them to ~/.local/bin (no sudo, no system
 # packages touched), and adds a roastmesh entry to your applications menu
@@ -29,8 +36,15 @@ CONFIG_FILE="$HOME/.local/share/roastmesh/gui_config.json"
 SUPPORTED_LANGS="en fr"
 
 LANG_CHOICE="${ROASTMESH_LANG:-}"
+BACKGROUND_CHOICE=""
+case "$(printf '%s' "${ROASTMESH_BACKGROUND:-}" | tr 'A-Z' 'a-z')" in
+    1|y|yes|true)  BACKGROUND_CHOICE="yes" ;;
+    0|n|no|false)  BACKGROUND_CHOICE="no" ;;
+esac
 while [ $# -gt 0 ]; do
     case "$1" in
+        --background)    BACKGROUND_CHOICE="yes"; shift ;;
+        --no-background) BACKGROUND_CHOICE="no"; shift ;;
         --lang)   LANG_CHOICE="${2:-}"; shift 2 ;;
         --lang=*) LANG_CHOICE="${1#*=}"; shift ;;
         *)        shift ;;
@@ -146,6 +160,34 @@ if [ -n "$LANG_CHOICE" ]; then
         echo "Note: you already have a roastmesh configuration, so --lang was not applied."
         echo "Change the language in the app's Settings tab instead."
     fi
+fi
+
+# Background service. An upgrade of an install that already has it must
+# restart it onto the new binary whatever was asked, and a fresh choice is
+# only ever asked of a person who can answer: this script usually arrives over
+# a pipe, so stdin is the script itself and the question has to go to the
+# terminal directly.
+BACKGROUND_WAS_ON=""
+if "$BIN_DIR/roastmesh" background status --quiet >/dev/null 2>&1; then
+    BACKGROUND_WAS_ON="yes"
+fi
+if [ -z "$BACKGROUND_CHOICE" ] && [ -z "$BACKGROUND_WAS_ON" ] && { : </dev/tty; } 2>/dev/null; then
+    echo
+    echo "Run roastmesh in the background from boot?"
+    echo "  It keeps serving other roasters with no window open, and steps aside"
+    echo "  while the app is open. You can change this later in Settings."
+    printf "Start it at boot? [y/N] " >/dev/tty
+    read -r ANSWER </dev/tty || ANSWER=""
+    case "$ANSWER" in
+        [yY]*) BACKGROUND_CHOICE="yes" ;;
+        *)     BACKGROUND_CHOICE="no" ;;
+    esac
+fi
+if [ "$BACKGROUND_CHOICE" = "yes" ] || { [ -z "$BACKGROUND_CHOICE" ] && [ -n "$BACKGROUND_WAS_ON" ]; }; then
+    # enable is idempotent and restarts, so this is also the upgrade path
+    "$BIN_DIR/roastmesh" background enable || echo "Could not set up the background service -- see the message above." >&2
+elif [ "$BACKGROUND_CHOICE" = "no" ] && [ -n "$BACKGROUND_WAS_ON" ]; then
+    "$BIN_DIR/roastmesh" background disable || true
 fi
 
 echo

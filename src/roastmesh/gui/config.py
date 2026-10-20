@@ -13,6 +13,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from roastmesh.background import valid_public_port
 from roastmesh.gui.i18n import DEFAULT_LANGUAGE, LANGUAGES
 from roastmesh.gui.widgets import MAX_UI_SCALE, MIN_UI_SCALE
 from roastmesh.index.db import default_db_path
@@ -107,21 +108,7 @@ def load_config() -> GuiConfig:
     )
 
 
-def _valid_port(value: object) -> str:
-    """A port, or "" -- never anything that would become a bad CLI argument.
-
-    Whatever survives here is handed straight to `node serve --public-port`,
-    so junk in the config file must not turn into a serve process that
-    refuses to start; an unusable value is simply no value.
-    """
-    text = str(value).strip().lower()
-    if text == "auto":
-        return "auto"
-    try:
-        port = int(text)
-    except (TypeError, ValueError):
-        return ""
-    return str(port) if 1 <= port <= 65535 else ""
+_valid_port = valid_public_port
 
 
 def _valid_ui_scale(value: object) -> float | None:
