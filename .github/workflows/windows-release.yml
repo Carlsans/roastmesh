@@ -109,6 +109,7 @@ jobs:
           & $exe background status --quiet
           if ($LASTEXITCODE -eq 0) { throw "background is still enabled after disable" }
           Write-Host "background service enable/run/disable -- OK"
+          exit 0   # the --quiet check above leaves $LASTEXITCODE at 1 on purpose
 
       - name: Build the installer
         shell: pwsh

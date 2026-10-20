@@ -268,6 +268,8 @@ def _windows_stop() -> None:
     node = background.read_state().get("node")
     if isinstance(node, int) and background.pid_alive(node):
         _run(["taskkill", "/F", "/T", "/PID", str(node)])
+    # A killed supervisor cannot tidy up after itself.
+    background._write_state(None, None)
 
 
 # -- public API ------------------------------------------------------------
