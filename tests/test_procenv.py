@@ -38,3 +38,24 @@ def test_external_subprocess_env_restores_the_original_when_frozen(monkeypatch) 
 
     assert env is not None
     assert env["LD_LIBRARY_PATH"] == "/usr/lib/some-real-system-path"
+
+
+def test_external_subprocess_env_drops_ld_library_path_when_the_original_is_itself_a_bundle_dir(monkeypatch) -> None:
+    """The real incident: roastmesh-gui (frozen) launches the roastmesh CLI
+    (also frozen, via gui/runner.py's roastmesh_argv) as a child process.
+    The child inherits the GUI's own bundled LD_LIBRARY_PATH as its
+    starting value, and PyInstaller's bootloader then records *that* as
+    the child's own LD_LIBRARY_PATH_ORIG before overwriting it with the
+    child's own extraction dir. "Restore ORIG" in that case puts back the
+    GUI's bundle dir, not a genuinely clean value -- confirmed directly:
+    `roastmesh background status` run this way crashed systemctl with
+    "version `OPENSSL_3.4.0' not found", the exact bug this module exists
+    to prevent, because the restored value was still a `/tmp/_MEI...` path."""
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEI222222yyyyyy")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/tmp/_MEI111111xxxxxx")
+
+    env = external_subprocess_env()
+
+    assert env is not None
+    assert "LD_LIBRARY_PATH" not in env

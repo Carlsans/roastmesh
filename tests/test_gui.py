@@ -1630,6 +1630,12 @@ def test_settings_background_toggle_reflects_the_system_state(tmp_path: Path) ->
     r = _run_headless(f"""
 import os, time
 os.environ["HOME"] = {str(home)!r}
+# autostart.unit_dir() checks XDG_CONFIG_HOME before falling back to
+# Path.home() -- on a real desktop session (this one included) that's
+# normally set and points at the real ~/.config, so without clearing it
+# here this test would check this machine's *actual* background service
+# instead of the fresh, empty HOME above.
+os.environ.pop("XDG_CONFIG_HOME", None)
 from roastmesh.gui.app import RoastmeshApp
 app = RoastmeshApp()
 settings = app.tabs[-1]
