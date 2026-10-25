@@ -24,7 +24,24 @@
 # packages touched), and adds a roastmesh entry to your applications menu
 # so it's a normal double-clickable app afterward. Safe to re-run --
 # re-running upgrades in place.
+#
+# A `curl | bash` run always executes whatever is on GitHub's master right
+# now, so it's never stale. Run as a local file instead (`./install.sh` from
+# a clone of this repo, or `packaging/install-systemd-service.sh`, which
+# invokes this script), and it self-updates that clone first, the same way
+# re-running the one-liner upgrades the installed binaries -- a local
+# checkout left alone for a while should not run an installer, or quote a
+# README, that's gone stale against what GitHub actually ships.
 set -euo pipefail
+
+if [ -f "$0" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    if git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "$SCRIPT_DIR" pull --ff-only ||
+            echo "Note: could not pull the latest roastmesh sources (local changes or a detached" \
+                 "checkout?) -- continuing with this clone as-is." >&2
+    fi
+fi
 
 REPO="Carlsans/roastmesh"
 BIN_DIR="$HOME/.local/bin"

@@ -180,6 +180,24 @@ def test_windows_disable_deletes_the_task(windows) -> None:
     assert ["schtasks", "/Delete", "/TN", "roastmesh-background", "/F"] in windows.calls
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a POSIX shell command as a stand-in systemctl")
+def test_run_never_leaks_a_frozen_ld_library_path_to_the_child(monkeypatch) -> None:
+    """The real incident this guards: `roastmesh background enable` on a
+    frozen Linux build ran `systemctl --user daemon-reload` with the
+    bundle's own LD_LIBRARY_PATH still set, and the system's systemd
+    picked up roastmesh's bundled libcrypto instead of its own, failing
+    with "version `OPENSSL_3.4.0' not found". A real subprocess (not the
+    Recorder stand-in above) so the child's own view of the environment is
+    what's checked, not just what autostart._run was handed."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxxxxxx")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+
+    proc = autostart._run(["sh", "-c", 'echo "LD=[$LD_LIBRARY_PATH]"'])
+
+    assert proc.stdout.strip() == "LD=[]"
+
+
 def test_windows_status_disabled_when_no_task(windows) -> None:
     windows.fail = {"/Query"}
     assert autostart.status().enabled is False

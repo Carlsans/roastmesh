@@ -29,7 +29,9 @@ the frozen roastmesh-gui sets LD_LIBRARY_PATH to its own PyInstaller temp
 extraction dir (confirmed via /proc/<pid>/environ on a real frozen
 build), and every external program _run_opener launches inherited it,
 picking up roastmesh's *bundled* libcrypto over the system's own.
-_external_subprocess_env is the fix.
+roastmesh.procenv.external_subprocess_env is the fix (see
+tests/test_procenv.py for the unit tests on that function directly; the
+integration test at the bottom of this file covers _run_opener's use of it).
 """
 from __future__ import annotations
 
@@ -41,7 +43,6 @@ import pytest
 pytest.importorskip("tkinter")
 
 from roastmesh.gui.app import (
-    _external_subprocess_env,
     _find_artisan_launcher,
     _is_snap_wrapper,
     _open_alog_file,
@@ -290,39 +291,6 @@ def test_open_alog_file_does_not_stage_for_a_plain_native_install(monkeypatch, t
     assert error is None
     seen_path = (tmp_path / "seen_path.txt").read_text().strip()
     assert seen_path == str(source)
-
-
-# _external_subprocess_env: the real bug behind "openssl not found" /
-# libcrypto.so errors a user hit on a different machine than the one
-# above -- a frozen roastmesh-gui's LD_LIBRARY_PATH (pointing at its own
-# PyInstaller temp extraction dir) leaking into every external program
-# _run_opener launches.
-
-def test_external_subprocess_env_is_none_when_not_frozen(monkeypatch) -> None:
-    monkeypatch.delattr("sys.frozen", raising=False)
-    assert _external_subprocess_env() is None
-
-
-def test_external_subprocess_env_drops_ld_library_path_when_frozen_with_no_original(monkeypatch) -> None:
-    monkeypatch.setattr("sys.frozen", True, raising=False)
-    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxxxxxx")
-    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
-
-    env = _external_subprocess_env()
-
-    assert env is not None
-    assert "LD_LIBRARY_PATH" not in env
-
-
-def test_external_subprocess_env_restores_the_original_when_frozen(monkeypatch) -> None:
-    monkeypatch.setattr("sys.frozen", True, raising=False)
-    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxxxxxx")
-    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/lib/some-real-system-path")
-
-    env = _external_subprocess_env()
-
-    assert env is not None
-    assert env["LD_LIBRARY_PATH"] == "/usr/lib/some-real-system-path"
 
 
 @_needs_posix_shell

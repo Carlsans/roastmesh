@@ -35,6 +35,11 @@ installs them to `~/.local/bin` (no sudo, no system packages touched), and adds 
 to your applications menu so it's a normal double-clickable app afterward. Safe to re-run any
 time — re-running just upgrades in place.
 
+Piped straight from `curl` like this, it's always whatever is on GitHub's `master` right now. Running
+it instead as a local file from a clone of this repo (`./install.sh`) pulls that clone to `master`
+first, so a checkout left alone for a while doesn't install from, or quote a README from, a stale
+copy of either.
+
 The interface is available in English and French, and defaults to whatever language your system
 is already set to. To pick one explicitly instead — handy for sharing an install link that opens
 straight into a given language — pass `--lang` after `--` (needed because the script is read from
@@ -131,6 +136,9 @@ activating via `.venv/bin/roastmesh` / `.venv\Scripts\roastmesh.exe`).
 macOS (python.org installer) and Windows (python.org installer) both bundle `tkinter` already —
 nothing extra needed there. If you installed Python via Homebrew on macOS instead:
 `brew install python-tk`.
+
+**Upgrading**: `git pull`, then re-run `pip install -e ".[dev]"` (only needed again if dependencies
+changed; harmless either way).
 
 ## Quick start (GUI)
 

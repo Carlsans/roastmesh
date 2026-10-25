@@ -30,6 +30,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from roastmesh import background, updater
 from roastmesh.alog.curves import format_mmss
+from roastmesh.procenv import external_subprocess_env
 from roastmesh.gui import config as gui_config
 from roastmesh.gui import i18n
 from roastmesh.gui import single_instance
@@ -65,36 +66,6 @@ from roastmesh.gui.widgets import (
 )
 
 
-def _external_subprocess_env() -> dict[str, str] | None:
-    """The environment to launch an external (non-roastmesh) program with.
-
-    A PyInstaller-frozen roastmesh-gui sets LD_LIBRARY_PATH to point at its
-    own self-extracted temp directory, so its bundled .so files (built
-    for roastmesh's own Python/cryptography/etc.) are what get found first
-    -- confirmed as the cause of a real bug: opening a roast crashed with
-    "openssl not found" / libcrypto.so errors, because the external
-    program's dynamic linker picked up roastmesh's *bundled* libcrypto
-    over the system's own, and the bundled one isn't a complete, ABI-
-    compatible OpenSSL install for anything but roastmesh itself.
-    subprocess.Popen inherits the parent's environment by default, so
-    every external program launched (xdg-open, flatpak, a plain Artisan
-    binary) picked this up. PyInstaller's bootloader preserves whatever
-    LD_LIBRARY_PATH existed before it overrode it as LD_LIBRARY_PATH_ORIG
-    (only set if one existed at all) -- restore that, or drop the
-    variable entirely if there was none. Returns None (meaning "use the
-    parent's environment, unmodified") when not running frozen, so this
-    has zero effect on a from-source run."""
-    if not getattr(sys, "frozen", False):
-        return None
-    env = dict(os.environ)
-    original = env.pop("LD_LIBRARY_PATH_ORIG", None)
-    if original is not None:
-        env["LD_LIBRARY_PATH"] = original
-    else:
-        env.pop("LD_LIBRARY_PATH", None)
-    return env
-
-
 def _run_opener(cmd: list[str]) -> str | None:
     """Run an opener command and report what happened. Returns None if it
     looks like it worked, or a short message to show the user if it
@@ -103,7 +74,7 @@ def _run_opener(cmd: list[str]) -> str | None:
     otherwise avoids everywhere else."""
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 env=_external_subprocess_env())
+                                 env=external_subprocess_env())
     except OSError as exc:
         return t("could not run {command}: {error}", command=cmd[0], error=exc)
     try:
@@ -224,7 +195,7 @@ def _find_artisan_launcher(path: str) -> tuple[list[str], bool] | None:
         # itself is -- `flatpak run` finds the app by id regardless.
         try:
             check = subprocess.run(["flatpak", "info", ARTISAN_FLATPAK_ID],
-                                    capture_output=True, timeout=3, env=_external_subprocess_env())
+                                    capture_output=True, timeout=3, env=external_subprocess_env())
         except (OSError, subprocess.TimeoutExpired):
             check = None
         if check is not None and check.returncode == 0:

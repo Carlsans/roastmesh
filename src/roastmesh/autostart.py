@@ -30,6 +30,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from roastmesh import background
+from roastmesh.procenv import external_subprocess_env
 
 UNIT_NAME = "roastmesh-background.service"
 TASK_NAME = "roastmesh-background"
@@ -54,9 +55,12 @@ class Status:
 
 
 def _run(argv: list[str], *, timeout: float = 30) -> subprocess.CompletedProcess:
+    # These are all external system tools (systemctl, loginctl, schtasks,
+    # taskkill, whoami), never roastmesh itself -- see procenv.py for why a
+    # frozen build's environment needs cleaning up before launching one.
     try:
         return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=timeout,
+                              timeout=timeout, env=external_subprocess_env(),
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise AutostartError(f"could not run {argv[0]}: {exc}") from exc
